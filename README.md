@@ -136,4 +136,10 @@ def int_to_color(n, brightness_threshold=500):
 	@returns:
 		(int,int,int): The RGB color
 	'''
+class Task:
+	def __init__(self, command):
+		self.command = command
+		self.returncode = None
+		self.stdout = []
+		self.stderr = []
 ```

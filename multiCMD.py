@@ -7,8 +7,11 @@ import sys
 import subprocess
 import select
 import os
+import string
+import re
+import itertools
 
-version = '1.13'
+version = '1.15'
 __version__ = version
 
 class Task:
@@ -19,6 +22,60 @@ class Task:
 		self.stderr = []
 	def __iter__(self):
 		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.name, self.command, self.returncode, self.stdout, self.stderr])
+
+def _expand_ranges(inStr):
+	'''
+	Expand ranges in a string
+
+	@params:
+		inStr: The string to expand
+
+	@returns:
+		list[str]: The expanded string
+	'''
+	expandingStr = [inStr]
+	expandedList = []
+	# all valid alphanumeric characters
+	alphanumeric = string.digits + string.ascii_letters
+	while len(expandingStr) > 0:
+		currentStr = expandingStr.pop()
+		match = re.search(r'\[(.*?)]', currentStr)
+		if not match:
+			expandedList.append(currentStr)
+			continue
+		group = match.group(1)
+		parts = group.split(',')
+		for part in parts:
+			part = part.strip()
+			if '-' in part:
+				try:
+					range_start,_, range_end = part.partition('-')
+				except ValueError:
+					expandedList.append(currentStr)
+					continue
+				range_start = range_start.strip()
+				range_end = range_end.strip()
+				if range_start.isdigit() and range_end.isdigit():
+					padding_length = min(len(range_start), len(range_end))
+					format_str = "{:0" + str(padding_length) + "d}"
+					for i in range(int(range_start), int(range_end) + 1):
+						formatted_i = format_str.format(i)
+						expandingStr.append(currentStr.replace(match.group(0), formatted_i, 1))
+				elif all(c in string.hexdigits for c in range_start + range_end):
+					for i in range(int(range_start, 16), int(range_end, 16) + 1):
+						expandingStr.append(currentStr.replace(match.group(0), format(i, 'x'), 1))
+				else:
+					try:
+						start_index = alphanumeric.index(range_start)
+						end_index = alphanumeric.index(range_end)
+						for i in range(start_index, end_index + 1):
+							expandingStr.append(currentStr.replace(match.group(0), alphanumeric[i], 1))
+					except ValueError:
+						expandedList.append(currentStr)
+			else:
+				expandingStr.append(currentStr.replace(match.group(0), part, 1))
+	expandedList.reverse()
+	return expandedList
 
 def __handle_stream(stream,target,pre='',post='',quiet=False):
 	'''
@@ -182,13 +239,50 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	'''
 	return run_commands([command], timeout, max_threads, quiet, dry_run, with_stdErr, return_code_only, return_object)[0]
 
+def __format_command(command,expand = False):
+	'''
+	Format a command
+
+	@params:
+		command: The command to format
+		expand: Whether to expand ranges
+
+	@returns:
+		list[list[str]]: The formatted commands sequence
+	'''
+	if isinstance(command,str):
+		if expand:
+			commands = _expand_ranges(command)
+		else:
+			commands = [command]
+		return [command.split() for command in commands]
+	# elif it is a iterable
+	elif hasattr(command,'__iter__'):
+		sanitized_command = []
+		for field in command:
+			if isinstance(field,str):
+				sanitized_command.append(field)
+			else:
+				sanitized_command.append(repr(field))
+		if not expand:
+			return [sanitized_command]
+		sanitized_expanded_command = [_expand_ranges(field) for field in sanitized_command]
+		# now the command had been expanded to list of list of fields with each field expanded to all possible options
+		# we need to generate all possible combinations of the fields
+		# we will use the cartesian product to do this
+		commands = list(itertools.product(*sanitized_expanded_command))
+		return [list(command) for command in commands]
+	else:
+		return __format_command(str(command),expand=expand)
+
+
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False):
+				 return_code_only=False,return_object=False, parse = False):
 	'''
 	Run multiple commands in parallel
 
 	@params:
-		commands: A list of commands to run
+		commands: A list of commands to run ( list[str] | list[list[str]] )
 		timeout: The timeout for each command
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
@@ -196,17 +290,20 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
+		parse: Whether to parse ranged input
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
 	'''
 	# split the commands in commands if it is a string
-	commands = [command.split() if isinstance(command,str) else command for command in commands]
+	formatedCommands = []
+	for command in commands:
+		formatedCommands.extend(__format_command(command,expand=parse))
 	# initialize the tasks
-	tasks = [Task(command) for command in commands]
+	tasks = [Task(command) for command in formatedCommands]
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
-		max_threads = len(commands)
+		max_threads = len(formatedCommands)
 	if max_threads > 1:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...)) for task in tasks]
@@ -361,17 +458,16 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 		if iteration % 5 == 0:
 			print(_genrate_progress_bar(iteration, total, prefix, suffix))
 
-
 def main():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
 	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
-#	parser.add_argument('-p','--parse', action='store_true',help='parse ranged input')
+	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
 	parser.add_argument('-t','--timeout', metavar='timeout', type=int, default=60,help='timeout for each command')
 	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of threads to use')
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} by pan@zopyr.us')
 	args = parser.parse_args()
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet)
+	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse)
 
 if __name__ == '__main__':
 	main()
