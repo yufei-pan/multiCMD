@@ -66,7 +66,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the commands
-		with_stdErr: Whether to return the standard error output
+		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
 
@@ -84,7 +84,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the command
-		with_stdErr: Whether to return the standard error output
+		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
 
