@@ -7,6 +7,10 @@ Can be used in bash scripts for automation actions.
 
 Also able to be imported and act as a wrapper for subprocess.
 
+Use return_object=True with run_commands or run_command to get the Task Object (definition below)
+
+Use quiet=True and wait_for_return=False to create a daemon thread that async updates the return list / objects when return comes 
+
 For each process, it will initialize a thread if using -m/--max_threads > 1
 
 For each thread, it will use subprocess lib to open a process for the command task
@@ -44,8 +48,9 @@ Run multiple commands in parallel
 positional arguments:
   command               commands to run
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
+  -p, --parse           Parse ranged input and expand them into multiple commands
   -t timeout, --timeout timeout
                         timeout for each command
   -m max_threads, --max_threads max_threads
@@ -56,12 +61,12 @@ optional arguments:
 
 ```python
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False):
+				 return_code_only=False,return_object=False, parse = False, wait_for_return = True):
 	'''
 	Run multiple commands in parallel
 
 	@params:
-		commands: A list of commands to run
+		commands: A list of commands to run ( list[str] | list[list[str]] )
 		timeout: The timeout for each command
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
@@ -69,12 +74,14 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
+		parse: Whether to parse ranged input
+		wait_for_return: Whether to wait for the return of the commands
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
-	'''
+  '''
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				return_code_only=False,return_object=False):
+				return_code_only=False,return_object=False,wait_for_return=True):
 	'''
 	Run a command
 
@@ -87,9 +94,21 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
+		wait_for_return: Whether to wait for the return of the command
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
+	'''
+def join_threads(threads=__running_threads,timeout=None):
+	'''
+	Join threads
+
+	@params:
+		threads: The threads to join
+		timeout: The timeout
+
+	@returns:
+		None
 	'''
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""

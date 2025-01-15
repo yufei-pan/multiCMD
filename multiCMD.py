@@ -11,9 +11,10 @@ import string
 import re
 import itertools
 
-version = '1.15'
+version = '1.16'
 __version__ = version
 
+__running_threads = []
 class Task:
 	def __init__(self, command):
 		self.command = command
@@ -21,7 +22,11 @@ class Task:
 		self.stdout = []
 		self.stderr = []
 	def __iter__(self):
-		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.name, self.command, self.returncode, self.stdout, self.stderr])
+		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.command, self.returncode, self.stdout, self.stderr])
+	def __repr__(self):
+		return f'Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr})'
+	def __str__(self):
+		return str(dict(self))
 
 def _expand_ranges(inStr):
 	'''
@@ -177,11 +182,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			#host.stdout = []
 			proc = subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE)
 			# create a thread to handle stdout
-			stdout_thread = threading.Thread(target=__handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet))
+			stdout_thread = threading.Thread(target=__handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet),daemon=True)
 			stdout_thread.start()
 			# create a thread to handle stderr
 			#host.stderr = []
-			stderr_thread = threading.Thread(target=__handle_stream, args=(proc.stderr,task.stderr,pre,post,quiet))
+			stderr_thread = threading.Thread(target=__handle_stream, args=(proc.stderr,task.stderr,pre,post,quiet),daemon=True)
 			stderr_thread.start()
 			# Monitor the subprocess and terminate it after the timeout
 			start_time = time.time()
@@ -220,7 +225,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			return task.stdout
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				return_code_only=False,return_object=False):
+				return_code_only=False,return_object=False,wait_for_return=True):
 	'''
 	Run a command
 
@@ -233,11 +238,14 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		with_stdErr: Whether to append the standard error output to the standard output
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
+		wait_for_return: Whether to wait for the return of the command
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
-	return run_commands([command], timeout, max_threads, quiet, dry_run, with_stdErr, return_code_only, return_object)[0]
+	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
+					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
+					 return_object=return_object,parse=False,wait_for_return=wait_for_return)[0]
 
 def __format_command(command,expand = False):
 	'''
@@ -275,9 +283,8 @@ def __format_command(command,expand = False):
 	else:
 		return __format_command(str(command),expand=expand)
 
-
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False, parse = False):
+				 return_code_only=False,return_object=False, parse = False, wait_for_return = True):
 	'''
 	Run multiple commands in parallel
 
@@ -291,6 +298,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
 		parse: Whether to parse ranged input
+		wait_for_return: Whether to wait for the return of the commands
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
@@ -304,13 +312,16 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(formatedCommands)
-	if max_threads > 1:
+	if max_threads > 1 or not wait_for_return:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
-		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...)) for task in tasks]
+		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
 		for thread in threads:
 			thread.start()
-		for thread in threads:
-			thread.join()
+		if wait_for_return:
+			for thread in threads:
+				thread.join()
+		else:
+			__running_threads.extend(threads)
 	else:
 		# just process the commands sequentially
 		sem = threading.Semaphore(1)
@@ -325,6 +336,20 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		return [task.stdout + task.stderr for task in tasks]
 	else:
 		return [task.stdout for task in tasks]
+
+def join_threads(threads=__running_threads,timeout=None):
+	'''
+	Join threads
+
+	@params:
+		threads: The threads to join
+		timeout: The timeout
+
+	@returns:
+		None
+	'''
+	for thread in threads:
+		thread.join(timeout=timeout)
 
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""
