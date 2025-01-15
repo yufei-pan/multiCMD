@@ -8,7 +8,8 @@ import subprocess
 import select
 import os
 
-version = '1.12'
+version = '1.13'
+__version__ = version
 
 class Task:
 	def __init__(self, command):
@@ -19,7 +20,20 @@ class Task:
 	def __iter__(self):
 		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.name, self.command, self.returncode, self.stdout, self.stderr])
 
-def handle_stream(stream,target,pre='',post='',quiet=False):
+def __handle_stream(stream,target,pre='',post='',quiet=False):
+	'''
+	Handle a stream
+
+	@params:
+		stream: The stream to handle
+		target: The target to write to
+		pre: The prefix to add to each line
+		post: The postfix to add to each line
+		quiet: Whether to suppress output
+
+	@returns:
+		None
+	'''
 	def add_line(current_line,target, keepLastLine=True):
 		if not keepLastLine:
 			if not quiet:
@@ -53,15 +67,41 @@ def handle_stream(stream,target,pre='',post='',quiet=False):
 		add_line(current_line,target, keepLastLine=lastLineCommited)
 
 def int_to_color(n, brightness_threshold=500):
-    hash_value = hash(str(n))
-    r = (hash_value >> 16) & 0xFF
-    g = (hash_value >> 8) & 0xFF
-    b = hash_value & 0xFF
-    if (r + g + b) < brightness_threshold:
-        return int_to_color(hash_value, brightness_threshold)
-    return (r, g, b)
+	'''
+	Convert an integer to a color
+
+	@params:
+		n: The integer
+		brightness_threshold: The brightness threshold
+
+	@returns:
+		(int,int,int): The RGB color
+	'''
+	hash_value = hash(str(n))
+	r = (hash_value >> 16) & 0xFF
+	g = (hash_value >> 8) & 0xFF
+	b = hash_value & 0xFF
+	if (r + g + b) < brightness_threshold:
+		return int_to_color(hash_value, brightness_threshold)
+	return (r, g, b)
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
+	'''
+	Run a command ( internal )
+
+	@params:
+		task: The Task object
+		sem: The semaphore
+		timeout: The timeout for the command
+		quiet: Whether to suppress output
+		dry_run: Whether to simulate running the command
+		with_stdErr: Whether to return the standard error output
+		identity: The identity of the command
+
+	@returns:
+		None | int | list[str]: The output of the command
+	'''
+
 	pre = ''
 	post = ''
 	with sem:
@@ -80,11 +120,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			#host.stdout = []
 			proc = subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE)
 			# create a thread to handle stdout
-			stdout_thread = threading.Thread(target=handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet))
+			stdout_thread = threading.Thread(target=__handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet))
 			stdout_thread.start()
 			# create a thread to handle stderr
 			#host.stderr = []
-			stderr_thread = threading.Thread(target=handle_stream, args=(proc.stderr,task.stderr,pre,post,quiet))
+			stderr_thread = threading.Thread(target=__handle_stream, args=(proc.stderr,task.stderr,pre,post,quiet))
 			stderr_thread.start()
 			# Monitor the subprocess and terminate it after the timeout
 			start_time = time.time()
@@ -105,9 +145,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			# here we handle the rest of the stdout after the subprocess returns
 			stdout, stderr = proc.communicate()
 			if stdout:
-				handle_stream(io.BytesIO(stdout),task.stdout, task)
+				__handle_stream(io.BytesIO(stdout),task.stdout, task)
 			if stderr:
-				handle_stream(io.BytesIO(stderr),task.stderr, task)
+				__handle_stream(io.BytesIO(stderr),task.stderr, task)
 			task.returncode = proc.poll()
 			if not quiet:
 				print(pre+'\n'+ '-'*100+post)
@@ -122,10 +162,44 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
-def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False):
+def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
+				return_code_only=False,return_object=False):
+	'''
+	Run a command
+
+	@params:
+		command: The command to run
+		timeout: The timeout for the command
+		max_threads: The maximum number of threads to use
+		quiet: Whether to suppress output
+		dry_run: Whether to simulate running the command
+		with_stdErr: Whether to return the standard error output
+		return_code_only: Whether to return only the return code
+		return_object: Whether to return the Task object
+
+	@returns:
+		None | int | list[str] | Task: The output of the command
+	'''
 	return run_commands([command], timeout, max_threads, quiet, dry_run, with_stdErr, return_code_only, return_object)[0]
 
-def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False):
+def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
+				 return_code_only=False,return_object=False):
+	'''
+	Run multiple commands in parallel
+
+	@params:
+		commands: A list of commands to run
+		timeout: The timeout for each command
+		max_threads: The maximum number of threads to use
+		quiet: Whether to suppress output
+		dry_run: Whether to simulate running the commands
+		with_stdErr: Whether to return the standard error output
+		return_code_only: Whether to return only the return code
+		return_object: Whether to return the Task object
+
+	@returns:
+		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
+	'''
 	# split the commands in commands if it is a string
 	commands = [command.split() if isinstance(command,str) else command for command in commands]
 	# initialize the tasks
@@ -159,12 +233,13 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	"""
 	Read an input from the user with a timeout and a countdown.
 
-	Parameters:
-	timeout (int): The timeout value in seconds.
-	prompt (str): The prompt message to display to the user. Default is 'Please enter your selection'.
+	@params:
+		timeout: The timeout in seconds
+		prompt: The prompt to display to the user
 
-	Returns:
-	str or None: The user input if received within the timeout, or None if no input is received.
+	@returns:
+		str: The input from the user or None if no input was received
+
 	"""
 	# Print the initial prompt with the countdown
 	print(f"{prompt} [{timeout}s]: ", end='', flush=True)
@@ -180,7 +255,20 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# If there is no input, return None
 	return None
 
-def genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
+def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
+	'''
+	Generate a progress bar string
+
+	@params:
+		iteration   - Required  : current iteration (Int)
+		total       - Required  : total iterations (Int)
+		prefix      - Optional  : prefix string (Str)
+		suffix      - Optional  : suffix string (Str)
+		columns     - Optional  : number of columns in the terminal (Int)
+
+	@returns:
+		str: the progress bar string
+	'''
 	noPrefix = False
 	noSuffix = False
 	noPercent = False
@@ -227,6 +315,15 @@ def genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
 	return lineOut
 
 def get_terminal_size():
+	'''
+	Get the terminal size
+
+	@params:
+		None
+
+	@returns:
+		(int,int): the number of columns and rows of the terminal
+	'''
 	try:
 		import os
 		_tsize = os.get_terminal_size()
@@ -241,20 +338,31 @@ def get_terminal_size():
 	return _tsize
 
 def print_progress_bar(iteration, total, prefix='', suffix=''):
+	'''
+	Call in a loop to create terminal progress bar
+	@params:
+		iteration   - Required  : current iteration (Int)
+		total       - Required  : total iterations (Int)
+		prefix      - Optional  : prefix string (Str)
+		suffix      - Optional  : suffix string (Str)
+
+	@returns:
+		None
+	'''
 	prefix += ' |' if not prefix.endswith(' |') else ''
 	suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
 	try:
 		columns, _ = get_terminal_size()
-
-		sys.stdout.write(f'\r{genrate_progress_bar(iteration, total, prefix, suffix, columns)}')
+		sys.stdout.write(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}')
 		sys.stdout.flush()
 		if iteration == total and total > 0:
 			print(file=sys.stdout)
 	except:
 		if iteration % 5 == 0:
-			print(genrate_progress_bar(iteration, total, prefix, suffix))
+			print(_genrate_progress_bar(iteration, total, prefix, suffix))
 
-if __name__ == '__main__':
+
+def main():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
 	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
 #	parser.add_argument('-p','--parse', action='store_true',help='parse ranged input')
@@ -264,3 +372,6 @@ if __name__ == '__main__':
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} by pan@zopyr.us')
 	args = parser.parse_args()
 	run_commands(args.commands, args.timeout, args.max_threads, args.quiet)
+
+if __name__ == '__main__':
+	main()
