@@ -11,7 +11,7 @@ import string
 import re
 import itertools
 
-version = '1.16'
+version = '1.17'
 __version__ = version
 
 __running_threads = []
@@ -191,6 +191,8 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			# Monitor the subprocess and terminate it after the timeout
 			start_time = time.time()
 			outLength = len(task.stdout) + len(task.stderr)
+			time.sleep(0)
+			sleep_time = 1.0e-8 # 10 nanoseconds
 			while proc.poll() is None:  # while the process is still running
 				if len(task.stdout) + len(task.stderr) != outLength:
 					start_time = time.time()
@@ -199,7 +201,10 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 					task.stderr.append('Timeout!')
 					proc.terminate()
 					break
-				time.sleep(0.1)  # avoid busy-waiting
+				time.sleep(sleep_time)
+				# exponential backoff
+				if sleep_time < 0.001:
+					sleep_time *= 2
 			task.returncode = proc.poll()
 			# Wait for output processing to complete
 			stdout_thread.join(timeout=1)

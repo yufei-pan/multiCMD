@@ -28,4 +28,5 @@ setup(
         'Operating System :: Microsoft :: Windows',
     ],
     python_requires='>=3.6',
+	license='GPLv3+',
 )
