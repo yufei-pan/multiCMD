@@ -10,8 +10,9 @@ import os
 import string
 import re
 import itertools
+import signal
 
-version = '1.17'
+version = '1.18'
 __version__ = version
 
 __running_threads = []
@@ -21,10 +22,11 @@ class Task:
 		self.returncode = None
 		self.stdout = []
 		self.stderr = []
+		self.stop = False
 	def __iter__(self):
 		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.command, self.returncode, self.stdout, self.stderr])
 	def __repr__(self):
-		return f'Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr})'
+		return f'Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr}, stop={self.stop})'
 	def __str__(self):
 		return str(dict(self))
 
@@ -194,13 +196,21 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			time.sleep(0)
 			sleep_time = 1.0e-8 # 10 nanoseconds
 			while proc.poll() is None:  # while the process is still running
-				if len(task.stdout) + len(task.stderr) != outLength:
-					start_time = time.time()
-					outLength = len(task.stdout) + len(task.stderr)
-				if timeout > 0 and time.time() - start_time > timeout:
-					task.stderr.append('Timeout!')
+				if task.stop:
+					proc.send_signal(signal.SIGINT)
+					time.sleep(0.01)
 					proc.terminate()
 					break
+				if timeout > 0:
+					if len(task.stdout) + len(task.stderr) != outLength:
+						start_time = time.time()
+						outLength = len(task.stdout) + len(task.stderr)
+					elif time.time() - start_time > timeout:
+						task.stderr.append('Timeout!')
+						proc.send_signal(signal.SIGINT)
+						time.time(0.01)
+						proc.terminate()
+						break
 				time.sleep(sleep_time)
 				# exponential backoff
 				if sleep_time < 0.001:
@@ -215,7 +225,8 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				__handle_stream(io.BytesIO(stdout),task.stdout, task)
 			if stderr:
 				__handle_stream(io.BytesIO(stderr),task.stderr, task)
-			task.returncode = proc.poll()
+			if not task.returncode:
+				task.returncode = -1
 			if not quiet:
 				print(pre+'\n'+ '-'*100+post)
 				print(pre+f'Process exited with return code {task.returncode}'+post)
