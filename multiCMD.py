@@ -208,7 +208,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 					elif time.time() - start_time > timeout:
 						task.stderr.append('Timeout!')
 						proc.send_signal(signal.SIGINT)
-						time.time(0.01)
+						time.sleep(0.01)
 						proc.terminate()
 						break
 				time.sleep(sleep_time)
@@ -225,7 +225,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				__handle_stream(io.BytesIO(stdout),task.stdout, task)
 			if stderr:
 				__handle_stream(io.BytesIO(stderr),task.stderr, task)
-			if not task.returncode:
+			if task.returncode is None:
 				task.returncode = -1
 			if not quiet:
 				print(pre+'\n'+ '-'*100+post)
