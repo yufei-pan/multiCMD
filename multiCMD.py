@@ -12,7 +12,7 @@ import re
 import itertools
 import signal
 
-version = '1.18'
+version = '1.19'
 __version__ = version
 
 __running_threads = []
@@ -226,7 +226,13 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if stderr:
 				__handle_stream(io.BytesIO(stderr),task.stderr, task)
 			if task.returncode is None:
-				task.returncode = -1
+				# process been killed via timeout or sigkill
+				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
+					task.returncode = 124
+				elif task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
+					task.returncode = 137
+				else:
+					task.returncode = -1
 			if not quiet:
 				print(pre+'\n'+ '-'*100+post)
 				print(pre+f'Process exited with return code {task.returncode}'+post)

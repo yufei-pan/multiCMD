@@ -1,5 +1,4 @@
 dist
 multiCMD.egg-info
 __pycache__
-test*
 .vscode
