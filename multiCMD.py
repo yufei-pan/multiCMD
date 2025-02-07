@@ -12,7 +12,7 @@ import re
 import itertools
 import signal
 
-version = '1.19'
+version = '1.20'
 __version__ = version
 
 __running_threads = []
@@ -194,7 +194,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			start_time = time.time()
 			outLength = len(task.stdout) + len(task.stderr)
 			time.sleep(0)
-			sleep_time = 1.0e-8 # 10 nanoseconds
+			sleep_time = 1.0e-7 # 100 nanoseconds
 			while proc.poll() is None:  # while the process is still running
 				if task.stop:
 					proc.send_signal(signal.SIGINT)

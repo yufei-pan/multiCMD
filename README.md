@@ -1,29 +1,22 @@
 # multiCMD
+
 A simple script that is able to issue multiple commands and execute them at the same time locally.
 
-multiCMD can display realtime-ish outputs in color if running multiple commands at the same time.
+`multiCMD` can display realtime-ish outputs in color if running multiple commands at the same time.
 
-Can be used in bash scripts for automation actions.
+It can be used in bash scripts for automation actions, and it can also be imported and act as a wrapper for `subprocess`.
 
-Also able to be imported and act as a wrapper for subprocess.
+- Use `return_object=True` with `run_commands` or `run_command` to get the Task Object (definition below).
+- Use `quiet=True` and `wait_for_return=False` to create a daemon thread that asynchronously updates the return list / objects when commands finish.
 
-Use return_object=True with run_commands or run_command to get the Task Object (definition below)
+For each process, a thread will be initialized if using `-m/--max_threads > 1`.  
+For each thread, `subprocess` is used to open a process for the command task.  
+Two additional threads are opened for processing input and output for the task.  
 
-Use quiet=True and wait_for_return=False to create a daemon thread that async updates the return list / objects when return comes 
+The input / output threads are non-blocking.  
+Thus, using `-t/--timeout` will work more reliably.
 
-For each process, it will initialize a thread if using -m/--max_threads > 1
-
-For each thread, it will use subprocess lib to open a process for the command task
-
-And it will open two sub threads for processing input and output for the task.
-
-They input / output threads will be non-blocking.
-
-Thus using -t/--timeout will work more reliably.
-
-Note: timeout specifies how many seconds multiCMD will kill the command if NO COMMITTED OUTPUT was detected from the program for this long.
-
-An output line is considered committed if steram hanlder encounters a '\n' or '\r' character.
+**Note:** `timeout` specifies how many seconds `multiCMD` will wait before killing the command if **no committed output** was detected for this duration. An output line is considered committed if the **stream handler** encounters a `\n` or `\r` character.
 
 
 Install via
