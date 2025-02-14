@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.20'
+version = '1.22'
 __version__ = version
 
 __running_threads = []
@@ -239,14 +239,21 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 					task.returncode = 137
 				else:
 					task.returncode = -1
-			if not quiet:
-				print(pre+'\n'+ '-'*100+post)
-				print(pre+f'Process exited with return code {task.returncode}'+post)
+		# if file not found
+		except FileNotFoundError as e:
+			print(f'Command / path not found: {task.command[0]}',file=sys.stderr,flush=True)
+			task.stderr.append(str(e))
+			task.returncode = 127
 		except Exception as e:
 			import traceback
+			print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
+			print(str(e).split('\n'))
 			task.stderr.extend(str(e).split('\n'))
 			task.stderr.extend(traceback.format_exc().split('\n'))
 			task.returncode = -1
+		if not quiet:
+			print(pre+'\n'+ '-'*100+post)
+			print(pre+f'Process exited with return code {task.returncode}'+post)
 		if with_stdErr:
 			return task.stdout + task.stderr
 		else:
@@ -520,7 +527,7 @@ def main():
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} by pan@zopyr.us')
 	args = parser.parse_args()
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse)
+	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
 
 if __name__ == '__main__':
 	main()
