@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.22'
+version = '1.23'
 __version__ = version
 
 __running_threads = []
@@ -28,6 +28,7 @@ class Task:
 		self.returncode = None
 		self.stdout = []
 		self.stderr = []
+		self.thread = None
 		self.stop = False
 	def __iter__(self):
 		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.command, self.returncode, self.stdout, self.stderr])
@@ -35,6 +36,10 @@ class Task:
 		return f'Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr}, stop={self.stop})'
 	def __str__(self):
 		return str(dict(self))
+	def is_alive(self):
+		if self.thread is not None:
+			return self.thread.is_alive()
+		return False
 
 def _expand_ranges(inStr):
 	'''
@@ -350,7 +355,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	if max_threads > 1 or not wait_for_return:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
-		for thread in threads:
+		for thread,task in zip(threads,tasks):
+			task.thread = thread
 			thread.start()
 		if wait_for_return:
 			for thread in threads:
