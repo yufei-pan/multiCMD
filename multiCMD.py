@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.25'
+version = '1.26'
 __version__ = version
 
 __running_threads = []
@@ -265,7 +265,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			return task.stdout
 
 def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,
-				return_code_only=True,return_object=False,wait_for_return=True):
+				return_code_only=False,return_object=False,wait_for_return=True,return_true_false=True):
 	'''
 	Ping multiple hosts
 
@@ -283,15 +283,27 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
+	single_host = False
 	if isinstance(hosts,str):
 		commands = [f'ping -c 1 {hosts}']
-		return run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
-							dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
-							return_object=return_object,wait_for_return=wait_for_return)[0]
-	commands = [f'ping -c 1 {host}' for host in hosts]
-	return run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
+		single_host = True
+	else:
+		commands = [f'ping -c 1 {host}' for host in hosts]
+	if return_true_false:
+		return_code_only = True
+	results = run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
 						dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 						return_object=return_object,wait_for_return=wait_for_return)
+	if return_true_false:
+		if single_host:
+			return not results[0]
+		else:
+			return [not result for result in results]
+	else:
+		if single_host:
+			return results[0]
+		else:
+			return results
 
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
