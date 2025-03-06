@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.23'
+version = '1.24'
 __version__ = version
 
 __running_threads = []
@@ -263,6 +263,31 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			return task.stdout + task.stderr
 		else:
 			return task.stdout
+
+def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,
+				return_code_only=True,return_object=False,wait_for_return=True):
+	'''
+	Ping multiple hosts
+
+	@params:
+		hosts: The hosts to ping
+		timeout: The timeout for the command
+		max_threads: The maximum number of threads to use
+		quiet: Whether to suppress output
+		dry_run: Whether to simulate running the command
+		with_stdErr: Whether to append the standard error output to the standard output
+		return_code_only: Whether to return only the return code
+		return_object: Whether to return the Task object
+		wait_for_return: Whether to wait for the return of the command
+
+	@returns:
+		None | int | list[str] | Task: The output of the command
+	'''
+	commands = [f'ping -c 1 {host}' for host in hosts]
+	return run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
+						dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
+						return_object=return_object,wait_for_return=wait_for_return)
+
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True):
