@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.24'
+version = '1.25'
 __version__ = version
 
 __running_threads = []
@@ -283,6 +283,11 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
+	if isinstance(hosts,str):
+		commands = [f'ping -c 1 {hosts}']
+		return run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
+							dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
+							return_object=return_object,wait_for_return=wait_for_return)[0]
 	commands = [f'ping -c 1 {host}' for host in hosts]
 	return run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
 						dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
