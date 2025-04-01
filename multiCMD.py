@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.26'
+version = '1.27'
 __version__ = version
 
 __running_threads = []
@@ -307,7 +307,7 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				return_code_only=False,return_object=False,wait_for_return=True):
+				return_code_only=False,return_object=False,wait_for_return=True, sem = None):
 	'''
 	Run a command
 
@@ -321,13 +321,14 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		return_code_only: Whether to return only the return code
 		return_object: Whether to return the Task object
 		wait_for_return: Whether to wait for the return of the command
+		sem: The semaphore to use for threading
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
-					 return_object=return_object,parse=False,wait_for_return=wait_for_return)[0]
+					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
 
 def __format_command(command,expand = False):
 	'''
@@ -366,7 +367,7 @@ def __format_command(command,expand = False):
 		return __format_command(str(command),expand=expand)
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False, parse = False, wait_for_return = True):
+				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, sem : threading.Semaphore = None):
 	'''
 	Run multiple commands in parallel
 
@@ -381,6 +382,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		return_object: Whether to return the Task object
 		parse: Whether to parse ranged input
 		wait_for_return: Whether to wait for the return of the commands
+		sem: The semaphore to use for threading
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
@@ -395,7 +397,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	if max_threads < 1:
 		max_threads = len(formatedCommands)
 	if max_threads > 1 or not wait_for_return:
-		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
+		if not sem:
+			sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
 		for thread,task in zip(threads,tasks):
 			task.thread = thread
