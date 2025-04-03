@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.27'
+version = '1.28'
 __version__ = version
 
 __running_threads = []
@@ -40,6 +40,179 @@ class Task:
 		if self.thread is not None:
 			return self.thread.is_alive()
 		return False
+	
+class AsyncExecutor:
+	def __init__(self, max_threads=1,semaphore=None,timeout=0,quiet=True,dry_run=False,parse=False):
+		'''
+		AsyncExecutor class to run commands in parallel asynchronously
+		@params:
+			max_threads: The maximum number of threads to use ( int ) ( Note: if passing semaphore, this likely will be ignored )
+			semaphore: The semaphore to use for threading ( threading.Semaphore )
+			timeout: The timeout for each command ( int )
+			quiet: Whether to suppress output ( bool )
+			dry_run: Whether to simulate running the commands ( bool )
+			parse: Whether to parse ranged input ( bool )
+		'''
+		self.max_threads = max_threads
+		self.semaphore = semaphore
+		self.runningThreads = []
+		self.tasks = []
+		self.timeout = timeout
+		self.quiet = quiet
+		self.dry_run = dry_run
+		self.parse = parse
+
+	def __iter__(self):
+		return iter(self.tasks)
+	
+	def __repr__(self):
+		return f'AsyncExecutor(max_threads={self.max_threads}, semaphore={self.semaphore}, runningThreads={self.runningThreads}, tasks={self.tasks}, timeout={self.timeout}, quiet={self.quiet}, dry_run={self.dry_run}, parse={self.parse})'
+	
+	def __str__(self):
+		return str(self.tasks)
+	
+	def __len__(self):
+		return len(self.tasks)
+	
+	def __bool__(self):
+		return bool(self.tasks)
+	
+	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
+		'''
+		Run multiple commands in parallel asynchronously
+		@params:
+			commands: A list of commands to run ( list[str] | list[list[str]] )
+			timeout: The timeout for each command to override the object default
+			max_threads: The maximum number of threads to use to override the object default
+			quiet: Whether to suppress output to override the object default
+			dry_run: Whether to simulate running the commands to override the object default
+			parse: Whether to parse ranged input to override the object default
+			sem: The semaphore to use for threading to override the object default
+		@returns:
+			list: The Task Object of the commands ( list[Task] )
+		'''
+		if timeout is ...:
+			timeout = self.timeout
+		if max_threads is ...:
+			max_threads = self.max_threads
+		if quiet is ...:
+			quiet = self.quiet
+		if dry_run is ...:
+			dry_run = self.dry_run
+		if parse is ...:
+			parse = self.parse
+		if sem is ...:
+			sem = self.semaphore
+		taskObjects: list[Task] = run_commands(commands,timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=False,
+				 return_code_only=False,return_object=True, parse = parse, wait_for_return = False, sem = sem)
+		self.tasks.extend(taskObjects)
+		self.runningThreads.extend([task.thread for task in taskObjects])
+		return taskObjects
+	
+	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
+		'''
+		Run a command in parallel asynchronously
+		@params:
+			command: The command to run ( str | list[str] )
+			timeout: The timeout for each command to override the object default
+			max_threads: The maximum number of threads to use to override the object default
+			quiet: Whether to suppress output to override the object default
+			dry_run: Whether to simulate running the commands to override the object default
+			parse: Whether to parse ranged input to override the object default
+			sem: The semaphore to use for threading to override the object default
+		@returns:
+			Task: The Task Object of the command
+		'''
+		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem)[0]
+	
+	def wait(self, timeout=..., threads = ...):
+		'''
+		Wait for the threads to finish
+		@params:
+			timeout: The timeout for each command to override the object default
+			threads: The threads to join, default to all running threads managed by this object
+		@returns:
+			list[threading.Thread]: The list of running threads that are still running
+		'''
+		if threads is ...:
+			threads = self.runningThreads
+		if timeout is ...:
+			timeout = self.timeout
+		for thread in threads:
+			if timeout > 0:
+				thread.join(timeout=timeout)
+			else:
+				thread.join()
+		self.runningThreads = [thread for thread in self.runningThreads if thread.is_alive()]
+		return self.runningThreads
+	
+	def stop(self,timeout=...):
+		'''
+		Stop all running threads. This signals all threads to stop and joins them
+		@params:
+			None
+		@returns:
+			list[Task]: The list of tasks that are managed by this object
+		'''
+		for task in self.tasks:
+			task.stop = True
+		self.wait(timeout)
+		return self.tasks
+	
+	def cleanup(self,timeout=...):
+		'''
+		Cleanup the tasks and threads. This calls stop() and clears the tasks and threads
+		@params:
+			None
+		@returns:
+			list[Task]: The list of tasks that are managed by this object
+		'''
+		self.stop(timeout)
+		self.tasks = []
+		self.runningThreads = []
+		return self.tasks
+	
+	def join(self, timeout=..., threads = ..., print_error=True):
+		'''
+		Wait for the threads to finish and print error if there is any
+		@params:
+			timeout: The timeout for each command to override the object default
+			threads: The threads to wait for, default to all running threads managed by this object
+		@returns:
+			list[Task]: The list of tasks that are managed by this object
+		'''
+		self.wait(timeout=timeout, threads=threads)
+		for task in self.tasks:
+			if task.returncode != 0 and print_error:
+				print(f'Command: {task.command} failed with return code: {task.returncode}')
+				print('Stdout:')
+				print('\n  '.join(task.stdout))
+				print('Stderr:')
+				print('\n  '.join(task.stderr))
+		return self.tasks
+	
+	def get_results(self, with_stdErr=False):
+		'''
+		Get the results of the tasks
+		@params:
+			with_stdErr: Whether to append the standard error output to the standard output	
+		@returns:
+			list[list[str]]: The output of the tasks ( list[list[str]] )
+		'''
+		if with_stdErr:
+			return [task.stdout + task.stderr for task in self.tasks]
+		else:
+			return [task.stdout for task in self.tasks]
+		
+	def get_return_codes(self):
+		'''
+		Get the return codes of the tasks
+		@params:
+			None
+		@returns:
+			list[int]: The return codes of the tasks ( list[int] )
+		'''
+		return [task.returncode for task in self.tasks]
 
 def _expand_ranges(inStr):
 	'''
