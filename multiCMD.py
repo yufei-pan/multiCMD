@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.28'
+version = '1.29'
 __version__ = version
 
 __running_threads = []
@@ -42,7 +42,7 @@ class Task:
 		return False
 	
 class AsyncExecutor:
-	def __init__(self, max_threads=1,semaphore=None,timeout=0,quiet=True,dry_run=False,parse=False):
+	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
 		'''
 		AsyncExecutor class to run commands in parallel asynchronously
 		@params:
@@ -54,6 +54,8 @@ class AsyncExecutor:
 			parse: Whether to parse ranged input ( bool )
 		'''
 		self.max_threads = max_threads
+		if semaphore is ...:
+			semaphore = threading.Semaphore(max_threads)
 		self.semaphore = semaphore
 		self.runningThreads = []
 		self.tasks = []
@@ -61,6 +63,7 @@ class AsyncExecutor:
 		self.quiet = quiet
 		self.dry_run = dry_run
 		self.parse = parse
+		self.__lastNotJoined = 0
 
 	def __iter__(self):
 		return iter(self.tasks)
@@ -103,6 +106,15 @@ class AsyncExecutor:
 			parse = self.parse
 		if sem is ...:
 			sem = self.semaphore
+		if len(self.runningThreads) > 130000:
+			self.wait(timeout=0)
+			if len(self.runningThreads) > 130000:
+				print('The amount of running threads approching cpython limit of 130704. Waiting until some available.')
+				while len(self.runningThreads) > 120000:
+					self.wait(timeout=1)
+		elif len(self.runningThreads) + self.__lastNotJoined > 1000:
+			self.wait(timeout=0)
+			self.__lastNotJoined = len(self.runningThreads)
 		taskObjects: list[Task] = run_commands(commands,timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=False,
 				 return_code_only=False,return_object=True, parse = parse, wait_for_return = False, sem = sem)
 		self.tasks.extend(taskObjects)
@@ -139,7 +151,7 @@ class AsyncExecutor:
 		if timeout is ...:
 			timeout = self.timeout
 		for thread in threads:
-			if timeout > 0:
+			if timeout >= 0:
 				thread.join(timeout=timeout)
 			else:
 				thread.join()
