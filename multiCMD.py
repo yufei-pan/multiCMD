@@ -238,7 +238,6 @@ def _expand_ranges(inStr):
 		list[str]: The expanded string
 	'''
 	global __variables
-	#TODO: add support for variable assignment
 	expandingStr = [inStr]
 	expandedList = []
 	# all valid alphanumeric characters
