@@ -18,10 +18,11 @@ import re
 import itertools
 import signal
 
-version = '1.29'
+version = '1.30'
 __version__ = version
 
 __running_threads = []
+__variables = {}
 class Task:
 	def __init__(self, command):
 		self.command = command
@@ -236,6 +237,7 @@ def _expand_ranges(inStr):
 	@returns:
 		list[str]: The expanded string
 	'''
+	global __variables
 	#TODO: add support for variable assignment
 	expandingStr = [inStr]
 	expandedList = []
@@ -251,14 +253,22 @@ def _expand_ranges(inStr):
 		parts = group.split(',')
 		for part in parts:
 			part = part.strip()
-			if '-' in part:
+			if ':' in part:
+				variableName, _, part = part.partition(':')
+				__variables[variableName] = part
+				expandingStr.append(currentStr.replace(match.group(0), '', 1))
+			elif '-' in part:
 				try:
 					range_start,_, range_end = part.partition('-')
 				except ValueError:
 					expandedList.append(currentStr)
 					continue
 				range_start = range_start.strip()
+				if range_start in __variables:
+					range_start = __variables[range_start]
 				range_end = range_end.strip()
+				if range_end in __variables:
+					range_end = __variables[range_end]
 				if range_start.isdigit() and range_end.isdigit():
 					padding_length = min(len(range_start), len(range_end))
 					format_str = "{:0" + str(padding_length) + "d}"
