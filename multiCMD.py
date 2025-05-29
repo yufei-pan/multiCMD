@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.30'
+version = '1.31'
 __version__ = version
 
 __running_threads = []
@@ -226,6 +226,66 @@ class AsyncExecutor:
 			list[int]: The return codes of the tasks ( list[int] )
 		'''
 		return [task.returncode for task in self.tasks]
+
+# immutable helpers compiled once at import time
+_BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
+_ALPHANUM     = string.digits + string.ascii_letters
+_ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
+
+def _expand_piece(piece: str, vars_: dict[str, str]) -> list[str]:
+	"""Turn one comma-separated element from inside [...] into a list of strings."""
+	piece = piece.strip()
+
+	# variable assignment  foo:BAR
+	if ':' in piece:
+		var, _, value = piece.partition(':')
+		vars_[var] = value
+		return                            # bracket disappears
+
+	# explicit range  start-end
+	if '-' in piece:
+		start, _, end = (p.strip() for p in piece.partition('-'))
+
+		start = vars_.get(start, start)
+		end   = vars_.get(end,   end)
+
+		if start.isdigit() and end.isdigit():               # decimal range
+			pad = max(len(start), len(end))
+			return [f"{i:0{pad}d}" for i in range(int(start), int(end) + 1)]
+
+		if all(c in string.hexdigits for c in start + end): # hex range
+			return [format(i, 'x') for i in range(int(start, 16),
+												  int(end,   16) + 1)]
+
+		# alphanumeric range (0-9a-zA-Z)
+		try:
+			return [_ALPHANUM[i]
+					for i in range(_ALPHA_IDX[start], _ALPHA_IDX[end] + 1)]
+		except KeyError:
+			pass                                            # fall through
+
+	# plain token or ${var}
+	return [vars_.get(piece, piece)]
+
+def _expand_ranges_fast(inStr: str) -> list[str]:
+	global __variables
+	segments: list[list[str]] = []
+	pos = 0
+	# split the template into literal pieces + expandable pieces
+	for m in _BRACKET_RX.finditer(inStr):
+		if m.start() > pos:
+			segments.append([inStr[pos:m.start()]])          # literal
+		choices: list[str] = []
+		for sub in m.group(1).split(','):
+			expandedPieces = _expand_piece(sub, __variables)
+			if expandedPieces:
+				choices.extend(expandedPieces)
+		segments.append(choices or [''])                        # keep length
+		pos = m.end()
+	segments.append([inStr[pos:]])                           # tail
+
+	# cartesian product of all segments
+	return [''.join(parts) for parts in itertools.product(*segments)]
 
 def _expand_ranges(inStr):
 	'''
@@ -538,7 +598,7 @@ def __format_command(command,expand = False):
 	'''
 	if isinstance(command,str):
 		if expand:
-			commands = _expand_ranges(command)
+			commands = _expand_ranges_fast(command)
 		else:
 			commands = [command]
 		return [command.split() for command in commands]
@@ -552,7 +612,7 @@ def __format_command(command,expand = False):
 				sanitized_command.append(repr(field))
 		if not expand:
 			return [sanitized_command]
-		sanitized_expanded_command = [_expand_ranges(field) for field in sanitized_command]
+		sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
 		# now the command had been expanded to list of list of fields with each field expanded to all possible options
 		# we need to generate all possible combinations of the fields
 		# we will use the cartesian product to do this
