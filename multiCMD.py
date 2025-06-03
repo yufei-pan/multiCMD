@@ -18,7 +18,7 @@ import re
 import itertools
 import signal
 
-version = '1.31'
+version = '1.32'
 __version__ = version
 
 __running_threads = []
@@ -232,7 +232,7 @@ _BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
 _ALPHANUM     = string.digits + string.ascii_letters
 _ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
 
-def _expand_piece(piece: str, vars_: dict[str, str]) -> list[str]:
+def _expand_piece(piece, vars_):
 	"""Turn one comma-separated element from inside [...] into a list of strings."""
 	piece = piece.strip()
 
@@ -267,7 +267,7 @@ def _expand_piece(piece: str, vars_: dict[str, str]) -> list[str]:
 	# plain token or ${var}
 	return [vars_.get(piece, piece)]
 
-def _expand_ranges_fast(inStr: str) -> list[str]:
+def _expand_ranges_fast(inStr):
 	global __variables
 	segments: list[list[str]] = []
 	pos = 0
