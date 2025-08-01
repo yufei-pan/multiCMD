@@ -18,10 +18,10 @@ import re
 import itertools
 import signal
 
-version = '1.32'
+version = '1.33'
 __version__ = version
 
-__running_threads = []
+__running_threads = set()
 __variables = {}
 class Task:
 	def __init__(self, command):
@@ -662,7 +662,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			for thread in threads:
 				thread.join()
 		else:
-			__running_threads.extend(threads)
+			__running_threads.update(threads)
 	else:
 		# just process the commands sequentially
 		sem = threading.Semaphore(1)
@@ -689,8 +689,11 @@ def join_threads(threads=__running_threads,timeout=None):
 	@returns:
 		None
 	'''
+	global __running_threads
 	for thread in threads:
 		thread.join(timeout=timeout)
+	if threads is __running_threads:
+		__running_threads = {t for t in threads if t.is_alive()}
 
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""
