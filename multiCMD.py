@@ -5,6 +5,7 @@
 #     "argparse",
 # ]
 # ///
+#%% imports
 import time
 import threading
 import io
@@ -18,11 +19,20 @@ import re
 import itertools
 import signal
 
-version = '1.33'
+#%% global vars
+version = '1.34'
 __version__ = version
-
+COMMIT_DATE = '2025-08-25'
 __running_threads = set()
 __variables = {}
+
+# immutable helpers compiled once at import time
+_BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
+_ALPHANUM     = string.digits + string.ascii_letters
+_ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
+
+
+#%% objects
 class Task:
 	def __init__(self, command):
 		self.command = command
@@ -41,7 +51,7 @@ class Task:
 		if self.thread is not None:
 			return self.thread.is_alive()
 		return False
-	
+
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
 		'''
@@ -227,11 +237,7 @@ class AsyncExecutor:
 		'''
 		return [task.returncode for task in self.tasks]
 
-# immutable helpers compiled once at import time
-_BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
-_ALPHANUM     = string.digits + string.ascii_letters
-_ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
-
+#%% helper functions
 def _expand_piece(piece, vars_):
 	"""Turn one comma-separated element from inside [...] into a list of strings."""
 	piece = piece.strip()
@@ -286,69 +292,6 @@ def _expand_ranges_fast(inStr):
 
 	# cartesian product of all segments
 	return [''.join(parts) for parts in itertools.product(*segments)]
-
-def _expand_ranges(inStr):
-	'''
-	Expand ranges in a string
-
-	@params:
-		inStr: The string to expand
-
-	@returns:
-		list[str]: The expanded string
-	'''
-	global __variables
-	expandingStr = [inStr]
-	expandedList = []
-	# all valid alphanumeric characters
-	alphanumeric = string.digits + string.ascii_letters
-	while len(expandingStr) > 0:
-		currentStr = expandingStr.pop()
-		match = re.search(r'\[(.*?)]', currentStr)
-		if not match:
-			expandedList.append(currentStr)
-			continue
-		group = match.group(1)
-		parts = group.split(',')
-		for part in parts:
-			part = part.strip()
-			if ':' in part:
-				variableName, _, part = part.partition(':')
-				__variables[variableName] = part
-				expandingStr.append(currentStr.replace(match.group(0), '', 1))
-			elif '-' in part:
-				try:
-					range_start,_, range_end = part.partition('-')
-				except ValueError:
-					expandedList.append(currentStr)
-					continue
-				range_start = range_start.strip()
-				if range_start in __variables:
-					range_start = __variables[range_start]
-				range_end = range_end.strip()
-				if range_end in __variables:
-					range_end = __variables[range_end]
-				if range_start.isdigit() and range_end.isdigit():
-					padding_length = min(len(range_start), len(range_end))
-					format_str = "{:0" + str(padding_length) + "d}"
-					for i in range(int(range_start), int(range_end) + 1):
-						formatted_i = format_str.format(i)
-						expandingStr.append(currentStr.replace(match.group(0), formatted_i, 1))
-				elif all(c in string.hexdigits for c in range_start + range_end):
-					for i in range(int(range_start, 16), int(range_end, 16) + 1):
-						expandingStr.append(currentStr.replace(match.group(0), format(i, 'x'), 1))
-				else:
-					try:
-						start_index = alphanumeric.index(range_start)
-						end_index = alphanumeric.index(range_end)
-						for i in range(start_index, end_index + 1):
-							expandingStr.append(currentStr.replace(match.group(0), alphanumeric[i], 1))
-					except ValueError:
-						expandedList.append(currentStr)
-			else:
-				expandingStr.append(currentStr.replace(match.group(0), part, 1))
-	expandedList.reverse()
-	return expandedList
 
 def __handle_stream(stream,target,pre='',post='',quiet=False):
 	'''
@@ -519,6 +462,43 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
+def __format_command(command,expand = False):
+	'''
+	Format a command
+
+	@params:
+		command: The command to format
+		expand: Whether to expand ranges
+
+	@returns:
+		list[list[str]]: The formatted commands sequence
+	'''
+	if isinstance(command,str):
+		if expand:
+			commands = _expand_ranges_fast(command)
+		else:
+			commands = [command]
+		return [command.split() for command in commands]
+	# elif it is a iterable
+	elif hasattr(command,'__iter__'):
+		sanitized_command = []
+		for field in command:
+			if isinstance(field,str):
+				sanitized_command.append(field)
+			else:
+				sanitized_command.append(repr(field))
+		if not expand:
+			return [sanitized_command]
+		sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
+		# now the command had been expanded to list of list of fields with each field expanded to all possible options
+		# we need to generate all possible combinations of the fields
+		# we will use the cartesian product to do this
+		commands = list(itertools.product(*sanitized_expanded_command))
+		return [list(command) for command in commands]
+	else:
+		return __format_command(str(command),expand=expand)
+
+#%% core funcitons
 def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True,return_true_false=True):
 	'''
@@ -560,7 +540,6 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 		else:
 			return results
 
-
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None):
 	'''
@@ -584,42 +563,6 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
-
-def __format_command(command,expand = False):
-	'''
-	Format a command
-
-	@params:
-		command: The command to format
-		expand: Whether to expand ranges
-
-	@returns:
-		list[list[str]]: The formatted commands sequence
-	'''
-	if isinstance(command,str):
-		if expand:
-			commands = _expand_ranges_fast(command)
-		else:
-			commands = [command]
-		return [command.split() for command in commands]
-	# elif it is a iterable
-	elif hasattr(command,'__iter__'):
-		sanitized_command = []
-		for field in command:
-			if isinstance(field,str):
-				sanitized_command.append(field)
-			else:
-				sanitized_command.append(repr(field))
-		if not expand:
-			return [sanitized_command]
-		sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
-		# now the command had been expanded to list of list of fields with each field expanded to all possible options
-		# we need to generate all possible combinations of the fields
-		# we will use the cartesian product to do this
-		commands = list(itertools.product(*sanitized_expanded_command))
-		return [list(command) for command in commands]
-	else:
-		return __format_command(str(command),expand=expand)
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, sem : threading.Semaphore = None):
@@ -695,6 +638,21 @@ def join_threads(threads=__running_threads,timeout=None):
 	if threads is __running_threads:
 		__running_threads = {t for t in threads if t.is_alive()}
 
+def main():
+	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
+	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
+	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
+	parser.add_argument('-t','--timeout', metavar='timeout', type=int, default=60,help='timeout for each command')
+	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of threads to use')
+	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
+	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
+	args = parser.parse_args()
+	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
+
+if __name__ == '__main__':
+	main()
+
+#%% misc functions
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""
 	Read an input from the user with a timeout and a countdown.
@@ -720,6 +678,148 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		time.sleep(1)
 	# If there is no input, return None
 	return None
+
+def pretty_format_table(data, delimiter = '\t',header = None):
+	version = 1.11
+	_ = version
+	if not data:
+		return ''
+	if isinstance(data, str):
+		data = data.strip('\n').split('\n')
+		data = [line.split(delimiter) for line in data]
+	elif isinstance(data, dict):
+		# flatten the 2D dict to a list of lists
+		if isinstance(next(iter(data.values())), dict):
+			tempData = [['key'] + list(next(iter(data.values())).keys())]
+			tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
+			data = tempData
+		else:
+			# it is a dict of lists
+			data = [[key] + list(value) for key, value in data.items()]
+	elif not isinstance(data, list):
+		data = list(data)
+	# format the list into 2d list of list of strings
+	if isinstance(data[0], dict):
+		tempData = [data[0].keys()]
+		tempData.extend([list(item.values()) for item in data])
+		data = tempData
+	data = [[str(item) for item in row] for row in data]
+	num_cols = len(data[0])
+	col_widths = [0] * num_cols
+	# Calculate the maximum width of each column
+	for c in range(num_cols):
+		#col_widths[c] = max(len(row[c]) for row in data)
+		# handle ansii escape sequences
+		col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
+	if header:
+		header_widths = [len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', col)) for col in header]
+		col_widths = [max(col_widths[i], header_widths[i]) for i in range(num_cols)]
+	# Build the row format string
+	row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
+	# Print the header
+	if not header:
+		header = data[0]
+		outTable = []
+		outTable.append(row_format.format(*header))
+		outTable.append('-+-'.join('-' * width for width in col_widths))
+		for row in data[1:]:
+			# if the row is empty, print an divider
+			if not any(row):
+				outTable.append('-+-'.join('-' * width for width in col_widths))
+			else:
+				outTable.append(row_format.format(*row))
+	else:
+		# pad / truncate header to appropriate length
+		if isinstance(header,str):
+			header = header.split(delimiter)
+		if len(header) < num_cols:
+			header += ['']*(num_cols-len(header))
+		elif len(header) > num_cols:
+			header = header[:num_cols]
+		outTable = []
+		outTable.append(row_format.format(*header))
+		outTable.append('-+-'.join('-' * width for width in col_widths))
+		for row in data:
+			# if the row is empty, print an divider
+			if not any(row):
+				outTable.append('-+-'.join('-' * width for width in col_widths))
+			else:
+				outTable.append(row_format.format(*row))
+	return '\n'.join(outTable) + '\n'
+
+def parseTable(data,sort=False):
+	if isinstance(data, str):
+		data = data.strip('\n').split('\n')
+	header_line = data[0]
+	# Use regex to find column names and their positions
+	pattern = r'(\S(?:.*?\S)?)(?=\s{2,}|\s*$)'
+	matches = list(re.finditer(pattern, header_line))
+	data_list = [[]]
+	columns = []
+	for i, match in enumerate(matches):
+		col_name = match.group(1)
+		data_list[0].append(col_name)
+		start = match.start()
+		if i + 1 < len(matches):
+			end = matches[i+1].start()
+		else:
+			end = None  # Last column goes till the end
+		columns.append((col_name, start, end))	
+	for line in data[1:]:
+		if not line.strip():
+			continue  # Skip empty lines
+		row = []
+		for col_name, start, end in columns:
+			if end is not None:
+				value = line[start:end].strip()
+			else:
+				value = line[start:].strip()
+			row.append(value)
+		data_list.append(row)
+	# sort data_list[1:] by the first column
+	if sort:
+		data_list[1:] = sorted(data_list[1:], key=lambda x: x[0])
+	return data_list
+
+def slugify(value, allow_unicode=False):
+	import unicodedata
+	"""
+	Taken from https://github.com/django/django/blob/master/django/utils/text.py
+	Convert to ASCII if 'allow_unicode' is False. Convert spaces or repeated
+	dashes to single dashes. Remove characters that aren't alphanumerics,
+	underscores, or hyphens. Convert to lowercase. Also strip leading and
+	trailing whitespace, dashes, and underscores.
+	"""
+	value = str(value)
+	if allow_unicode:
+		value = unicodedata.normalize('NFKC', value)
+	else:
+		value = unicodedata.normalize('NFKD', value).encode('ascii', 'ignore').decode('ascii')
+	value = re.sub(r'[^\w\s-]', '', value.lower())
+	return re.sub(r'[-\s]+', '-', value).strip('-_')
+
+def get_terminal_size():
+	'''
+	Get the terminal size
+
+	@params:
+		None
+
+	@returns:
+		(int,int): the number of columns and rows of the terminal
+	'''
+	try:
+		import os
+		_tsize = os.get_terminal_size()
+	except:
+		try:
+			import fcntl, termios, struct
+			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
+			_tsize = struct.unpack('HHHH', packed)[:2]
+		except:
+			import shutil
+			_tsize = shutil.get_terminal_size(fallback=(120, 30))
+	return _tsize
 
 def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
 	'''
@@ -780,29 +880,6 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
 		lineOut += suffix
 	return lineOut
 
-def get_terminal_size():
-	'''
-	Get the terminal size
-
-	@params:
-		None
-
-	@returns:
-		(int,int): the number of columns and rows of the terminal
-	'''
-	try:
-		import os
-		_tsize = os.get_terminal_size()
-	except:
-		try:
-			import fcntl, termios, struct
-			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
-			_tsize = struct.unpack('HHHH', packed)[:2]
-		except:
-			import shutil
-			_tsize = shutil.get_terminal_size(fallback=(120, 30))
-	return _tsize
-
 def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
 	Call in a loop to create terminal progress bar
@@ -826,17 +903,3 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	except:
 		if iteration % 5 == 0:
 			print(_genrate_progress_bar(iteration, total, prefix, suffix))
-
-def main():
-	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
-	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
-	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
-	parser.add_argument('-t','--timeout', metavar='timeout', type=int, default=60,help='timeout for each command')
-	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of threads to use')
-	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
-	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} by pan@zopyr.us')
-	args = parser.parse_args()
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
-
-if __name__ == '__main__':
-	main()
