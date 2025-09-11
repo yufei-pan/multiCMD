@@ -20,9 +20,9 @@ import itertools
 import signal
 
 #%% global vars
-version = '1.34'
+version = '1.35'
 __version__ = version
-COMMIT_DATE = '2025-08-25'
+COMMIT_DATE = '2025-09-10'
 __running_threads = set()
 __variables = {}
 
@@ -679,73 +679,119 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# If there is no input, return None
 	return None
 
-def pretty_format_table(data, delimiter = '\t',header = None):
-	version = 1.11
+def pretty_format_table(data, delimiter="\t", header=None, full=False):
+	import re
+	version = 1.12
 	_ = version
+	def visible_len(s):
+		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
+	def table_width(col_widths, sep_len):
+		# total width = sum of column widths + separators between columns
+		return sum(col_widths) + sep_len * (len(col_widths) - 1)
+	def truncate_to_width(s, width):
+		# If fits, leave as is. If too long and width >= 1, keep width-1 chars + "."
+		# If width == 0, nothing fits; return empty string.
+		if visible_len(s) <= width:
+			return s
+		if width <= 0:
+			return ""
+		# Build a truncated plain string based on visible chars (no ANSI awareness for slicing)
+		# For simplicity, slice the raw string. This may cut ANSI; best to avoid ANSI in data if truncation occurs.
+		return s[: max(width - 2, 0)] + ".."
 	if not data:
-		return ''
+		return ""
+	# Normalize input data structure
 	if isinstance(data, str):
-		data = data.strip('\n').split('\n')
+		data = data.strip("\n").split("\n")
 		data = [line.split(delimiter) for line in data]
 	elif isinstance(data, dict):
-		# flatten the 2D dict to a list of lists
 		if isinstance(next(iter(data.values())), dict):
-			tempData = [['key'] + list(next(iter(data.values())).keys())]
-			tempData.extend( [[key] + list(value.values()) for key, value in data.items()])
+			tempData = [["key"] + list(next(iter(data.values())).keys())]
+			tempData.extend([[key] + list(value.values()) for key, value in data.items()])
 			data = tempData
 		else:
-			# it is a dict of lists
 			data = [[key] + list(value) for key, value in data.items()]
 	elif not isinstance(data, list):
 		data = list(data)
-	# format the list into 2d list of list of strings
 	if isinstance(data[0], dict):
-		tempData = [data[0].keys()]
+		tempData = [list(data[0].keys())]
 		tempData.extend([list(item.values()) for item in data])
 		data = tempData
 	data = [[str(item) for item in row] for row in data]
 	num_cols = len(data[0])
-	col_widths = [0] * num_cols
-	# Calculate the maximum width of each column
-	for c in range(num_cols):
-		#col_widths[c] = max(len(row[c]) for row in data)
-		# handle ansii escape sequences
-		col_widths[c] = max(len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',row[c])) for row in data)
-	if header:
-		header_widths = [len(re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', col)) for col in header]
-		col_widths = [max(col_widths[i], header_widths[i]) for i in range(num_cols)]
-	# Build the row format string
-	row_format = ' | '.join('{{:<{}}}'.format(width) for width in col_widths)
-	# Print the header
-	if not header:
+	# Resolve header and rows
+	using_provided_header = header is not None
+	if not using_provided_header:
 		header = data[0]
-		outTable = []
-		outTable.append(row_format.format(*header))
-		outTable.append('-+-'.join('-' * width for width in col_widths))
-		for row in data[1:]:
-			# if the row is empty, print an divider
-			if not any(row):
-				outTable.append('-+-'.join('-' * width for width in col_widths))
-			else:
-				outTable.append(row_format.format(*row))
+		rows = data[1:]
 	else:
-		# pad / truncate header to appropriate length
-		if isinstance(header,str):
+		if isinstance(header, str):
 			header = header.split(delimiter)
+		# Pad/trim header to match num_cols
 		if len(header) < num_cols:
-			header += ['']*(num_cols-len(header))
+			header = header + [""] * (num_cols - len(header))
 		elif len(header) > num_cols:
 			header = header[:num_cols]
-		outTable = []
-		outTable.append(row_format.format(*header))
-		outTable.append('-+-'.join('-' * width for width in col_widths))
-		for row in data:
-			# if the row is empty, print an divider
+		rows = data
+	# Compute initial column widths based on data and header
+	def compute_col_widths(hdr, rows_):
+		col_w = [0] * len(hdr)
+		for i in range(len(hdr)):
+			col_w[i] = max(visible_len(hdr[i]), *(visible_len(r[i]) for r in rows_ if i < len(r)))
+		return col_w
+	# Ensure all rows have the same number of columns
+	normalized_rows = []
+	for r in rows:
+		if len(r) < num_cols:
+			r = r + [""] * (num_cols - len(r))
+		elif len(r) > num_cols:
+			r = r[:num_cols]
+		normalized_rows.append(r)
+	rows = normalized_rows
+	col_widths = compute_col_widths(header, rows)
+	# If full=True, keep existing formatting
+	# Else try to fit within the terminal width by:
+	# 1) Switching to compressed separators if needed
+	# 2) Recursively compressing columns (truncating with ".")
+	sep = " | "
+	hsep = "-+-"
+	cols = get_terminal_size()[0]
+	def render(hdr, rows, col_w, sep_str, hsep_str):
+		row_fmt = sep_str.join("{{:<{}}}".format(w) for w in col_w)
+		out = []
+		out.append(row_fmt.format(*hdr))
+		out.append(hsep_str.join("-" * w for w in col_w))
+		for row in rows:
 			if not any(row):
-				outTable.append('-+-'.join('-' * width for width in col_widths))
+				out.append(hsep_str.join("-" * w for w in col_w))
 			else:
-				outTable.append(row_format.format(*row))
-	return '\n'.join(outTable) + '\n'
+				row = [truncate_to_width(row[i], col_w[i]) for i in range(len(row))]
+				out.append(row_fmt.format(*row))
+		return "\n".join(out) + "\n"
+	if full:
+		return render(header, rows, col_widths, sep, hsep)
+	# Try default separators first
+	if table_width(col_widths, len(sep)) <= cols:
+		return render(header, rows, col_widths, sep, hsep)
+	# Use compressed separators (no spaces)
+	sep = "|"
+	hsep = "+"
+	if table_width(col_widths, len(sep)) <= cols:
+		return render(header, rows, col_widths, sep, hsep)
+	# Begin column compression
+	# Track which columns have been compressed already to header width
+	header_widths = [visible_len(h) for h in header]
+	width_diff = [max(col_widths[i] - header_widths[i],0) for i in range(num_cols)]
+	total_overflow_width = table_width(col_widths, len(sep)) - cols
+	for i, diff in sorted(enumerate(width_diff), key=lambda x: -x[1]):
+		if total_overflow_width <= 0:
+			break
+		if diff <= 0:
+			continue
+		reduce_by = min(diff, total_overflow_width)
+		col_widths[i] -= reduce_by
+		total_overflow_width -= reduce_by
+	return render(header, rows, col_widths, sep, hsep)
 
 def parseTable(data,sort=False):
 	if isinstance(data, str):
@@ -903,3 +949,109 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	except:
 		if iteration % 5 == 0:
 			print(_genrate_progress_bar(iteration, total, prefix, suffix))
+
+def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_format=".2f"):
+	if to_int or isinstance(size, str):
+		if isinstance(size, int):
+			return size
+		elif isinstance(size, str):
+			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
+			if not match:
+				if to_str:
+					return size
+				print(
+					"Invalid size format. Expected format: 'number [unit]', "
+					"e.g., '1.5 GiB' or '1.5GiB'"
+				)
+				print(f"Got: {size}")
+				return 0
+			number, _, unit = match.groups()
+			number = float(number)
+			unit = unit.strip().lower().rstrip("b")
+			if unit.endswith("i"):
+				use_1024_bytes = True
+			elif use_1024_bytes is None:
+				use_1024_bytes = False
+			unit = unit.rstrip("i")
+			if use_1024_bytes:
+				power = 2**10
+			else:
+				power = 10**3
+			unit_labels = {
+				"": 0,
+				"k": 1,
+				"m": 2,
+				"g": 3,
+				"t": 4,
+				"p": 5,
+				"e": 6,
+				"z": 7,
+				"y": 8,
+			}
+			if unit not in unit_labels:
+				if to_str:
+					return size
+			else:
+				if to_str:
+					return format_bytes(
+						size=int(number * (power**unit_labels[unit])),
+						use_1024_bytes=use_1024_bytes,
+						to_str=True,
+						str_format=str_format,
+					)
+				return int(number * (power**unit_labels[unit]))
+		else:
+			try:
+				return int(size)
+			except Exception:
+				return 0
+	elif to_str or isinstance(size, int) or isinstance(size, float):
+		if isinstance(size, str):
+			try:
+				size = size.rstrip("B").rstrip("b")
+				size = float(size.lower().strip())
+			except Exception:
+				return size
+		if use_1024_bytes or use_1024_bytes is None:
+			power = 2**10
+			n = 0
+			power_labels = {
+				0: "",
+				1: "Ki",
+				2: "Mi",
+				3: "Gi",
+				4: "Ti",
+				5: "Pi",
+				6: "Ei",
+				7: "Zi",
+				8: "Yi",
+			}
+			while size > power:
+				size /= power
+				n += 1
+			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")
+		else:
+			power = 10**3
+			n = 0
+			power_labels = {
+				0: "",
+				1: "K",
+				2: "M",
+				3: "G",
+				4: "T",
+				5: "P",
+				6: "E",
+				7: "Z",
+				8: "Y",
+			}
+			while size > power:
+				size /= power
+				n += 1
+			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")
+	else:
+		try:
+			return format_bytes(float(size), use_1024_bytes)
+		except Exception:
+			pass
+		return 0
+
