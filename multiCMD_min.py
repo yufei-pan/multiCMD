@@ -181,8 +181,8 @@ if True:
 			elif return_object:return A
 			elif with_stdErr:return[A.stdout+A.stderr for A in A]
 			else:return[A.stdout for A in A]
-		def join_threads(threads=__running_threads,timeout=None):
-			A=threads
+		def join_threads(threads=...,timeout=None):
+			A=multiCMD.__running_threads if threads is ... else threads
 			for B in A:B.join(timeout=timeout)
 			if A is multiCMD.__running_threads:multiCMD.__running_threads={A for A in A if A.is_alive()}
 		def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):

@@ -20,7 +20,7 @@ import itertools
 import signal
 
 #%% global vars
-version = '1.35'
+version = '1.36'
 __version__ = version
 COMMIT_DATE = '2025-09-10'
 __running_threads = set()
@@ -621,7 +621,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	else:
 		return [task.stdout for task in tasks]
 
-def join_threads(threads=__running_threads,timeout=None):
+def join_threads(threads=...,timeout=None):
 	'''
 	Join threads
 
@@ -633,6 +633,8 @@ def join_threads(threads=__running_threads,timeout=None):
 		None
 	'''
 	global __running_threads
+	if threads is ...:
+		threads = __running_threads
 	for thread in threads:
 		thread.join(timeout=timeout)
 	if threads is __running_threads:
