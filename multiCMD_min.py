@@ -215,7 +215,7 @@ if True:
 				E=A
 			def V(hdr,rows_):
 				B=hdr;C=[0]*len(B)
-				for A in range(len(B)):C[A]=max(J(B[A]),*(J(B[A])for B in rows_ if A<len(B)))
+				for A in range(len(B)):C[A]=max(0,J(B[A]),*(J(B[A])for B in rows_ if A<len(B)))
 				return C
 			P=[]
 			for F in E:

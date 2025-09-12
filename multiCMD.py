@@ -20,9 +20,9 @@ import itertools
 import signal
 
 #%% global vars
-version = '1.36'
+version = '1.37'
 __version__ = version
-COMMIT_DATE = '2025-09-10'
+COMMIT_DATE = '2025-09-11'
 __running_threads = set()
 __variables = {}
 
@@ -739,7 +739,7 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 	def compute_col_widths(hdr, rows_):
 		col_w = [0] * len(hdr)
 		for i in range(len(hdr)):
-			col_w[i] = max(visible_len(hdr[i]), *(visible_len(r[i]) for r in rows_ if i < len(r)))
+			col_w[i] = max(0, visible_len(hdr[i]), *(visible_len(r[i]) for r in rows_ if i < len(r)))
 		return col_w
 	# Ensure all rows have the same number of columns
 	normalized_rows = []
