@@ -444,7 +444,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 					task.returncode = -1
 		# if file not found
 		except FileNotFoundError as e:
-			print(f'Command / path not found: {task.command[0]}',file=sys.stderr,flush=True)
+			print(f'Command path not found: {task.command[0]}',file=sys.stderr,flush=True)
 			task.stderr.append(str(e))
 			task.returncode = 127
 		except Exception as e:
