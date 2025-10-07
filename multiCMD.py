@@ -20,9 +20,9 @@ import itertools
 import signal
 
 #%% global vars
-version = '1.37'
+version = '1.38'
 __version__ = version
-COMMIT_DATE = '2025-09-11'
+COMMIT_DATE = '2025-10-06'
 __running_threads = set()
 __variables = {}
 
@@ -795,12 +795,12 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 		total_overflow_width -= reduce_by
 	return render(header, rows, col_widths, sep, hsep)
 
-def parseTable(data,sort=False):
+def parseTable(data,sort=False,min_space=2):
 	if isinstance(data, str):
 		data = data.strip('\n').split('\n')
 	header_line = data[0]
 	# Use regex to find column names and their positions
-	pattern = r'(\S(?:.*?\S)?)(?=\s{2,}|\s*$)'
+	pattern = r'(\S(?:.*?\S)?)(?=\s{'+ str(min_space) + r',}|\s*$)'
 	matches = list(re.finditer(pattern, header_line))
 	data_list = [[]]
 	columns = []
