@@ -115,7 +115,7 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 		try:
 			if F is not None:
 				if F==...:F=threading.get_ident()
-				P,Q,R=int_to_color(F);C=f"[38;2;{P};{Q};{R}m";D='\x1b[0m'
+				P,Q,R=int_to_color(F);C=f"\033[38;2;{P};{Q};{R}m";D='\x1b[0m'
 			if not E:print(C+'Running command: '+' '.join(A.command)+D);print(C+'-'*100+D)
 			if dry_run:return A.stdout+A.stderr
 			B=subprocess.Popen(A.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);J=threading.Thread(target=__handle_stream,args=(B.stdout,A.stdout,C,D,E),daemon=True);J.start();K=threading.Thread(target=__handle_stream,args=(B.stderr,A.stderr,C,D,E),daemon=True);K.start();L=time.time();M=len(A.stdout)+len(A.stderr);time.sleep(0);H=1e-07

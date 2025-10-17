@@ -6,18 +6,17 @@
 # ]
 # ///
 #%% imports
-import time
-import threading
-import io
 import argparse
-import sys
-import subprocess
-import select
-import os
-import string
-import re
+import io
 import itertools
+import re
+import select
 import signal
+import string
+import subprocess
+import sys
+import threading
+import time
 
 #%% global vars
 version = '1.38'
@@ -859,12 +858,14 @@ def get_terminal_size():
 	try:
 		import os
 		_tsize = os.get_terminal_size()
-	except:
+	except Exception:
 		try:
-			import fcntl, termios, struct
+			import fcntl
+			import struct
+			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
 			_tsize = struct.unpack('HHHH', packed)[:2]
-		except:
+		except Exception:
 			import shutil
 			_tsize = shutil.get_terminal_size(fallback=(120, 30))
 	return _tsize
@@ -923,7 +924,7 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
 			lineOut += percent
 	else:
 		if length >= 16:
-			lineOut += f' Calculating... '
+			lineOut += ' Calculating... '
 	if not noSuffix:
 		lineOut += suffix
 	return lineOut
@@ -948,7 +949,7 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 		sys.stdout.flush()
 		if iteration == total and total > 0:
 			print(file=sys.stdout)
-	except:
+	except Exception:
 		if iteration % 5 == 0:
 			print(_genrate_progress_bar(iteration, total, prefix, suffix))
 
