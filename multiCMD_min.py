@@ -2,10 +2,10 @@ import types, sys
 multiCMD = types.ModuleType('multiCMD')
 sys.modules['multiCMD'] = multiCMD
 _src  = r'''
-import time,threading,io,sys,subprocess,select,string,re,itertools,signal
-version='1.38_min'
+import argparse,io,itertools,math,re,select,signal,string,subprocess,sys,threading,time
+version='1.39'
 __version__=version
-COMMIT_DATE='2025-10-06'
+COMMIT_DATE='2025-10-28'
 __running_threads=set()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
@@ -105,17 +105,18 @@ def __handle_stream(stream,target,pre='',post='',quiet=False):
 		elif F==b'\r':D(A,C,keepLastLine=B);A=bytearray();B=False
 		else:A.extend(F)
 	if A:D(A,C,keepLastLine=B)
-def int_to_color(n,brightness_threshold=500):
-	B=brightness_threshold;A=hash(str(n));C=A>>16&255;D=A>>8&255;E=A&255
-	if C+D+E<B:return int_to_color(A,B)
-	return C,D,E
+def int_to_color(hash_value,min_brightness=100,max_brightness=220):
+	C=max_brightness;B=min_brightness;A=hash_value;D=A>>16&255;E=A>>8&255;F=A&255;G=math.sqrt(.299*D**2+.587*E**2+.114*F**2)
+	if G<B:return int_to_color(hash(str(A)),B,C)
+	if G>C:return int_to_color(hash(str(A)),B,C)
+	return D,E,F
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	I=timeout;F=identity;E=quiet;A=task;C='';D=''
 	with sem:
 		try:
 			if F is not None:
 				if F==...:F=threading.get_ident()
-				P,Q,R=int_to_color(F);C=f"\033[38;2;{P};{Q};{R}m";D='\x1b[0m'
+				P,Q,R=int_to_color(F);C=f"[38;2;{P};{Q};{R}m";D='\x1b[0m'
 			if not E:print(C+'Running command: '+' '.join(A.command)+D);print(C+'-'*100+D)
 			if dry_run:return A.stdout+A.stderr
 			B=subprocess.Popen(A.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);J=threading.Thread(target=__handle_stream,args=(B.stdout,A.stdout,C,D,E),daemon=True);J.start();K=threading.Thread(target=__handle_stream,args=(B.stderr,A.stderr,C,D,E),daemon=True);K.start();L=time.time();M=len(A.stdout)+len(A.stderr);time.sleep(0);H=1e-07
@@ -270,11 +271,11 @@ def slugify(value,allow_unicode=False):
 	A=re.sub('[^\\w\\s-]','',A.lower());return re.sub('[-\\s]+','-',A).strip('-_')
 def get_terminal_size():
 	try:import os;A=os.get_terminal_size()
-	except:
-		try:import fcntl,termios as C,struct as B;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
-		except:import shutil as E;A=E.get_terminal_size(fallback=(120,30))
+	except Exception:
+		try:import fcntl,struct as B,termios as C;D=fcntl.ioctl(0,C.TIOCGWINSZ,B.pack('HHHH',0,0,0,0));A=B.unpack('HHHH',D)[:2]
+		except Exception:import shutil as E;A=E.get_terminal_size(fallback=(240,50))
 	return A
-def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=120):
+def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	G=columns;F=prefix;E=total;C=suffix;B=iteration;J=False;K=False;L=False;M=False
 	if E==0:return f"{F} iteration:{B} {C}".ljust(G)
 	N=f"|{'{0:.1f}'.format(100*(B/float(E)))}% ";A=G-len(F)-len(C)-len(N)-3
@@ -297,7 +298,7 @@ total:
 	if not M:
 		D+=f"{O}"
 		if not L:D+=N
-	elif A>=16:D+=f" Calculating... "
+	elif A>=16:D+=' Calculating... '
 	if not K:D+=C
 	return D
 def print_progress_bar(iteration,total,prefix='',suffix=''):
@@ -305,7 +306,7 @@ def print_progress_bar(iteration,total,prefix='',suffix=''):
 	try:
 		E,F=get_terminal_size();sys.stdout.write(f"\r{_genrate_progress_bar(B,C,D,A,E)}");sys.stdout.flush()
 		if B==C and C>0:print(file=sys.stdout)
-	except:
+	except Exception:
 		if B%5==0:print(_genrate_progress_bar(B,C,D,A))
 def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
 	H=str_format;F=to_str;C=use_1024_bytes;A=size

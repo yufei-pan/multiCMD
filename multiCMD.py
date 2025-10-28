@@ -9,6 +9,7 @@
 import argparse
 import io
 import itertools
+import math
 import re
 import select
 import signal
@@ -19,9 +20,9 @@ import threading
 import time
 
 #%% global vars
-version = '1.38'
+version = '1.39'
 __version__ = version
-COMMIT_DATE = '2025-10-06'
+COMMIT_DATE = '2025-10-28'
 __running_threads = set()
 __variables = {}
 
@@ -338,23 +339,15 @@ def __handle_stream(stream,target,pre='',post='',quiet=False):
 	if current_line:
 		add_line(current_line,target, keepLastLine=lastLineCommited)
 
-def int_to_color(n, brightness_threshold=500):
-	'''
-	Convert an integer to a color
-
-	@params:
-		n: The integer
-		brightness_threshold: The brightness threshold
-
-	@returns:
-		(int,int,int): The RGB color
-	'''
-	hash_value = hash(str(n))
+def int_to_color(hash_value, min_brightness=100,max_brightness=220):
 	r = (hash_value >> 16) & 0xFF
 	g = (hash_value >> 8) & 0xFF
 	b = hash_value & 0xFF
-	if (r + g + b) < brightness_threshold:
-		return int_to_color(hash_value, brightness_threshold)
+	brightness = math.sqrt(0.299 * r**2 + 0.587 * g**2 + 0.114 * b**2)
+	if brightness < min_brightness:
+		return int_to_color(hash(str(hash_value)), min_brightness, max_brightness)
+	if brightness > max_brightness:
+		return int_to_color(hash(str(hash_value)), min_brightness, max_brightness)
 	return (r, g, b)
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
@@ -382,8 +375,8 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				if identity == ...:
 					identity = threading.get_ident()
 				r, g, b = int_to_color(identity)
-				pre = f'\033[38;2;{r};{g};{b}m'
-				post = '\033[0m'
+				pre = f'\x1b[38;2;{r};{g};{b}m'
+				post = '\x1b[0m'
 			if not quiet:
 				print(pre+'Running command: '+' '.join(task.command)+post)
 				print(pre+'-'*100+post)
@@ -867,10 +860,10 @@ def get_terminal_size():
 			_tsize = struct.unpack('HHHH', packed)[:2]
 		except Exception:
 			import shutil
-			_tsize = shutil.get_terminal_size(fallback=(120, 30))
+			_tsize = shutil.get_terminal_size(fallback=(240, 50))
 	return _tsize
 
-def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=120):
+def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	'''
 	Generate a progress bar string
 
