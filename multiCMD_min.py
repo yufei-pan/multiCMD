@@ -1,4 +1,5 @@
-import types, sys
+import sys
+import types
 multiCMD = types.ModuleType('multiCMD')
 sys.modules['multiCMD'] = multiCMD
 _src  = r'''
