@@ -20,9 +20,9 @@ import threading
 import time
 
 #%% global vars
-version = '1.39'
+version = '1.40'
 __version__ = version
-COMMIT_DATE = '2025-10-28'
+COMMIT_DATE = '2025-11-18'
 __running_threads = set()
 __variables = {}
 
@@ -673,25 +673,10 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# If there is no input, return None
 	return None
 
-def pretty_format_table(data, delimiter="\t", header=None, full=False):
+def pretty_format_table(data, delimiter=None, header=None, full=False):
 	import re
-	version = 1.12
+	version = 1.20
 	_ = version
-	def visible_len(s):
-		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
-	def table_width(col_widths, sep_len):
-		# total width = sum of column widths + separators between columns
-		return sum(col_widths) + sep_len * (len(col_widths) - 1)
-	def truncate_to_width(s, width):
-		# If fits, leave as is. If too long and width >= 1, keep width-1 chars + "."
-		# If width == 0, nothing fits; return empty string.
-		if visible_len(s) <= width:
-			return s
-		if width <= 0:
-			return ""
-		# Build a truncated plain string based on visible chars (no ANSI awareness for slicing)
-		# For simplicity, slice the raw string. This may cut ANSI; best to avoid ANSI in data if truncation occurs.
-		return s[: max(width - 2, 0)] + ".."
 	if not data:
 		return ""
 	# Normalize input data structure
@@ -700,83 +685,74 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 		data = [line.split(delimiter) for line in data]
 	elif isinstance(data, dict):
 		if isinstance(next(iter(data.values())), dict):
-			tempData = [["key"] + list(next(iter(data.values())).keys())]
-			tempData.extend([[key] + list(value.values()) for key, value in data.items()])
-			data = tempData
+			if not header:
+				header = ["key"] + list(next(iter(data.values())).keys())
+			data = [[key] + list(value.values()) for key, value in data.items()]
 		else:
 			data = [[key] + list(value) for key, value in data.items()]
 	elif not isinstance(data, list):
 		data = list(data)
 	if isinstance(data[0], dict):
-		tempData = [list(data[0].keys())]
-		tempData.extend([list(item.values()) for item in data])
-		data = tempData
+		if not header:
+			header = list(data[0].keys())
+		data = [list(item.values()) for item in data]
+	elif isinstance(data[0], str):
+		data = [row.split(delimiter) for row in data]
 	data = [[str(item) for item in row] for row in data]
-	num_cols = len(data[0])
-	# Resolve header and rows
-	using_provided_header = header is not None
-	if not using_provided_header:
+	if isinstance(header, str):
+		header = header.split(delimiter)
+	if not header or not any(header):
 		header = data[0]
-		rows = data[1:]
-	else:
-		if isinstance(header, str):
-			header = header.split(delimiter)
-		# Pad/trim header to match num_cols
-		if len(header) < num_cols:
-			header = header + [""] * (num_cols - len(header))
-		elif len(header) > num_cols:
-			header = header[:num_cols]
-		rows = data
-	# Compute initial column widths based on data and header
-	def compute_col_widths(hdr, rows_):
-		col_w = [0] * len(hdr)
-		for i in range(len(hdr)):
-			col_w[i] = max(0, visible_len(hdr[i]), *(visible_len(r[i]) for r in rows_ if i < len(r)))
-		return col_w
+		data = data[1:]
+	num_cols = len(header)
+	def visible_len(s):
+		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
 	# Ensure all rows have the same number of columns
-	normalized_rows = []
-	for r in rows:
-		if len(r) < num_cols:
-			r = r + [""] * (num_cols - len(r))
-		elif len(r) > num_cols:
-			r = r[:num_cols]
-		normalized_rows.append(r)
-	rows = normalized_rows
-	col_widths = compute_col_widths(header, rows)
-	# If full=True, keep existing formatting
-	# Else try to fit within the terminal width by:
-	# 1) Switching to compressed separators if needed
-	# 2) Recursively compressing columns (truncating with ".")
-	sep = " | "
-	hsep = "-+-"
-	cols = get_terminal_size()[0]
-	def render(hdr, rows, col_w, sep_str, hsep_str):
-		row_fmt = sep_str.join("{{:<{}}}".format(w) for w in col_w)
-		out = []
-		out.append(row_fmt.format(*hdr))
-		out.append(hsep_str.join("-" * w for w in col_w))
-		for row in rows:
-			if not any(row):
-				out.append(hsep_str.join("-" * w for w in col_w))
-			else:
-				row = [truncate_to_width(row[i], col_w[i]) for i in range(len(row))]
-				out.append(row_fmt.format(*row))
-		return "\n".join(out) + "\n"
-	if full:
-		return render(header, rows, col_widths, sep, hsep)
-	# Try default separators first
-	if table_width(col_widths, len(sep)) <= cols:
-		return render(header, rows, col_widths, sep, hsep)
+	col_widths = [len(header[i]) for i in range(num_cols)]
+	data_invisible_length = []
+	for row in data:
+		dil = []
+		for item, col_width, cwi in zip(row, col_widths, range(num_cols)):
+			vl = visible_len(item)
+			if vl > col_width:
+				col_widths[cwi] = vl
+			dil.append(len(item) - vl)
+		data_invisible_length.append(dil)
+	header_widths = [visible_len(h) for h in header]
+	header = [item.ljust(col_width + len(item) - visible_len(item)) for item, col_width in zip(header, col_widths)]
+	normalized_padded_data = []
+	for row, invisible_lengths in zip(data, data_invisible_length):
+		if not any(row):
+			row = ['-' * col_width for col_width in col_widths]
+		elif len(row) < num_cols:
+			row = [row[i].ljust(col_widths[i] + invisible_lengths[i]) if i < len(row) else "".ljust(col_widths[i]) for i in range(num_cols)]
+		elif len(row) >= num_cols:
+			#row = row[:num_cols]
+			row = [item.ljust(col_width + invisible_length) for item, col_width, invisible_length in zip(row, col_widths, invisible_lengths)]
+		normalized_padded_data.append(row)
+	data = normalized_padded_data
+	column_separator = " | "
+	horizontal_separator = "-+-"
+	terminal_width = get_terminal_size()[0]
+	def table_width(col_widths, sep_len):
+		return sum(col_widths) + sep_len * (len(col_widths) - 1)
+	def render(header, rows, column_widths, column_separator, horizontal_separator):
+		return "\n".join(
+		 [column_separator.join(header),
+		 horizontal_separator.join("-" * width for width in column_widths),
+		 *(column_separator.join(row) for row in rows)
+		 ]) + "\n"
+	if full or table_width(col_widths, len(column_separator)) <= terminal_width:
+		return render(header, data, col_widths, column_separator, horizontal_separator)
 	# Use compressed separators (no spaces)
-	sep = "|"
-	hsep = "+"
-	if table_width(col_widths, len(sep)) <= cols:
-		return render(header, rows, col_widths, sep, hsep)
+	column_separator = "|"
+	horizontal_separator = "+"
+	if table_width(col_widths, len(column_separator)) <= terminal_width:
+		return render(header, data, col_widths, column_separator, horizontal_separator)
 	# Begin column compression
 	# Track which columns have been compressed already to header width
-	header_widths = [visible_len(h) for h in header]
-	width_diff = [max(col_widths[i] - header_widths[i],0) for i in range(num_cols)]
-	total_overflow_width = table_width(col_widths, len(sep)) - cols
+	width_diff = [max(col_width - header_width, 0) for col_width, header_width in zip(col_widths, header_widths)]
+	total_overflow_width = table_width(col_widths, len(column_separator)) - terminal_width
 	for i, diff in sorted(enumerate(width_diff), key=lambda x: -x[1]):
 		if total_overflow_width <= 0:
 			break
@@ -785,7 +761,25 @@ def pretty_format_table(data, delimiter="\t", header=None, full=False):
 		reduce_by = min(diff, total_overflow_width)
 		col_widths[i] -= reduce_by
 		total_overflow_width -= reduce_by
-	return render(header, rows, col_widths, sep, hsep)
+	def truncate_to_width(string, width,invisible_length):
+		s_len = len(string) - invisible_length
+		if s_len <= width:
+			return string
+		rstripedSize = len(string.rstrip()) - invisible_length
+		if rstripedSize <= width:
+			return string[:width + invisible_length]
+		if width < 2:
+			if width < 1:
+				return ""
+			else:
+				return '.'
+		return string[: width + invisible_length - 2] + ".."
+	data = [
+		[truncate_to_width(item, col_width, invisible_length) for item, col_width, invisible_length in zip(row, col_widths, dil)]
+		for row, dil in zip(data, data_invisible_length)
+	]
+	header = [item[:col_width] for item, col_width in zip(header, col_widths)]
+	return render(header, data, col_widths, column_separator, horizontal_separator)
 
 def parseTable(data,sort=False,min_space=2):
 	if isinstance(data, str):

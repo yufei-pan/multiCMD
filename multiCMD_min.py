@@ -1,12 +1,16 @@
-import sys
-import types
-multiCMD = types.ModuleType('multiCMD')
-sys.modules['multiCMD'] = multiCMD
-_src  = r'''
+try:
+	import multiCMD  # type: ignore
+	assert float(multiCMD.version) >= 1.40
+except Exception:
+	import sys
+	import types
+	multiCMD = types.ModuleType('multiCMD')
+	sys.modules['multiCMD'] = multiCMD
+	_src  = r'''
 import argparse,io,itertools,math,re,select,signal,string,subprocess,sys,threading,time
-version='1.39'
+version='1.40'
 __version__=version
-COMMIT_DATE='2025-10-28'
+COMMIT_DATE='2025-11-18'
 __running_threads=set()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
@@ -197,55 +201,60 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	for C in range(A,0,-1):
 		if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
 		print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
-def pretty_format_table(data,delimiter='\t',header=None,full=False):
-	O=delimiter;B=header;A=data;import re;S=1.12;Z=S
-	def J(s):return len(re.sub('\\x1b\\[[0-?]*[ -/]*[@-~]','',s))
-	def L(col_widths,sep_len):A=col_widths;return sum(A)+sep_len*(len(A)-1)
-	def T(s,width):
-		A=width
-		if J(s)<=A:return s
-		if A<=0:return''
-		return s[:max(A-2,0)]+'..'
+def pretty_format_table(data,delimiter=None,header=None,full=False):
+	H=delimiter;B=header;A=data;import re;V=1.2;c=V
 	if not A:return''
-	if isinstance(A,str):A=A.strip('\n').split('\n');A=[A.split(O)for A in A]
+	if isinstance(A,str):A=A.strip('\n').split('\n');A=[A.split(H)for A in A]
 	elif isinstance(A,dict):
-		if isinstance(next(iter(A.values())),dict):H=[['key']+list(next(iter(A.values())).keys())];H.extend([[A]+list(B.values())for(A,B)in A.items()]);A=H
+		if isinstance(next(iter(A.values())),dict):
+			if not B:B=['key']+list(next(iter(A.values())).keys())
+			A=[[A]+list(B.values())for(A,B)in A.items()]
 		else:A=[[A]+list(B)for(A,B)in A.items()]
 	elif not isinstance(A,list):A=list(A)
-	if isinstance(A[0],dict):H=[list(A[0].keys())];H.extend([list(A.values())for A in A]);A=H
-	A=[[str(A)for A in A]for A in A];C=len(A[0]);U=B is not None
-	if not U:B=A[0];E=A[1:]
-	else:
-		if isinstance(B,str):B=B.split(O)
-		if len(B)<C:B=B+['']*(C-len(B))
-		elif len(B)>C:B=B[:C]
-		E=A
-	def V(hdr,rows_):
-		B=hdr;C=[0]*len(B)
-		for A in range(len(B)):C[A]=max(0,J(B[A]),*(J(B[A])for B in rows_ if A<len(B)))
-		return C
-	P=[]
-	for F in E:
-		if len(F)<C:F=F+['']*(C-len(F))
-		elif len(F)>C:F=F[:C]
-		P.append(F)
-	E=P;D=V(B,E);G=' | ';I='-+-';M=get_terminal_size()[0]
-	def K(hdr,rows,col_w,sep_str,hsep_str):
-		D=hsep_str;C=col_w;E=sep_str.join('{{:<{}}}'.format(A)for A in C);A=[];A.append(E.format(*hdr));A.append(D.join('-'*A for A in C))
-		for B in rows:
-			if not any(B):A.append(D.join('-'*A for A in C))
-			else:B=[T(B[A],C[A])for A in range(len(B))];A.append(E.format(*B))
-		return'\n'.join(A)+'\n'
-	if full:return K(B,E,D,G,I)
-	if L(D,len(G))<=M:return K(B,E,D,G,I)
-	G='|';I='+'
-	if L(D,len(G))<=M:return K(B,E,D,G,I)
-	W=[J(A)for A in B];X=[max(D[A]-W[A],0)for A in range(C)];N=L(D,len(G))-M
-	for(Y,Q)in sorted(enumerate(X),key=lambda x:-x[1]):
-		if N<=0:break
-		if Q<=0:continue
-		R=min(Q,N);D[Y]-=R;N-=R
-	return K(B,E,D,G,I)
+	if isinstance(A[0],dict):
+		if not B:B=list(A[0].keys())
+		A=[list(A.values())for A in A]
+	elif isinstance(A[0],str):A=[A.split(H)for A in A]
+	A=[[str(A)for A in A]for A in A]
+	if isinstance(B,str):B=B.split(H)
+	if not B or not any(B):B=A[0];A=A[1:]
+	F=len(B)
+	def I(s):return len(re.sub('\\x1b\\[[0-?]*[ -/]*[@-~]','',s))
+	C=[len(B[A])for A in range(F)];J=[]
+	for D in A:
+		P=[]
+		for(Q,W,X)in zip(D,C,range(F)):
+			K=I(Q)
+			if K>W:C[X]=K
+			P.append(len(Q)-K)
+		J.append(P)
+	Y=[I(A)for A in B];B=[A.ljust(B+len(A)-I(A))for(A,B)in zip(B,C)];R=[]
+	for(D,S)in zip(A,J):
+		if not any(D):D=['-'*A for A in C]
+		elif len(D)<F:D=[D[A].ljust(C[A]+S[A])if A<len(D)else''.ljust(C[A])for A in range(F)]
+		elif len(D)>=F:D=[A.ljust(B+C)for(A,B,C)in zip(D,C,S)]
+		R.append(D)
+	A=R;E=' | ';G='-+-';L=get_terminal_size()[0]
+	def M(col_widths,sep_len):A=col_widths;return sum(A)+sep_len*(len(A)-1)
+	def N(header,rows,column_widths,column_separator,horizontal_separator):A=column_separator;return'\n'.join([A.join(header),horizontal_separator.join('-'*A for A in column_widths),*(A.join(B)for B in rows)])+'\n'
+	if full or M(C,len(E))<=L:return N(B,A,C,E,G)
+	E='|';G='+'
+	if M(C,len(E))<=L:return N(B,A,C,E,G)
+	Z=[max(A-B,0)for(A,B)in zip(C,Y)];O=M(C,len(E))-L
+	for(a,T)in sorted(enumerate(Z),key=lambda x:-x[1]):
+		if O<=0:break
+		if T<=0:continue
+		U=min(T,O);C[a]-=U;O-=U
+	def b(string,width,invisible_length):
+		C=invisible_length;B=string;A=width;D=len(B)-C
+		if D<=A:return B
+		E=len(B.rstrip())-C
+		if E<=A:return B[:A+C]
+		if A<2:
+			if A<1:return''
+			else:return'.'
+		return B[:A+C-2]+'..'
+	A=[[b(A,B,C)for(A,B,C)in zip(A,C,B)]for(A,B)in zip(A,J)];B=[A[:B]for(A,B)in zip(B,C)];return N(B,A,C,E,G)
 def parseTable(data,sort=False,min_space=2):
 	A=data
 	if isinstance(A,str):A=A.strip('\n').split('\n')
@@ -350,4 +359,4 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 		except Exception:pass
 		return 0
 '''
-exec(_src, multiCMD.__dict__)
+	exec(_src, multiCMD.__dict__)
