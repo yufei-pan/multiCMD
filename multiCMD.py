@@ -20,9 +20,9 @@ import threading
 import time
 
 #%% global vars
-version = '1.40'
+version = '1.41'
 __version__ = version
-COMMIT_DATE = '2025-11-18'
+COMMIT_DATE = '2025-11-19'
 __running_threads = set()
 __variables = {}
 
@@ -673,7 +673,7 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# If there is no input, return None
 	return None
 
-def pretty_format_table(data, delimiter=None, header=None, full=False):
+def pretty_format_table(data, delimiter=None, header=None, full=False, remove_empty_columns=False):
 	import re
 	version = 1.20
 	_ = version
@@ -708,7 +708,7 @@ def pretty_format_table(data, delimiter=None, header=None, full=False):
 	def visible_len(s):
 		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
 	# Ensure all rows have the same number of columns
-	col_widths = [len(header[i]) for i in range(num_cols)]
+	col_widths = [0] * num_cols
 	data_invisible_length = []
 	for row in data:
 		dil = []
@@ -718,10 +718,21 @@ def pretty_format_table(data, delimiter=None, header=None, full=False):
 				col_widths[cwi] = vl
 			dil.append(len(item) - vl)
 		data_invisible_length.append(dil)
+	cols_to_remove = []
+	if remove_empty_columns and not full:
+		cols_to_remove = [i for i, col_width in enumerate(col_widths) if col_width == 0]
+		header = [item for i, item in enumerate(header) if i not in cols_to_remove]
+		col_widths = [w for i, w in enumerate(col_widths) if i not in cols_to_remove]
+		num_cols = len(header)
 	header_widths = [visible_len(h) for h in header]
+	col_widths = [max(w, hw) for w, hw in zip(col_widths, header_widths)]
 	header = [item.ljust(col_width + len(item) - visible_len(item)) for item, col_width in zip(header, col_widths)]
 	normalized_padded_data = []
+	new_data_invisible_length = []
 	for row, invisible_lengths in zip(data, data_invisible_length):
+		if cols_to_remove:
+			row = [item for i, item in enumerate(row) if i not in cols_to_remove]
+			invisible_lengths = [il for i, il in enumerate(invisible_lengths) if i not in cols_to_remove]
 		if not any(row):
 			row = ['-' * col_width for col_width in col_widths]
 		elif len(row) < num_cols:
@@ -730,7 +741,9 @@ def pretty_format_table(data, delimiter=None, header=None, full=False):
 			#row = row[:num_cols]
 			row = [item.ljust(col_width + invisible_length) for item, col_width, invisible_length in zip(row, col_widths, invisible_lengths)]
 		normalized_padded_data.append(row)
+		new_data_invisible_length.append(invisible_lengths)
 	data = normalized_padded_data
+	data_invisible_length = new_data_invisible_length
 	column_separator = " | "
 	horizontal_separator = "-+-"
 	terminal_width = get_terminal_size()[0]

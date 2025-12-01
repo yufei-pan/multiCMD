@@ -1,16 +1,7 @@
-try:
-	import multiCMD  # type: ignore
-	assert float(multiCMD.version) >= 1.40
-except Exception:
-	import sys
-	import types
-	multiCMD = types.ModuleType('multiCMD')
-	sys.modules['multiCMD'] = multiCMD
-	_src  = r'''
 import argparse,io,itertools,math,re,select,signal,string,subprocess,sys,threading,time
-version='1.40'
+version='1.41'
 __version__=version
-COMMIT_DATE='2025-11-18'
+COMMIT_DATE='2025-11-19'
 __running_threads=set()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
@@ -201,10 +192,10 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	for C in range(A,0,-1):
 		if sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
 		print(f"\r{B} [{C}s]: ",end='',flush=True);time.sleep(1)
-def pretty_format_table(data,delimiter=None,header=None,full=False):
-	H=delimiter;B=header;A=data;import re;V=1.2;c=V
+def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
+	K=delimiter;B=header;A=data;import re;Y=1.2;e=Y
 	if not A:return''
-	if isinstance(A,str):A=A.strip('\n').split('\n');A=[A.split(H)for A in A]
+	if isinstance(A,str):A=A.strip('\n').split('\n');A=[A.split(K)for A in A]
 	elif isinstance(A,dict):
 		if isinstance(next(iter(A.values())),dict):
 			if not B:B=['key']+list(next(iter(A.values())).keys())
@@ -214,38 +205,41 @@ def pretty_format_table(data,delimiter=None,header=None,full=False):
 	if isinstance(A[0],dict):
 		if not B:B=list(A[0].keys())
 		A=[list(A.values())for A in A]
-	elif isinstance(A[0],str):A=[A.split(H)for A in A]
+	elif isinstance(A[0],str):A=[A.split(K)for A in A]
 	A=[[str(A)for A in A]for A in A]
-	if isinstance(B,str):B=B.split(H)
+	if isinstance(B,str):B=B.split(K)
 	if not B or not any(B):B=A[0];A=A[1:]
 	F=len(B)
-	def I(s):return len(re.sub('\\x1b\\[[0-?]*[ -/]*[@-~]','',s))
-	C=[len(B[A])for A in range(F)];J=[]
+	def L(s):return len(re.sub('\\x1b\\[[0-?]*[ -/]*[@-~]','',s))
+	C=[0]*F;I=[]
 	for D in A:
-		P=[]
-		for(Q,W,X)in zip(D,C,range(F)):
-			K=I(Q)
-			if K>W:C[X]=K
-			P.append(len(Q)-K)
-		J.append(P)
-	Y=[I(A)for A in B];B=[A.ljust(B+len(A)-I(A))for(A,B)in zip(B,C)];R=[]
-	for(D,S)in zip(A,J):
+		R=[]
+		for(S,Z,a)in zip(D,C,range(F)):
+			M=L(S)
+			if M>Z:C[a]=M
+			R.append(len(S)-M)
+		I.append(R)
+	G=[]
+	if remove_empty_columns and not full:G=[A for(A,B)in enumerate(C)if B==0];B=[B for(A,B)in enumerate(B)if A not in G];C=[B for(A,B)in enumerate(C)if A not in G];F=len(B)
+	T=[L(A)for A in B];C=[max(A,B)for(A,B)in zip(C,T)];B=[A.ljust(B+len(A)-L(A))for(A,B)in zip(B,C)];U=[];V=[]
+	for(D,H)in zip(A,I):
+		if G:D=[B for(A,B)in enumerate(D)if A not in G];H=[B for(A,B)in enumerate(H)if A not in G]
 		if not any(D):D=['-'*A for A in C]
-		elif len(D)<F:D=[D[A].ljust(C[A]+S[A])if A<len(D)else''.ljust(C[A])for A in range(F)]
-		elif len(D)>=F:D=[A.ljust(B+C)for(A,B,C)in zip(D,C,S)]
-		R.append(D)
-	A=R;E=' | ';G='-+-';L=get_terminal_size()[0]
-	def M(col_widths,sep_len):A=col_widths;return sum(A)+sep_len*(len(A)-1)
-	def N(header,rows,column_widths,column_separator,horizontal_separator):A=column_separator;return'\n'.join([A.join(header),horizontal_separator.join('-'*A for A in column_widths),*(A.join(B)for B in rows)])+'\n'
-	if full or M(C,len(E))<=L:return N(B,A,C,E,G)
-	E='|';G='+'
-	if M(C,len(E))<=L:return N(B,A,C,E,G)
-	Z=[max(A-B,0)for(A,B)in zip(C,Y)];O=M(C,len(E))-L
-	for(a,T)in sorted(enumerate(Z),key=lambda x:-x[1]):
-		if O<=0:break
-		if T<=0:continue
-		U=min(T,O);C[a]-=U;O-=U
-	def b(string,width,invisible_length):
+		elif len(D)<F:D=[D[A].ljust(C[A]+H[A])if A<len(D)else''.ljust(C[A])for A in range(F)]
+		elif len(D)>=F:D=[A.ljust(B+C)for(A,B,C)in zip(D,C,H)]
+		U.append(D);V.append(H)
+	A=U;I=V;E=' | ';J='-+-';N=get_terminal_size()[0]
+	def O(col_widths,sep_len):A=col_widths;return sum(A)+sep_len*(len(A)-1)
+	def P(header,rows,column_widths,column_separator,horizontal_separator):A=column_separator;return'\n'.join([A.join(header),horizontal_separator.join('-'*A for A in column_widths),*(A.join(B)for B in rows)])+'\n'
+	if full or O(C,len(E))<=N:return P(B,A,C,E,J)
+	E='|';J='+'
+	if O(C,len(E))<=N:return P(B,A,C,E,J)
+	b=[max(A-B,0)for(A,B)in zip(C,T)];Q=O(C,len(E))-N
+	for(c,W)in sorted(enumerate(b),key=lambda x:-x[1]):
+		if Q<=0:break
+		if W<=0:continue
+		X=min(W,Q);C[c]-=X;Q-=X
+	def d(string,width,invisible_length):
 		C=invisible_length;B=string;A=width;D=len(B)-C
 		if D<=A:return B
 		E=len(B.rstrip())-C
@@ -254,7 +248,7 @@ def pretty_format_table(data,delimiter=None,header=None,full=False):
 			if A<1:return''
 			else:return'.'
 		return B[:A+C-2]+'..'
-	A=[[b(A,B,C)for(A,B,C)in zip(A,C,B)]for(A,B)in zip(A,J)];B=[A[:B]for(A,B)in zip(B,C)];return N(B,A,C,E,G)
+	A=[[d(A,B,C)for(A,B,C)in zip(A,C,B)]for(A,B)in zip(A,I)];B=[A[:B]for(A,B)in zip(B,C)];return P(B,A,C,E,J)
 def parseTable(data,sort=False,min_space=2):
 	A=data
 	if isinstance(A,str):A=A.strip('\n').split('\n')
@@ -358,5 +352,3 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 		try:return format_bytes(float(A),C)
 		except Exception:pass
 		return 0
-'''
-	exec(_src, multiCMD.__dict__)
