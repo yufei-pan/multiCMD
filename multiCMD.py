@@ -12,6 +12,7 @@ import itertools
 import math
 import re
 import select
+import shutil
 import signal
 import string
 import subprocess
@@ -20,9 +21,9 @@ import threading
 import time
 
 #%% global vars
-version = '1.41'
+version = '1.42'
 __version__ = version
-COMMIT_DATE = '2025-11-19'
+COMMIT_DATE = '2025-12-16'
 __running_threads = set()
 __variables = {}
 
@@ -31,6 +32,8 @@ _BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
 _ALPHANUM     = string.digits + string.ascii_letters
 _ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
 
+SUDO_PATH = shutil.which("sudo")
+USE_SUDO = False
 
 #%% objects
 class Task:
@@ -350,6 +353,26 @@ def int_to_color(hash_value, min_brightness=100,max_brightness=220):
 		return int_to_color(hash(str(hash_value)), min_brightness, max_brightness)
 	return (r, g, b)
 
+def set_sudo(use_sudo):
+	'''
+	Set whether to use sudo for commands
+
+	@params:
+		use_sudo: Whether to use sudo
+
+	@returns:
+		None
+	'''
+	global USE_SUDO
+	global SUDO_PATH
+	if use_sudo:
+		if SUDO_PATH:
+			USE_SUDO = True
+		else:
+			print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+	else:
+		USE_SUDO = False
+
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	'''
 	Run a command ( internal )
@@ -557,7 +580,8 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, sem : threading.Semaphore = None):
+				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
+				 sem : threading.Semaphore = None, use_sudo=...):
 	'''
 	Run multiple commands in parallel
 
@@ -577,18 +601,27 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
 	'''
+	global USE_SUDO
+	global SUDO_PATH
+	if use_sudo is ...:
+		use_sudo = USE_SUDO
 	# split the commands in commands if it is a string
 	formatedCommands = []
 	for command in commands:
 		formatedCommands.extend(__format_command(command,expand=parse))
 	# initialize the tasks
+	if use_sudo:
+		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	tasks = [Task(command) for command in formatedCommands]
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(formatedCommands)
+	if not sem:
+		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
+	if use_sudo:
+		# validate sudo access
+		__run_command(Task([SUDO_PATH, '-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)	
 	if max_threads > 1 or not wait_for_return:
-		if not sem:
-			sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
 		for thread,task in zip(threads,tasks):
 			task.thread = thread
@@ -599,8 +632,6 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		else:
 			__running_threads.update(threads)
 	else:
-		# just process the commands sequentially
-		sem = threading.Semaphore(1)
 		for task in tasks:
 			__run_command(task,sem,timeout,quiet,dry_run,identity=None)
 	# return the only the output for the tasks
@@ -638,10 +669,11 @@ def main():
 	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
 	parser.add_argument('-t','--timeout', metavar='timeout', type=int, default=60,help='timeout for each command')
 	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of threads to use')
+	parser.add_argument('--sudo', action='store_true',help='use sudo for commands')
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
 	args = parser.parse_args()
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
+	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True, use_sudo=args.sudo)
 
 if __name__ == '__main__':
 	main()

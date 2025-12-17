@@ -1,12 +1,15 @@
-import argparse,io,itertools,math,re,select,signal,string,subprocess,sys,threading,time
-version='1.41'
+#!/usr/bin/env python3
+import argparse,io,itertools,math,re,select,shutil,signal,string,subprocess,sys,threading,time
+version='1.42'
 __version__=version
-COMMIT_DATE='2025-11-19'
+COMMIT_DATE='2025-12-16'
 __running_threads=set()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
 _ALPHANUM=string.digits+string.ascii_letters
 _ALPHA_IDX={B:A for(A,B)in enumerate(_ALPHANUM)}
+SUDO_PATH=shutil.which('sudo')
+USE_SUDO=False
 class Task:
 	def __init__(A,command):A.command=command;A.returncode=None;A.stdout=[];A.stderr=[];A.thread=None;A.stop=False
 	def __iter__(A):return zip(['command','returncode','stdout','stderr'],[A.command,A.returncode,A.stdout,A.stderr])
@@ -106,6 +109,12 @@ def int_to_color(hash_value,min_brightness=100,max_brightness=220):
 	if G<B:return int_to_color(hash(str(A)),B,C)
 	if G>C:return int_to_color(hash(str(A)),B,C)
 	return D,E,F
+def set_sudo(use_sudo):
+	global USE_SUDO;global SUDO_PATH
+	if use_sudo:
+		if SUDO_PATH:USE_SUDO=True
+		else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr)
+	else:USE_SUDO=False
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	I=timeout;F=identity;E=quiet;A=task;C='';D=''
 	with sem:
@@ -161,21 +170,24 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 	elif C:return A[0]
 	else:return A
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
-def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None):
-	K=wait_for_return;J=dry_run;I=quiet;H=timeout;C=max_threads;B=sem;E=[]
-	for L in commands:E.extend(__format_command(L,expand=parse))
-	A=[Task(A)for A in E]
-	if C<1:C=len(E)
-	if C>1 or not K:
-		if not B:B=threading.Semaphore(C)
-		F=[threading.Thread(target=__run_command,args=(A,B,H,I,J,...),daemon=True)for A in A]
-		for(D,G)in zip(F,A):G.thread=D;D.start()
-		if K:
-			for D in F:D.join()
-		else:__running_threads.update(F)
+def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...):
+	L=wait_for_return;K=dry_run;J=quiet;I=timeout;E=use_sudo;D=max_threads;B=sem;global USE_SUDO;global SUDO_PATH
+	if E is...:E=USE_SUDO
+	C=[]
+	for M in commands:C.extend(__format_command(M,expand=parse))
+	if E:C=[[SUDO_PATH]+A for A in C]
+	A=[Task(A)for A in C]
+	if D<1:D=len(C)
+	if not B:B=threading.Semaphore(D)
+	if E:__run_command(Task([SUDO_PATH,'-v']),B,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)
+	if D>1 or not L:
+		G=[threading.Thread(target=__run_command,args=(A,B,I,J,K,...),daemon=True)for A in A]
+		for(F,H)in zip(G,A):H.thread=F;F.start()
+		if L:
+			for F in G:F.join()
+		else:__running_threads.update(G)
 	else:
-		B=threading.Semaphore(1)
-		for G in A:__run_command(G,B,H,I,J,identity=None)
+		for H in A:__run_command(H,B,I,J,K,identity=None)
 	if return_code_only:return[A.returncode for A in A]
 	elif return_object:return A
 	elif with_stdErr:return[A.stdout+A.stderr for A in A]
@@ -185,8 +197,6 @@ def join_threads(threads=...,timeout=None):
 	if A is...:A=__running_threads
 	for B in A:B.join(timeout=timeout)
 	if A is __running_threads:__running_threads={A for A in A if A.is_alive()}
-def main():A=argparse.ArgumentParser(description='Run multiple commands in parallel');A.add_argument('commands',metavar='command',type=str,nargs='+',help='commands to run');A.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');A.add_argument('-t','--timeout',metavar='timeout',type=int,default=60,help='timeout for each command');A.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of threads to use');A.add_argument('-q','--quiet',action='store_true',help='quiet mode');A.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");B=A.parse_args();run_commands(B.commands,B.timeout,B.max_threads,B.quiet,parse=B.parse,with_stdErr=True)
-if __name__=='__main__':main()
 def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
 	B=prompt;A=timeout;print(f"{B} [{A}s]: ",end='',flush=True)
 	for C in range(A,0,-1):
