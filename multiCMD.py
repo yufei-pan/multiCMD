@@ -10,6 +10,7 @@ import argparse
 import io
 import itertools
 import math
+import os
 import re
 import select
 import shutil
@@ -21,9 +22,9 @@ import threading
 import time
 
 #%% global vars
-version = '1.42'
+version = '1.43'
 __version__ = version
-COMMIT_DATE = '2025-12-16'
+COMMIT_DATE = '2025-12-22'
 __running_threads = set()
 __variables = {}
 
@@ -365,7 +366,7 @@ def set_sudo(use_sudo):
 	'''
 	global USE_SUDO
 	global SUDO_PATH
-	if use_sudo:
+	if os.geteuid() != 0 and use_sudo:
 		if SUDO_PATH:
 			USE_SUDO = True
 		else:
