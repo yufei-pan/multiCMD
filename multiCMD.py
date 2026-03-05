@@ -20,11 +20,12 @@ import subprocess
 import sys
 import threading
 import time
+from pprint import pformat
 
 #%% global vars
-version = '1.44'
+version = '1.45'
 __version__ = version
-COMMIT_DATE = '2026-01-13'
+COMMIT_DATE = '2026-03-05'
 __running_threads = set()
 __variables = {}
 
@@ -45,16 +46,27 @@ class Task:
 		self.stderr = []
 		self.thread = None
 		self.stop = False
+
 	def __iter__(self):
-		return zip(['command', 'returncode', 'stdout', 'stderr'], [self.command, self.returncode, self.stdout, self.stderr])
+		yield from (
+			('command', self.command),
+			('returncode', self.returncode),
+			('stdout', self.stdout),
+			('stderr', self.stderr)
+		)
+
 	def __repr__(self):
-		return f'Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr}, stop={self.stop})'
+		return f"""Task(command={pformat(self.command)},
+returncode={self.returncode!r},
+stdout={'\n' + pformat(self.stdout) if self.stdout else '[]'},
+stderr={'\n' + pformat(self.stderr) if self.stderr else '[]'},
+stop={self.stop!r})"""
+
 	def __str__(self):
-		return str(dict(self))
+		return pformat(dict(self))
+
 	def is_alive(self):
-		if self.thread is not None:
-			return self.thread.is_alive()
-		return False
+		return self.thread is not None and self.thread.is_alive()
 
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
@@ -575,7 +587,8 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 			return results
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				return_code_only=False,return_object=False,wait_for_return=True, sem = None):
+				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
+				use_sudo = ..., raise_error = False):
 	'''
 	Run a command
 
@@ -590,17 +603,20 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		return_object: Whether to return the Task object
 		wait_for_return: Whether to wait for the return of the command
 		sem: The semaphore to use for threading
+		use_sudo: Whether to use sudo for commands
+		raise_error: Whether to raise an error if the command fails
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
-					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
+					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
+					 use_sudo=use_sudo, raise_error=raise_error)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
-				 sem : threading.Semaphore = None, use_sudo=...):
+				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False):
 	'''
 	Run multiple commands in parallel
 
@@ -616,9 +632,11 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		parse: Whether to parse ranged input
 		wait_for_return: Whether to wait for the return of the commands
 		sem: The semaphore to use for threading
+		use_sudo: Whether to use sudo for commands
+		raise_error: Whether to raise an error if the command fails
 
 	@returns:
-		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
+		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
 	global USE_SUDO
 	global SUDO_PATH
@@ -654,6 +672,10 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		for task in tasks:
 			__run_command(task,sem,timeout,quiet,dry_run,identity=None)
 	# return the only the output for the tasks
+	if raise_error:
+		errors = [task for task in tasks if task.returncode != 0]
+		if errors:
+			raise Exception(f"Commands failed: {pformat(errors)}")
 	if return_code_only:
 		return [task.returncode for task in tasks]
 	elif return_object:
