@@ -23,7 +23,7 @@ import time
 from pprint import pformat
 
 #%% global vars
-version = '1.45'
+version = '1.46'
 __version__ = version
 COMMIT_DATE = '2026-03-05'
 __running_threads = set()
@@ -58,8 +58,10 @@ class Task:
 	def __repr__(self):
 		return f"""Task(command={pformat(self.command)},
 returncode={self.returncode!r},
-stdout={'\n' + pformat(self.stdout) if self.stdout else '[]'},
-stderr={'\n' + pformat(self.stderr) if self.stderr else '[]'},
+stdout=
+{pformat(self.stdout)},
+stderr=
+{pformat(self.stderr)},
 stop={self.stop!r})"""
 
 	def __str__(self):
