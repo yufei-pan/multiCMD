@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse,io,itertools,math,os,re,select,shutil,signal,string,subprocess,sys,threading,time
-version='1.44'
+from pprint import pformat
+version='1.47'
 __version__=version
-COMMIT_DATE='2026-01-13'
+COMMIT_DATE='2026-04-28'
 __running_threads=set()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
@@ -12,12 +13,16 @@ SUDO_PATH=shutil.which('sudo')
 USE_SUDO=False
 class Task:
 	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False
-	def __iter__(self):return zip(['command','returncode','stdout','stderr'],[self.command,self.returncode,self.stdout,self.stderr])
-	def __repr__(self):return f"Task(command={self.command}, returncode={self.returncode}, stdout={self.stdout}, stderr={self.stderr}, stop={self.stop})"
-	def __str__(self):return str(dict(self))
-	def is_alive(self):
-		if self.thread is not None:return self.thread.is_alive()
-		return False
+	def __iter__(self):yield from(('command',self.command),('returncode',self.returncode),('stdout',self.stdout),('stderr',self.stderr))
+	def __repr__(self):return f"""Task(command={pformat(self.command)},
+returncode={self.returncode!r},
+stdout=
+{pformat(self.stdout)},
+stderr=
+{pformat(self.stderr)},
+stop={self.stop!r})"""
+	def __str__(self):return pformat(dict(self))
+	def is_alive(self):return self.thread is not None and self.thread.is_alive()
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
 		self.max_threads=max_threads
@@ -140,8 +145,8 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 				time.sleep(sleep_time)
 				if sleep_time<.001:sleep_time*=2
 			task.returncode=proc.poll();stdout_thread.join(timeout=1);stderr_thread.join(timeout=1);stdout,stderr=proc.communicate()
-			if stdout:__handle_stream(io.BytesIO(stdout),task.stdout,task)
-			if stderr:__handle_stream(io.BytesIO(stderr),task.stderr,task)
+			if stdout:__handle_stream(io.BytesIO(stdout),task.stdout,pre=pre,post=post,quiet=quiet)
+			if stderr:__handle_stream(io.BytesIO(stderr),task.stderr,pre=pre,post=post,quiet=quiet)
 			if task.returncode is None:
 				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):task.returncode=124
 				elif task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
@@ -175,8 +180,8 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 		else:return[not result for result in results]
 	elif single_host:return results[0]
 	else:return results
-def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem)[0]
-def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...):
+def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error)[0]
+def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False):
 	global USE_SUDO;global SUDO_PATH
 	if use_sudo is...:use_sudo=USE_SUDO
 	formatedCommands=[]
@@ -194,6 +199,9 @@ def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with
 		else:__running_threads.update(threads)
 	else:
 		for task in tasks:__run_command(task,sem,timeout,quiet,dry_run,identity=None)
+	if raise_error:
+		errors=[task for task in tasks if task.returncode!=0]
+		if errors:raise Exception(f"Commands failed: {pformat(errors)}")
 	if return_code_only:return[task.returncode for task in tasks]
 	elif return_object:return tasks
 	elif with_stdErr:return[task.stdout+task.stderr for task in tasks]
