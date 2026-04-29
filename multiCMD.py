@@ -23,9 +23,9 @@ import time
 from pprint import pformat
 
 #%% global vars
-version = '1.46'
+version = '1.47'
 __version__ = version
-COMMIT_DATE = '2026-03-05'
+COMMIT_DATE = '2026-04-28'
 __running_threads = set()
 __variables = {}
 
@@ -479,9 +479,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			# here we handle the rest of the stdout after the subprocess returns
 			stdout, stderr = proc.communicate()
 			if stdout:
-				__handle_stream(io.BytesIO(stdout),task.stdout, task)
+				__handle_stream(io.BytesIO(stdout),task.stdout, pre=pre, post=post, quiet=quiet)
 			if stderr:
-				__handle_stream(io.BytesIO(stderr),task.stderr, task)
+				__handle_stream(io.BytesIO(stderr),task.stderr, pre=pre, post=post, quiet=quiet)
 			if task.returncode is None:
 				# process been killed via timeout or sigkill
 				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
