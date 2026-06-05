@@ -7,7 +7,6 @@
 # ///
 #%% imports
 import argparse
-import io
 import itertools
 import math
 import os
@@ -23,9 +22,9 @@ import time
 from pprint import pformat
 
 #%% global vars
-version = '1.47'
+version = '1.48'
 __version__ = version
-COMMIT_DATE = '2026-04-28'
+COMMIT_DATE = '2026-06-04'
 __running_threads = set()
 __variables = {}
 
@@ -286,7 +285,7 @@ def _expand_piece(piece, vars_):
 		end   = str(__evaluate_value(end,   vars_))
 
 		if start.isdigit() and end.isdigit():
-			pad = max(len(start), len(end))
+			pad = min(len(start), len(end))
 			return [f"{i:0{pad}d}" for i in range(int(start), int(end) + 1)]
 
 		if all(c in string.hexdigits for c in start + end):
@@ -328,6 +327,9 @@ def _expand_ranges_fast(inStr):
 
 	# cartesian product of all segments
 	return [''.join(parts) for parts in itertools.product(*segments)]
+
+# backwards-compatible alias for the pre-rename public name
+_expand_ranges = _expand_ranges_fast
 
 def __handle_stream(stream,target,pre='',post='',quiet=False):
 	'''
@@ -376,15 +378,55 @@ def __handle_stream(stream,target,pre='',post='',quiet=False):
 		add_line(current_line,target, keepLastLine=lastLineCommited)
 
 def int_to_color(hash_value, min_brightness=100,max_brightness=220):
+	'''
+	Deterministically map an integer to a readable RGB color.
+
+	The three low bytes of the value seed the hue, then the color is scaled so
+	its perceived brightness lands within [min_brightness, max_brightness].
+	Brightness scales linearly with the RGB vector, so we can hit the target in
+	one step. This avoids the previous approach of recursing on hash(str(...)),
+	which was non-deterministic (str hashing is randomized per process) and
+	could recurse deeply before finding an in-range color.
+
+	@params:
+		hash_value: The integer to map to a color
+		min_brightness: The minimum perceived brightness (0-255)
+		max_brightness: The maximum perceived brightness (0-255)
+
+	@returns:
+		(int,int,int): The RGB color
+	'''
+	def _brightness(r, g, b):
+		return math.sqrt(0.299 * r**2 + 0.587 * g**2 + 0.114 * b**2)
 	r = (hash_value >> 16) & 0xFF
 	g = (hash_value >> 8) & 0xFF
 	b = hash_value & 0xFF
-	brightness = math.sqrt(0.299 * r**2 + 0.587 * g**2 + 0.114 * b**2)
-	if brightness < min_brightness:
-		return int_to_color(hash(str(hash_value)), min_brightness, max_brightness)
+	brightness = _brightness(r, g, b)
+	if brightness == 0:
+		# pure black has no hue to preserve; fall back to a neutral mid gray
+		gray = int((min_brightness + max_brightness) / 2)
+		return (gray, gray, gray)
 	if brightness > max_brightness:
-		return int_to_color(hash(str(hash_value)), min_brightness, max_brightness)
-	return (r, g, b)
+		scale = max_brightness / brightness
+		r, g, b = r * scale, g * scale, b * scale
+	elif brightness < min_brightness:
+		scale = min_brightness / brightness
+		r, g, b = min(255, r * scale), min(255, g * scale), min(255, b * scale)
+		# Channels can clamp at 255 (e.g. a saturated blue can never reach the
+		# target on its own because of blue's low luminance weight), so blend
+		# toward white to make up the difference. Brightness rises monotonically
+		# toward white (255,255,255), so a bounded binary search converges
+		# without recursion.
+		if _brightness(r, g, b) < min_brightness:
+			lo, hi = 0.0, 1.0
+			for _ in range(20):
+				t = (lo + hi) / 2
+				if _brightness(r + t * (255 - r), g + t * (255 - g), b + t * (255 - b)) < min_brightness:
+					lo = t
+				else:
+					hi = t
+			r, g, b = r + hi * (255 - r), g + hi * (255 - g), b + hi * (255 - b)
+	return (min(255, round(r)), min(255, round(g)), min(255, round(b)))
 
 def set_sudo(use_sudo):
 	'''
@@ -398,12 +440,16 @@ def set_sudo(use_sudo):
 	'''
 	global USE_SUDO
 	global SUDO_PATH
-	if os.geteuid() != 0 and use_sudo:
-		if SUDO_PATH:
-			USE_SUDO = True
-		else:
-			print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+	if not use_sudo:
+		USE_SUDO = False
+		return
+	# os.geteuid() is POSIX only; on platforms without it we cannot be root.
+	if getattr(os, 'geteuid', lambda: 1)() == 0:
+		USE_SUDO = False
+	elif SUDO_PATH:
+		USE_SUDO = True
 	else:
+		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
 		USE_SUDO = False
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
@@ -413,7 +459,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 	@params:
 		task: The Task object
 		sem: The semaphore
-		timeout: The timeout for the command
+		timeout: Inactivity timeout in seconds. The command is killed only after
+			it produces no new committed output line for this many seconds (a line
+			is committed on '\n'/'\r'), not after a fixed total runtime. 0 disables it.
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the command
 		with_stdErr: Whether to return the standard error output
@@ -439,7 +487,10 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if dry_run:
 				return task.stdout + task.stderr
 			#host.stdout = []
-			proc = subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE)
+			# stdin is connected to DEVNULL: multiCMD does not feed live input to
+			# commands, so any command that reads stdin gets immediate EOF instead
+			# of blocking forever on an empty, never-closed pipe.
+			proc = subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL)
 			# create a thread to handle stdout
 			stdout_thread = threading.Thread(target=__handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet),daemon=True)
 			stdout_thread.start()
@@ -472,16 +523,31 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				# exponential backoff
 				if sleep_time < 0.001:
 					sleep_time *= 2
+			# Make sure the process is fully reaped. If we broke out of the loop
+			# after signalling it (stop / timeout), it may not have exited yet.
+			try:
+				proc.wait(timeout=1)
+			except subprocess.TimeoutExpired:
+				proc.kill()
+				try:
+					proc.wait(timeout=1)
+				except subprocess.TimeoutExpired:
+					pass
 			task.returncode = proc.poll()
-			# Wait for output processing to complete
-			stdout_thread.join(timeout=1)
-			stderr_thread.join(timeout=1)
-			# here we handle the rest of the stdout after the subprocess returns
-			stdout, stderr = proc.communicate()
-			if stdout:
-				__handle_stream(io.BytesIO(stdout),task.stdout, pre=pre, post=post, quiet=quiet)
-			if stderr:
-				__handle_stream(io.BytesIO(stderr),task.stderr, pre=pre, post=post, quiet=quiet)
+			# The reader threads exit on their own once the child closes its
+			# stdout/stderr (which happens when it terminates), so joining them
+			# captures all remaining output. We deliberately avoid
+			# proc.communicate() here: it would read the same pipes concurrently
+			# with the reader threads, which can raise or interleave/drop output.
+			stdout_thread.join(timeout=5)
+			stderr_thread.join(timeout=5)
+			# release the pipe file descriptors
+			for stream in (proc.stdout, proc.stderr):
+				try:
+					if stream:
+						stream.close()
+				except Exception:
+					pass
 			if task.returncode is None:
 				# process been killed via timeout or sigkill
 				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
@@ -596,7 +662,10 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 
 	@params:
 		command: The command to run
-		timeout: The timeout for the command
+		timeout: Inactivity timeout in seconds. The command is killed only after
+			it produces no new committed output line for this many seconds, not
+			after a fixed total runtime. A line is "committed" when the stream
+			handler sees a '\n' or '\r'. Use 0 (the default) to disable it.
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the command
@@ -624,7 +693,10 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )
-		timeout: The timeout for each command
+		timeout: Inactivity timeout in seconds. A command is killed only after it
+			produces no new committed output line for this many seconds, not after
+			a fixed total runtime. A line is "committed" when the stream handler
+			sees a '\n' or '\r'. Use 0 (the default) to disable the timeout.
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the commands
@@ -644,6 +716,11 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	global SUDO_PATH
 	if use_sudo is ...:
 		use_sudo = USE_SUDO
+	# Guard against requesting sudo when it is not available. Without this,
+	# prepending a None SUDO_PATH would crash subprocess.Popen with a TypeError.
+	if use_sudo and not SUDO_PATH:
+		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+		use_sudo = False
 	# split the commands in commands if it is a string
 	formatedCommands = []
 	for command in commands:
@@ -716,7 +793,10 @@ def main():
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
 	args = parser.parse_args()
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True, use_sudo=args.sudo)
+	# set_sudo() validates that sudo exists and that we are not already root
+	# before enabling it, and updates the USE_SUDO global accordingly.
+	set_sudo(args.sudo)
+	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
 
 if __name__ == '__main__':
 	main()
@@ -1104,7 +1184,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				7: "Zi",
 				8: "Yi",
 			}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")
@@ -1122,7 +1202,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				7: "Z",
 				8: "Y",
 			}
-			while size > power:
+			while size >= power:
 				size /= power
 				n += 1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")

@@ -1,40 +1,49 @@
 # multiCMD
 
-A simple script that is able to issue multiple commands and execute them at the same time locally.
+Run many commands at the same time — from the shell or from Python.
 
-`multiCMD` can display realtime-ish outputs in color if running multiple commands at the same time.
+`multiCMD` is a small, dependency-light helper (a single `multiCMD.py` module) for
+launching and supervising multiple subprocesses concurrently. It streams each
+command's output in real time (optionally colorized per command), captures
+stdout/stderr/return codes, supports per-command inactivity timeouts, and can
+expand range patterns like `host[1-10]` into many commands at once.
 
-It can be used in bash scripts for automation actions, and it can also be imported and act as a wrapper for `subprocess`.
+It works both as a command-line tool and as an importable wrapper around
+`subprocess` for your own automation scripts.
 
-- Use `return_object=True` with `run_commands` or `run_command` to get the Task Object (definition below).
-- Use `quiet=True` and `wait_for_return=False` to create a daemon thread that asynchronously updates the return list / objects when commands finish.
+## Features
 
-For each process, a thread will be initialized if using `-m/--max_threads > 1`.  
-For each thread, `subprocess` is used to open a process for the command task.  
-Two additional threads are opened for processing input and output for the task.  
+- Run a batch of commands in parallel with a bounded thread pool.
+- Live, non-blocking, optionally per-command colorized output.
+- Capture `stdout`, `stderr`, and return code per command via the `Task` object.
+- Per-command **inactivity timeout** (see [Timeout semantics](#timeout-semantics)).
+- Range/pattern expansion: `host[1-3]`, `[01-03]`, `[a-f]`, `[1-2,a-b]`, variables, and `{...}` expressions.
+- Fire-and-forget async mode (`wait_for_return=False`) plus an `AsyncExecutor` for managing long-lived batches.
+- Optional `sudo` wrapping.
+- No third-party runtime dependencies; requires Python >= 3.6.
 
-The input / output threads are non-blocking.  
-Thus, using `-t/--timeout` will work more reliably.
+## Install
 
-**Note:** `timeout` specifies how many seconds `multiCMD` will wait before killing the command if **no committed output** was detected for this duration. An output line is considered committed if the **stream handler** encounters a `\n` or `\r` character.
-
-
-Install via
 ```bash
 pip install multiCMD
 ```
 
-multiCMD will be available as
+This installs the module and three equivalent console entry points:
+
 ```bash
 mcmd
 multiCMD
 multicmd
 ```
 
+You can also just drop `multiCMD.py` into your project and import it directly.
+
+## Command-line usage
 
 ```bash
 $ mcmd -h
-usage: mcmd [-h] [-t timeout] [-m max_threads] [-q] [-V] command [command ...]
+usage: mcmd [-h] [-p] [-t timeout] [-m max_threads] [--sudo] [-q] [-V]
+            command [command ...]
 
 Run multiple commands in parallel
 
@@ -44,114 +53,199 @@ positional arguments:
 options:
   -h, --help            show this help message and exit
   -p, --parse           Parse ranged input and expand them into multiple commands
-  -t timeout, --timeout timeout
+  -t, --timeout timeout
                         timeout for each command
-  -m max_threads, --max_threads max_threads
+  -m, --max_threads max_threads
                         maximum number of threads to use
+  --sudo                use sudo for commands
   -q, --quiet           quiet mode
   -V, --version         show program's version number and exit
 ```
 
+### Examples
+
+Run two commands sequentially (default `--max_threads 1`):
+
+```bash
+mcmd "echo hello" "echo world"
+```
+
+Run them concurrently:
+
+```bash
+mcmd -m 4 "echo hello" "echo world"
+```
+
+Expand a range into many commands and run 8 at a time:
+
+```bash
+mcmd -p -m 8 "ping -c1 192.168.1.[1-254]"
+```
+
+Kill any command that goes silent for more than 30 seconds:
+
+```bash
+mcmd -t 30 -m 16 "long-running-task [1-100]"
+```
+
+Run with `sudo` (falls back gracefully if `sudo` is unavailable or you are already root):
+
+```bash
+mcmd --sudo "systemctl restart myservice"
+```
+
+> Each positional argument is one command. With `-m/--max_threads > 1`, a worker
+> thread is spawned per command; each worker uses `subprocess` to run the command
+> and two extra threads to drain stdout/stderr without blocking. `stdin` is
+> connected to `/dev/null` — multiCMD does not feed live input to commands.
+
+## Range / pattern expansion (`-p` / `parse=True`)
+
+When parsing is enabled, bracketed patterns are expanded into the cartesian
+product of all options:
+
+| Pattern              | Expands to                                  |
+| -------------------- | ------------------------------------------- |
+| `host[1-3]`          | `host1`, `host2`, `host3`                   |
+| `host[01-03]`        | `host01`, `host02`, `host03` (zero-padded)  |
+| `item[a-c]`          | `itema`, `itemb`, `itemc`                   |
+| `v[a-f]`             | `va` … `vf` (hex range)                      |
+| `x[1-2,a-b]`         | `x1`, `x2`, `xa`, `xb` (comma list)          |
+| `[1-2]-[a-b]`        | `1-a`, `1-b`, `2-a`, `2-b` (multiple groups) |
+| `[n:3]host[1-n]`     | `host1`, `host2`, `host3` (variables)        |
+| `host[{2+3}]`        | `host5` (`{...}` is evaluated as Python)     |
+
+Notes:
+
+- Decimal padding follows the **shorter** endpoint, so `[0-10]` yields
+  `0..10` (unpadded) while `[01-10]` yields `01..10`.
+- `name:value` inside brackets assigns a variable (the bracket itself produces
+  no output) that later brackets can reference.
+- `{expr}` is evaluated as a Python expression with the current variables in
+  scope. Only use this with trusted input.
+
+## Python API
+
 ```python
-def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				 return_code_only=False,return_object=False, parse = False, wait_for_return = True):
-	'''
-	Run multiple commands in parallel
+import multiCMD
 
-	@params:
-		commands: A list of commands to run ( list[str] | list[list[str]] )
-		timeout: The timeout for each command
-		max_threads: The maximum number of threads to use
-		quiet: Whether to suppress output
-		dry_run: Whether to simulate running the commands
-		with_stdErr: Whether to append the standard error output to the standard output
-		return_code_only: Whether to return only the return code
-		return_object: Whether to return the Task object
-		parse: Whether to parse ranged input
-		wait_for_return: Whether to wait for the return of the commands
+# Run a single command, return its stdout lines
+out = multiCMD.run_command(["echo", "hello"], quiet=True)
+# -> ["hello"]
 
-	@returns:
-		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] )
-  '''
-def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
-				return_code_only=False,return_object=False,wait_for_return=True):
-	'''
-	Run a command
+# Run several in parallel
+results = multiCMD.run_commands(
+    [["echo", "hello"], ["echo", "world"]],
+    max_threads=4, quiet=True,
+)
+# -> [["hello"], ["world"]]
+```
 
-	@params:
-		command: The command to run
-		timeout: The timeout for the command
-		max_threads: The maximum number of threads to use
-		quiet: Whether to suppress output
-		dry_run: Whether to simulate running the command
-		with_stdErr: Whether to append the standard error output to the standard output
-		return_code_only: Whether to return only the return code
-		return_object: Whether to return the Task object
-		wait_for_return: Whether to wait for the return of the command
+### Getting return codes and the full `Task`
 
-	@returns:
-		None | int | list[str] | Task: The output of the command
-	'''
-def join_threads(threads=__running_threads,timeout=None):
-	'''
-	Join threads
+```python
+# Just the return code
+rc = multiCMD.run_command(["false"], return_code_only=True, quiet=True)  # -> 1
 
-	@params:
-		threads: The threads to join
-		timeout: The timeout
+# The full Task object (command, returncode, stdout, stderr)
+task = multiCMD.run_command(["echo", "hi"], return_object=True, quiet=True)
+print(task.returncode, task.stdout, task.stderr)  # 0 ['hi'] []
+```
 
-	@returns:
-		None
-	'''
-def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
-	"""
-	Read an input from the user with a timeout and a countdown.
+### Asynchronous / fire-and-forget
 
-	@params:
-		timeout: The timeout in seconds
-		prompt: The prompt to display to the user
+Use `quiet=True` with `wait_for_return=False` to launch commands on daemon
+threads. The returned `Task` objects are updated in place as commands finish:
 
-	@returns:
-		str: The input from the user or None if no input was received
+```python
+tasks = multiCMD.run_commands(
+    [["sleep", "2"], ["sleep", "1"]],
+    max_threads=2, quiet=True,
+    wait_for_return=False, return_object=True,
+)
+# tasks[i].returncode is None until that command completes
 
-	"""
-def print_progress_bar(iteration, total, prefix='', suffix=''):
-	'''
-	Call in a loop to create terminal progress bar
-	@params:
-		iteration   - Required  : current iteration (Int)
-		total       - Required  : total iterations (Int)
-		prefix      - Optional  : prefix string (Str)
-		suffix      - Optional  : suffix string (Str)
+# Later, block until everything launched this way has finished:
+multiCMD.join_threads()
+```
 
-	@returns:
-		None
-	'''
-def get_terminal_size():
-	'''
-	Get the terminal size
+For managing larger or repeated batches, use `AsyncExecutor`:
 
-	@params:
-		None
+```python
+ex = multiCMD.AsyncExecutor(max_threads=8, timeout=30, quiet=True)
+ex.run_command(["./worker", "--job", "1"])
+ex.run_commands([["./worker", "--job", "2"], ["./worker", "--job", "3"]])
+ex.join()                 # wait and print any failures
+print(ex.get_return_codes())
+print(ex.get_results())
+```
 
-	@returns:
-		(int,int): the number of columns and rows of the terminal
-	'''
-def int_to_color(n, brightness_threshold=500):
-	'''
-	Convert an integer to a color
+### Range expansion from Python
 
-	@params:
-		n: The integer
-		brightness_threshold: The brightness threshold
+```python
+multiCMD.run_commands([["echo", "[0-10]"]], quiet=True, parse=True)
+# -> [["0"], ["1"], ..., ["10"]]
+```
 
-	@returns:
-		(int,int,int): The RGB color
-	'''
-class Task:
-	def __init__(self, command):
-		self.command = command
-		self.returncode = None
-		self.stdout = []
-		self.stderr = []
+### Using sudo
+
+```python
+multiCMD.set_sudo(True)            # validates sudo is present and you aren't root
+multiCMD.run_command(["systemctl", "restart", "nginx"])
+# or per-call:
+multiCMD.run_command(["id"], use_sudo=True)
+```
+
+If `sudo` is not on `PATH`, or you are already root, the request is ignored with
+a warning instead of failing.
+
+## Timeout semantics
+
+`timeout` is an **inactivity timeout**, not a maximum total runtime. A command is
+killed only after it has produced **no new committed output line** for `timeout`
+seconds. An output line is "committed" when the stream handler encounters a `\n`
+or `\r`.
+
+This means a command that keeps printing output will keep running, while one that
+hangs silently will be terminated after `timeout` seconds. Set `timeout=0` (the
+default in the API) to disable the timeout entirely. On timeout, the task's
+return code is set to `124` and `Timeout!` is appended to its stderr.
+
+## Key functions and objects
+
+```python
+run_command(command, timeout=0, max_threads=1, quiet=False, dry_run=False,
+            with_stdErr=False, return_code_only=False, return_object=False,
+            wait_for_return=True, sem=None, use_sudo=..., raise_error=False)
+
+run_commands(commands, timeout=0, max_threads=1, quiet=False, dry_run=False,
+             with_stdErr=False, return_code_only=False, return_object=False,
+             parse=False, wait_for_return=True, sem=None, use_sudo=...,
+             raise_error=False)
+
+ping(hosts, timeout=1, max_threads=0, ...)   # returns True/False reachability
+join_threads(threads=..., timeout=None)      # join fire-and-forget threads
+set_sudo(use_sudo)                            # enable/disable sudo globally
+
+class Task:    # command, returncode, stdout (list[str]), stderr (list[str])
+class AsyncExecutor:  # run_command(s), wait, join, stop, cleanup, get_results, get_return_codes
+```
+
+The module also bundles a few terminal/formatting helpers used internally and
+reusable on their own: `pretty_format_table`, `parseTable`, `print_progress_bar`,
+`format_bytes`, `get_terminal_size`, `input_with_timeout_and_countdown`, and
+`slugify`.
+
+## Development
+
+Run the test suite with [pytest](https://pytest.org):
+
+```bash
+pip install pytest
+pytest
+```
+
+## License
+
+GPLv3+ — see the package metadata. Authored by Yufei Pan (<pan@zopyr.us>).
 ```
