@@ -26,8 +26,9 @@ def test_parse_flag_expands():
 	proc = run_cli(["-p", "echo [1-2]"])
 	assert proc.returncode == 0
 	combined = proc.stdout + proc.stderr
-	assert "1" in combined
-	assert "2" in combined
+	assert "[1-2]" not in combined
+	assert "Running command: echo 1" in combined
+	assert "Running command: echo 2" in combined
 
 
 def test_max_threads_and_timeout_smoke():
