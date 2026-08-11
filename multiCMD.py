@@ -503,6 +503,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			outLength = len(task.stdout) + len(task.stderr)
 			time.sleep(0)
 			sleep_time = 1.0e-7 # 100 nanoseconds
+			inactivity_timeout = False
 			while proc.poll() is None:  # while the process is still running
 				if task.stop:
 					proc.send_signal(signal.SIGINT)
@@ -515,6 +516,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 						outLength = len(task.stdout) + len(task.stderr)
 					elif time.time() - start_time > timeout:
 						task.stderr.append('Timeout!')
+						inactivity_timeout = True
 						proc.send_signal(signal.SIGINT)
 						time.sleep(0.01)
 						proc.terminate()
@@ -548,7 +550,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 						stream.close()
 				except Exception:
 					pass
-			if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
+			if inactivity_timeout:
 				task.returncode = 124
 			elif task.returncode is None:
 				# process been killed via sigkill or similar without a normal exit code

@@ -54,6 +54,30 @@ def test_timeout_silent_command():
 
 
 @pytest.mark.slow
+def test_timeout_returncode_preserved_after_sigint_handler_stderr():
+	task = run_command(
+		[
+			"python3",
+			"-c",
+			"import signal, sys, time\n"
+			"def handler(sig, frame):\n"
+			"    sys.stderr.write('handled\\n')\n"
+			"    sys.stderr.flush()\n"
+			"    sys.exit(0)\n"
+			"signal.signal(signal.SIGINT, handler)\n"
+			"time.sleep(10)\n",
+		],
+		timeout=0.3,
+		quiet=True,
+		return_object=True,
+	)
+	assert task.returncode == 124
+	assert "Timeout!" in task.stderr
+	assert "handled" in task.stderr
+	assert task.stderr[-1].strip() == "handled"
+
+
+@pytest.mark.slow
 def test_wait_for_return_false():
 	task = run_command(
 		["sleep", "0.4"],
