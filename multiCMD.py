@@ -22,9 +22,9 @@ import time
 from pprint import pformat
 
 #%% global vars
-version = '1.48'
+version = '1.49'
 __version__ = version
-COMMIT_DATE = '2026-06-04'
+COMMIT_DATE = '2026-08-10'
 __running_threads = set()
 __variables = {}
 
