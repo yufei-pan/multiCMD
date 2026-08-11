@@ -27,10 +27,11 @@ def test_regression_stdin_eof_no_hang():
 def test_regression_int_to_color_no_recursion():
 	# Previously could RecursionError / non-deterministic str hashing
 	colors = [int_to_color(i) for i in range(0, 5000, 97)]
-	assert len(colors) == len(set(range(0, 5000, 97)))
 	assert int_to_color(42) == int_to_color(42)
 	for rgb in colors:
 		assert all(0 <= c <= 255 for c in rgb)
+	# Distinct inputs should not all collapse onto the same color.
+	assert len(set(colors)) > 1
 
 
 @pytest.mark.slow

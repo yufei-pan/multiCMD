@@ -2,8 +2,6 @@ import builtins
 import select
 import sys
 
-import pytest
-
 from multiCMD import (
 	_genrate_progress_bar,
 	format_bytes,
