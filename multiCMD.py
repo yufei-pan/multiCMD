@@ -548,11 +548,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 						stream.close()
 				except Exception:
 					pass
-			if task.returncode is None:
-				# process been killed via timeout or sigkill
-				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
-					task.returncode = 124
-				elif task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
+			if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):
+				task.returncode = 124
+			elif task.returncode is None:
+				# process been killed via sigkill or similar without a normal exit code
+				if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
 					task.returncode = 137
 				else:
 					task.returncode = -1
