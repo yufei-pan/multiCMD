@@ -3,6 +3,7 @@ import os
 import pytest
 
 import multiCMD
+from conftest import has_sudo_binary
 from multiCMD import run_command, set_sudo
 
 
@@ -31,7 +32,7 @@ def test_set_sudo_true_without_sudo_binary(capsys):
 
 @pytest.mark.sudo
 def test_set_sudo_true_non_root_with_binary():
-	if os.geteuid() == 0 or not multiCMD.SUDO_PATH:
+	if os.geteuid() == 0 or not has_sudo_binary():
 		pytest.skip("needs non-root and sudo in PATH")
 	set_sudo(True)
 	assert multiCMD.USE_SUDO is True
