@@ -21,16 +21,13 @@ def test_pretty_format_table_basic_and_remove_empty():
 	data = [["a", ""], ["b", ""]]
 	header = ["h1", "h2"]
 	out = pretty_format_table(data, header=header, remove_empty_columns=True)
-	assert "h1" in out
-	assert "h2" not in out
-	assert "a" in out
+	assert out == "h1\n--\na \nb \n"
 
 
 def test_parse_table():
 	text = "col1  col2\nfoo   bar\n"
 	table = parseTable(text)
-	assert table[0] == ["col1", "col2"]
-	assert table[1][0] == "foo"
+	assert table == [["col1", "col2"], ["foo", "bar"]]
 
 
 def test_slugify_ascii_and_unicode():
@@ -40,27 +37,30 @@ def test_slugify_ascii_and_unicode():
 
 
 def test_format_bytes_roundtrip():
-	assert format_bytes(1024, use_1024_bytes=True, to_str=True).lower().startswith("1")
+	assert format_bytes(1024, use_1024_bytes=True, to_str=True) == "1.00 Ki"
 	assert format_bytes("1 KiB", to_int=True) == 1024
 
 
 def test_int_to_color_deterministic_and_in_range():
-	c1 = int_to_color(0x123456)
-	c2 = int_to_color(0x123456)
-	assert c1 == c2
-	assert all(0 <= ch <= 255 for ch in c1)
-	# black / bright extremes should not raise
-	assert len(int_to_color(0)) == 3
-	assert len(int_to_color(0xFFFFFF)) == 3
+	assert int_to_color(0x123456) == (36, 103, 171)
+	assert int_to_color(0) == (160, 160, 160)
+	assert int_to_color(0xFFFFFF) == (220, 220, 220)
 
 
-def test_progress_bar_helpers(capsys):
-	s = _genrate_progress_bar(5, 10, prefix="P", suffix="S", columns=80)
-	assert "P" in s and "S" in s
+def test_progress_bar_helpers(capsys, monkeypatch):
+	expected_bar = (
+		"P██████████████████████████████████▁__________________________________|50.0% S"
+	)
+	assert _genrate_progress_bar(5, 10, prefix="P", suffix="S", columns=80) == expected_bar
+
+	monkeypatch.setattr(
+		"multiCMD.get_terminal_size", lambda: (80, 24)
+	)
 	print_progress_bar(5, 10, prefix="Progress:", suffix="Complete")
 	captured = capsys.readouterr()
-	assert "Progress:" in captured.out
-	assert "50.0%" in captured.out or "50%" in captured.out
+	assert captured.out == (
+		"\rProgress: |████████████████████████▄_________________________|50.0% | Complete"
+	)
 
 
 def test_get_terminal_size_tuple():
