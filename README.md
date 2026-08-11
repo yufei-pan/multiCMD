@@ -242,8 +242,11 @@ Run the test suite with [pytest](https://pytest.org):
 
 ```bash
 pip install pytest
-pytest
+pytest                 # full suite under tests/
+pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
+
+`test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
 ## License
 
