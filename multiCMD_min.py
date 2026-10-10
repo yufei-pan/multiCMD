@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-import argparse,io,itertools,math,os,re,select,shutil,signal,string,subprocess,sys,threading,time
+import argparse,collections,itertools,math,os,re,select,shutil,signal,string,subprocess,sys,threading,time
 from pprint import pformat
-version='1.47'
+version='1.51'
 __version__=version
-COMMIT_DATE='2026-04-28'
+COMMIT_DATE='2026-10-10'
 __running_threads=set()
+__running_threads_lock=threading.Lock()
+__finished_threads=collections.deque()
 __variables={}
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
 _ALPHANUM=string.digits+string.ascii_letters
@@ -23,16 +25,61 @@ stderr=
 stop={self.stop!r})"""
 	def __str__(self):return pformat(dict(self))
 	def is_alive(self):return self.thread is not None and self.thread.is_alive()
+class _HeldPermit:
+	def __init__(self,semaphore):self.semaphore=semaphore
+	def __enter__(self):return self
+	def __exit__(self,*exc_info):self.semaphore.release();return False
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
 		self.max_threads=max_threads
 		if semaphore is...:semaphore=threading.Semaphore(max_threads)
-		self.semaphore=semaphore;self.runningThreads=[];self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self.__lastNotJoined=0
+		self.semaphore=semaphore;self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self._lock=threading.Lock();self._queue=collections.deque();self._dispatching=False;self._threads={};self._finished=collections.deque()
 	def __iter__(self):return iter(self.tasks)
 	def __repr__(self):return f"AsyncExecutor(max_threads={self.max_threads}, semaphore={self.semaphore}, runningThreads={self.runningThreads}, tasks={self.tasks}, timeout={self.timeout}, quiet={self.quiet}, dry_run={self.dry_run}, parse={self.parse})"
 	def __str__(self):return str(self.tasks)
 	def __len__(self):return len(self.tasks)
 	def __bool__(self):return bool(self.tasks)
+	@property
+	def runningThreads(self):
+		self._reap()
+		with self._lock:return list(self._threads)
+	def _reap(self):
+		while True:
+			try:thread,task=self._finished.popleft()
+			except IndexError:return
+			thread.join()
+			with self._lock:
+				self._threads.pop(thread,None)
+				if task is not None and task.thread is thread:task.thread=None
+	def _start_thread(self,target,args,task=None):
+		thread=threading.Thread(target=target,args=args,daemon=True)
+		with self._lock:
+			self._threads[thread]=None
+			if task is not None:task.thread=thread
+			try:thread.start()
+			except BaseException:
+				del self._threads[thread]
+				if task is not None:task.thread=None
+				raise
+		return thread
+	def _dispatch(self):
+		try:
+			while True:
+				with self._lock:
+					if not self._queue:self._dispatching=False;break
+					task,sem,timeout,quiet,dry_run=self._queue.popleft()
+				acquired=False
+				while not task.stop and not acquired:acquired=sem.acquire(timeout=.1)
+				if task.stop:
+					if acquired:sem.release()
+					continue
+				self._reap()
+				try:self._start_thread(_run_executor_task,(task,_HeldPermit(sem),timeout,quiet,dry_run,self._finished),task)
+				except BaseException:sem.release();raise
+		except BaseException:
+			with self._lock:self._dispatching=False
+			raise
+		finally:self._finished.append((threading.current_thread(),None))
 	def run_commands(self,commands,timeout=...,max_threads=...,quiet=...,dry_run=...,parse=...,sem=...):
 		if timeout is...:timeout=self.timeout
 		if max_threads is...:max_threads=self.max_threads
@@ -40,25 +87,36 @@ class AsyncExecutor:
 		if dry_run is...:dry_run=self.dry_run
 		if parse is...:parse=self.parse
 		if sem is...:sem=self.semaphore
-		if len(self.runningThreads)>130000:
-			self.wait(timeout=0)
-			if len(self.runningThreads)>130000:
-				print('The amount of running threads approching cpython limit of 130704. Waiting until some available.')
-				while len(self.runningThreads)>120000:self.wait(timeout=1)
-		elif len(self.runningThreads)+self.__lastNotJoined>1000:self.wait(timeout=0);self.__lastNotJoined=len(self.runningThreads)
-		taskObjects=run_commands(commands,timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=False,return_code_only=False,return_object=True,parse=parse,wait_for_return=False,sem=sem);self.tasks.extend(taskObjects);self.runningThreads.extend([task.thread for task in taskObjects]);return taskObjects
+		taskObjects,use_sudo=_build_tasks(commands,parse=parse)
+		if not sem:sem=threading.Semaphore(max_threads if max_threads>=1 else max(len(taskObjects),1))
+		if use_sudo:_validate_sudo(sem)
+		self._reap()
+		with self._lock:
+			self.tasks.extend(taskObjects);self._queue.extend((task,sem,timeout,quiet,dry_run)for task in taskObjects);start_dispatcher=not self._dispatching and bool(self._queue)
+			if start_dispatcher:self._dispatching=True
+		if start_dispatcher:
+			try:self._start_thread(self._dispatch,())
+			except BaseException:
+				with self._lock:self._dispatching=False
+				raise
+		return taskObjects
 	def run_command(self,command,timeout=...,max_threads=...,quiet=...,dry_run=...,parse=...,sem=...):return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem)[0]
 	def wait(self,timeout=...,threads=...):
-		if threads is...:threads=self.runningThreads
 		if timeout is...:timeout=self.timeout
-		for thread in threads:
-			if timeout>=0:thread.join(timeout=timeout)
-			else:thread.join()
-		self.runningThreads=[thread for thread in self.runningThreads if thread.is_alive()];return self.runningThreads
+		while True:
+			pending=self.runningThreads if threads is...else list(threads)
+			for thread in pending:
+				if timeout>=0:thread.join(timeout=timeout)
+				else:thread.join()
+			if threads is not...or not pending or any(thread.is_alive()for thread in pending):break
+		return self.runningThreads
 	def stop(self,timeout=...):
 		for task in self.tasks:task.stop=True
 		self.wait(timeout);return self.tasks
-	def cleanup(self,timeout=...):self.stop(timeout);self.tasks=[];self.runningThreads=[];return self.tasks
+	def cleanup(self,timeout=...):
+		self.stop(timeout)
+		with self._lock:self.tasks=[];self._queue.clear();self._threads.clear()
+		return self.tasks
 	def join(self,timeout=...,threads=...,print_error=True):
 		self.wait(timeout=timeout,threads=threads)
 		for task in self.tasks:
@@ -79,7 +137,7 @@ def _expand_piece(piece,vars_):
 	if':'in piece:var,_,value=piece.partition(':');vars_[var]=__evaluate_value(value.strip(),vars_,dereference=False);return
 	if'-'in piece:
 		start,_,end=(p.strip()for p in piece.partition('-'));start=str(__evaluate_value(start,vars_));end=str(__evaluate_value(end,vars_))
-		if start.isdigit()and end.isdigit():pad=max(len(start),len(end));return[f"{i:0{pad}d}"for i in range(int(start),int(end)+1)]
+		if start.isdigit()and end.isdigit():pad=min(len(start),len(end));return[f"{i:0{pad}d}"for i in range(int(start),int(end)+1)]
 		if all(c in string.hexdigits for c in start+end):return[format(i,'x')for i in range(int(start,16),int(end,16)+1)]
 		try:return[_ALPHANUM[i]for i in range(_ALPHA_IDX[start],_ALPHA_IDX[end]+1)]
 		except KeyError:pass
@@ -99,6 +157,7 @@ def _expand_ranges_fast(inStr):
 		if choices:segments.append(choices)
 		pos=match.end()
 	segments.append([inStr[pos:]]);return[''.join(parts)for parts in itertools.product(*segments)]
+_expand_ranges=_expand_ranges_fast
 def __handle_stream(stream,target,pre='',post='',quiet=False):
 	def add_line(current_line,target,keepLastLine=True):
 		if not keepLastLine:
@@ -117,16 +176,26 @@ def __handle_stream(stream,target,pre='',post='',quiet=False):
 		else:current_line.extend(char)
 	if current_line:add_line(current_line,target,keepLastLine=lastLineCommited)
 def int_to_color(hash_value,min_brightness=100,max_brightness=220):
-	r=hash_value>>16&255;g=hash_value>>8&255;b=hash_value&255;brightness=math.sqrt(.299*r**2+.587*g**2+.114*b**2)
-	if brightness<min_brightness:return int_to_color(hash(str(hash_value)),min_brightness,max_brightness)
-	if brightness>max_brightness:return int_to_color(hash(str(hash_value)),min_brightness,max_brightness)
-	return r,g,b
+	def _brightness(r,g,b):return math.sqrt(.299*r**2+.587*g**2+.114*b**2)
+	r=hash_value>>16&255;g=hash_value>>8&255;b=hash_value&255;brightness=_brightness(r,g,b)
+	if brightness==0:gray=int((min_brightness+max_brightness)/2);return gray,gray,gray
+	if brightness>max_brightness:scale=max_brightness/brightness;r,g,b=r*scale,g*scale,b*scale
+	elif brightness<min_brightness:
+		scale=min_brightness/brightness;r,g,b=min(255,r*scale),min(255,g*scale),min(255,b*scale)
+		if _brightness(r,g,b)<min_brightness:
+			lo,hi=.0,1.
+			for _ in range(20):
+				t=(lo+hi)/2
+				if _brightness(r+t*(255-r),g+t*(255-g),b+t*(255-b))<min_brightness:lo=t
+				else:hi=t
+			r,g,b=r+hi*(255-r),g+hi*(255-g),b+hi*(255-b)
+	return min(255,round(r)),min(255,round(g)),min(255,round(b))
 def set_sudo(use_sudo):
 	global USE_SUDO;global SUDO_PATH
-	if os.geteuid()!=0 and use_sudo:
-		if SUDO_PATH:USE_SUDO=True
-		else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr)
-	else:USE_SUDO=False
+	if not use_sudo:USE_SUDO=False;return
+	if getattr(os,'geteuid',lambda:1)()==0:USE_SUDO=False
+	elif SUDO_PATH:USE_SUDO=True
+	else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);USE_SUDO=False
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	pre='';post=''
 	with sem:
@@ -136,26 +205,54 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 				r,g,b=int_to_color(identity);pre=f"[38;2;{r};{g};{b}m";post='\x1b[0m'
 			if not quiet:print(pre+'Running command: '+' '.join(task.command)+post);print(pre+'-'*100+post)
 			if dry_run:return task.stdout+task.stderr
-			proc=subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.PIPE);stdout_thread=threading.Thread(target=__handle_stream,args=(proc.stdout,task.stdout,pre,post,quiet),daemon=True);stdout_thread.start();stderr_thread=threading.Thread(target=__handle_stream,args=(proc.stderr,task.stderr,pre,post,quiet),daemon=True);stderr_thread.start();start_time=time.time();outLength=len(task.stdout)+len(task.stderr);time.sleep(0);sleep_time=1e-07
+			proc=subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL);stdout_thread=threading.Thread(target=__handle_stream,args=(proc.stdout,task.stdout,pre,post,quiet),daemon=True);stdout_thread.start();stderr_thread=threading.Thread(target=__handle_stream,args=(proc.stderr,task.stderr,pre,post,quiet),daemon=True);stderr_thread.start();start_time=time.time();outLength=len(task.stdout)+len(task.stderr);time.sleep(0);sleep_time=1e-07;inactivity_timeout=False
 			while proc.poll()is None:
 				if task.stop:proc.send_signal(signal.SIGINT);time.sleep(.01);proc.terminate();break
 				if timeout>0:
 					if len(task.stdout)+len(task.stderr)!=outLength:start_time=time.time();outLength=len(task.stdout)+len(task.stderr)
-					elif time.time()-start_time>timeout:task.stderr.append('Timeout!');proc.send_signal(signal.SIGINT);time.sleep(.01);proc.terminate();break
+					elif time.time()-start_time>timeout:task.stderr.append('Timeout!');inactivity_timeout=True;proc.send_signal(signal.SIGINT);time.sleep(.01);proc.terminate();break
 				time.sleep(sleep_time)
 				if sleep_time<.001:sleep_time*=2
-			task.returncode=proc.poll();stdout_thread.join(timeout=1);stderr_thread.join(timeout=1);stdout,stderr=proc.communicate()
-			if stdout:__handle_stream(io.BytesIO(stdout),task.stdout,pre=pre,post=post,quiet=quiet)
-			if stderr:__handle_stream(io.BytesIO(stderr),task.stderr,pre=pre,post=post,quiet=quiet)
-			if task.returncode is None:
-				if task.stderr and task.stderr[-1].strip().startswith('Timeout!'):task.returncode=124
-				elif task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
+			try:proc.wait(timeout=1)
+			except subprocess.TimeoutExpired:
+				proc.kill()
+				try:proc.wait(timeout=1)
+				except subprocess.TimeoutExpired:pass
+			task.returncode=proc.poll();stdout_thread.join(timeout=5);stderr_thread.join(timeout=5)
+			for stream in(proc.stdout,proc.stderr):
+				try:
+					if stream:stream.close()
+				except Exception:pass
+			if inactivity_timeout:task.returncode=124
+			elif task.returncode is None:
+				if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
 				else:task.returncode=-1
 		except FileNotFoundError as e:print(f"Command path not found: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=127
 		except Exception as e:import traceback;print(f"Error running command: {task.command}",file=sys.stderr,flush=True);print(str(e).split('\n'));task.stderr.extend(str(e).split('\n'));task.stderr.extend(traceback.format_exc().split('\n'));task.returncode=-1
 		if not quiet:print(pre+'\n'+'-'*100+post);print(pre+f"Process exited with return code {task.returncode}"+post)
 		if with_stdErr:return task.stdout+task.stderr
 		else:return task.stdout
+def _run_executor_task(task,permit,timeout,quiet,dry_run,finished):
+	try:__run_command(task,permit,timeout,quiet,dry_run,identity=...)
+	finally:finished.append((threading.current_thread(),task))
+def __run_tracked_command(task,sem,timeout,quiet,dry_run,identity):
+	try:__run_command(task,sem,timeout,quiet,dry_run,identity=identity)
+	finally:__finished_threads.append(threading.current_thread())
+def __reap_finished_threads():
+	while True:
+		try:thread=__finished_threads.popleft()
+		except IndexError:return
+		thread.join()
+		with __running_threads_lock:__running_threads.discard(thread)
+def _build_tasks(commands,parse=False,use_sudo=...):
+	global USE_SUDO;global SUDO_PATH
+	if use_sudo is...:use_sudo=USE_SUDO
+	if use_sudo and not SUDO_PATH:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);use_sudo=False
+	formatedCommands=[]
+	for command in commands:formatedCommands.extend(__format_command(command,expand=parse))
+	if use_sudo:formatedCommands=[[SUDO_PATH]+command for command in formatedCommands]
+	return[Task(command)for command in formatedCommands],bool(use_sudo)
+def _validate_sudo(sem):__run_command(Task([SUDO_PATH,'-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)
 def __format_command(command,expand=False):
 	if isinstance(command,str):
 		if expand:commands=_expand_ranges_fast(command)
@@ -182,21 +279,18 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 	else:return results
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error)[0]
 def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False):
-	global USE_SUDO;global SUDO_PATH
-	if use_sudo is...:use_sudo=USE_SUDO
-	formatedCommands=[]
-	for command in commands:formatedCommands.extend(__format_command(command,expand=parse))
-	if use_sudo:formatedCommands=[[SUDO_PATH]+command for command in formatedCommands]
-	tasks=[Task(command)for command in formatedCommands]
-	if max_threads<1:max_threads=len(formatedCommands)
+	tasks,use_sudo=_build_tasks(commands,parse=parse,use_sudo=use_sudo)
+	if max_threads<1:max_threads=len(tasks)
 	if not sem:sem=threading.Semaphore(max_threads)
-	if use_sudo:__run_command(Task([SUDO_PATH,'-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)
-	if max_threads>1 or not wait_for_return:
+	if use_sudo:_validate_sudo(sem)
+	if not wait_for_return:
+		__reap_finished_threads();threads=[threading.Thread(target=__run_tracked_command,args=(task,sem,timeout,quiet,dry_run,...),daemon=True)for task in tasks]
+		with __running_threads_lock:__running_threads.update(threads)
+		for(thread,task)in zip(threads,tasks):task.thread=thread;thread.start()
+	elif max_threads>1:
 		threads=[threading.Thread(target=__run_command,args=(task,sem,timeout,quiet,dry_run,...),daemon=True)for task in tasks]
 		for(thread,task)in zip(threads,tasks):task.thread=thread;thread.start()
-		if wait_for_return:
-			for thread in threads:thread.join()
-		else:__running_threads.update(threads)
+		for thread in threads:thread.join()
 	else:
 		for task in tasks:__run_command(task,sem,timeout,quiet,dry_run,identity=None)
 	if raise_error:
@@ -207,11 +301,11 @@ def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with
 	elif with_stdErr:return[task.stdout+task.stderr for task in tasks]
 	else:return[task.stdout for task in tasks]
 def join_threads(threads=...,timeout=None):
-	global __running_threads
-	if threads is...:threads=__running_threads
+	if threads is...:
+		with __running_threads_lock:threads=list(__running_threads)
 	for thread in threads:thread.join(timeout=timeout)
-	if threads is __running_threads:__running_threads={t for t in threads if t.is_alive()}
-def main():parser=argparse.ArgumentParser(description='Run multiple commands in parallel');parser.add_argument('commands',metavar='command',type=str,nargs='+',help='commands to run');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='timeout',type=int,default=60,help='timeout for each command');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of threads to use');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode');parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args();run_commands(args.commands,args.timeout,args.max_threads,args.quiet,parse=args.parse,with_stdErr=True,use_sudo=args.sudo)
+	__reap_finished_threads()
+def main():parser=argparse.ArgumentParser(description='Run multiple commands in parallel');parser.add_argument('commands',metavar='command',type=str,nargs='+',help='commands to run');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='timeout',type=int,default=60,help='timeout for each command');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of threads to use');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode');parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args();set_sudo(args.sudo);run_commands(args.commands,args.timeout,args.max_threads,args.quiet,parse=args.parse,with_stdErr=True)
 if __name__=='__main__':main()
 def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
 	print(f"{prompt} [{timeout}s]: ",end='',flush=True)
@@ -366,11 +460,11 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 			except Exception:return size
 		if use_1024_bytes or use_1024_bytes is None:
 			power=2**10;n=0;power_labels={0:'',1:'Ki',2:'Mi',3:'Gi',4:'Ti',5:'Pi',6:'Ei',7:'Zi',8:'Yi'}
-			while size>power:size/=power;n+=1
+			while size>=power:size/=power;n+=1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace('  ',' ')
 		else:
 			power=10**3;n=0;power_labels={0:'',1:'K',2:'M',3:'G',4:'T',5:'P',6:'E',7:'Z',8:'Y'}
-			while size>power:size/=power;n+=1
+			while size>=power:size/=power;n+=1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace('  ',' ')
 	else:
 		try:return format_bytes(float(size),use_1024_bytes)
