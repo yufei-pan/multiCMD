@@ -183,8 +183,10 @@ print(ex.get_results())
 `run_command(s)` returns right away and queues the commands. One dispatcher thread
 starts each queued command only after taking a permit from the semaphore, so the
 executor holds at most one thread per permit plus the dispatcher, however many
-commands are queued. A queued command's `task.thread` is `None` until it starts,
-and `stop()` skips commands that have not started yet.
+commands are queued. A command's `task.thread` is `None` until it starts, and goes
+back to `None` once it has finished and the executor has joined its thread, so a
+large batch does not keep a `Thread` object per finished command. `stop()` skips
+commands that have not started yet.
 
 ### Range expansion from Python
 

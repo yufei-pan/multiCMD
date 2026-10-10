@@ -96,8 +96,9 @@ class AsyncExecutor:
 
 		Commands are queued and a dispatcher thread starts each one only after taking a permit
 		from the semaphore, so the executor holds at most one thread per permit it uses plus the
-		dispatcher, however many commands are queued. A queued command's task.thread stays None
-		until it starts.
+		dispatcher, however many commands are queued. A command's task.thread is None until it
+		starts, and goes back to None once it has finished and the executor has joined its thread,
+		so finished tasks do not keep their Thread objects.
 		@params:
 			max_threads: The maximum number of threads to use ( int ) ( Note: if passing semaphore, this likely will be ignored )
 			semaphore: The semaphore to use for threading ( threading.Semaphore )
@@ -158,23 +159,31 @@ class AsyncExecutor:
 		'''
 		while True:
 			try:
-				thread = self._finished.popleft()
+				thread, task = self._finished.popleft()
 			except IndexError:
 				return
 			thread.join()
 			with self._lock:
 				self._threads.pop(thread, None)
+				# a finished Thread object costs ~2 KB, and the task outlives it in self.tasks
+				if task is not None and task.thread is thread:
+					task.thread = None
 
-	def _start_thread(self, target, args):
+	def _start_thread(self, target, args, task=None):
 		thread = threading.Thread(target=target, args=args, daemon=True)
 		# registered before it starts, so it is tracked before it can report itself finished
 		with self._lock:
 			self._threads[thread] = None
+			if task is not None:
+				# set before it starts, so _reap() never sees the task without its thread
+				task.thread = thread
 			try:
 				thread.start()
 			except BaseException:
 				# never started: it would never report itself finished
 				del self._threads[thread]
+				if task is not None:
+					task.thread = None
 				raise
 		return thread
 
@@ -199,7 +208,7 @@ class AsyncExecutor:
 					continue
 				self._reap()
 				try:
-					task.thread = self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished))
+					self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished), task)
 				except BaseException:
 					sem.release()
 					raise
@@ -209,7 +218,7 @@ class AsyncExecutor:
 				self._dispatching = False
 			raise
 		finally:
-			self._finished.append(threading.current_thread())
+			self._finished.append((threading.current_thread(), None))
 
 	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
 		'''
@@ -696,12 +705,12 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 
 def _run_executor_task(task, permit, timeout, quiet, dry_run, finished):
 	'''
-	Run an AsyncExecutor command, then report this thread finished so the executor joins it ( internal )
+	Run an AsyncExecutor command, then report this thread finished so the executor joins it and drops it from the task ( internal )
 	'''
 	try:
 		__run_command(task, permit, timeout, quiet, dry_run, identity=...)
 	finally:
-		finished.append(threading.current_thread())
+		finished.append((threading.current_thread(), task))
 
 def __run_tracked_command(task, sem, timeout, quiet, dry_run, identity):
 	'''

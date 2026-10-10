@@ -69,7 +69,10 @@ def _stack_mappings(size):
 	return count
 
 
-def test_executor_queues_commands_instead_of_parking_threads():
+def test_executor_queues_commands_instead_of_parking_threads(monkeypatch):
+	ran = []
+	run_task = multiCMD._run_executor_task
+	monkeypatch.setattr(multiCMD, '_run_executor_task', lambda task, *args: (ran.append(task), run_task(task, *args)))
 	gate = threading.Semaphore(0)
 	baseline = threading.active_count()
 	ex = AsyncExecutor(semaphore=gate, quiet=True, dry_run=True)
@@ -83,7 +86,8 @@ def test_executor_queues_commands_instead_of_parking_threads():
 		gate.release()
 	ex.wait(timeout=-1)
 	assert ex.runningThreads == []
-	assert all(task.thread is not None and not task.is_alive() for task in tasks)
+	assert sorted(map(id, ran)) == sorted(map(id, tasks))
+	assert all(task.thread is None and not task.is_alive() for task in tasks)
 
 
 @pytest.mark.slow
@@ -121,9 +125,15 @@ def test_executor_releases_finished_thread_stacks():
 
 def test_executor_threads_stay_out_of_global_set():
 	ex = AsyncExecutor(max_threads=2, quiet=True)
-	tasks = ex.run_commands([['true'], ['true']])
+	tasks = ex.run_commands([['sleep', '0.3'], ['sleep', '0.3']])
+	# finished tasks drop their thread, so take the threads while the commands run
+	deadline = time.monotonic() + 5
+	while not all(task.thread for task in tasks) and time.monotonic() < deadline:
+		time.sleep(0.01)
+	threads = {task.thread for task in tasks}
+	assert None not in threads
+	assert not threads & _global_threads()
 	ex.wait(timeout=-1)
-	assert not {task.thread for task in tasks} & _global_threads()
 
 
 def test_finished_fire_and_forget_threads_leave_global_set():
@@ -132,6 +142,15 @@ def test_finished_fire_and_forget_threads_leave_global_set():
 		task.thread.join()
 	run_commands([['true']], wait_for_return=False, quiet=True)
 	assert not {task.thread for task in tasks} & _global_threads()
+
+
+def test_finished_executor_tasks_release_their_threads():
+	ex = AsyncExecutor(max_threads=4, quiet=True)
+	tasks = ex.run_commands([['true']] * 20)
+	ex.wait(timeout=-1)
+	assert [task.returncode for task in tasks] == [0] * 20
+	# a finished Thread object costs ~2 KB, kept for as long as the executor keeps the task
+	assert all(task.thread is None and not task.is_alive() for task in tasks)
 
 
 def test_stop_skips_queued_commands():
