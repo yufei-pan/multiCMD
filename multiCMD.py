@@ -7,6 +7,7 @@
 # ///
 #%% imports
 import argparse
+import collections
 import itertools
 import math
 import os
@@ -25,7 +26,11 @@ from pprint import pformat
 version = '1.49'
 __version__ = version
 COMMIT_DATE = '2026-08-10'
+# fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on
 __running_threads = set()
+__running_threads_lock = threading.Lock()
+# fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
+__finished_threads = collections.deque()
 __variables = {}
 
 # immutable helpers compiled once at import time
@@ -69,10 +74,30 @@ stop={self.stop!r})"""
 	def is_alive(self):
 		return self.thread is not None and self.thread.is_alive()
 
+class _HeldPermit:
+	'''
+	Semaphore stand-in for a command whose permit the dispatcher already holds ( internal )
+	Entering is free, exiting releases the permit.
+	'''
+	def __init__(self, semaphore):
+		self.semaphore = semaphore
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *exc_info):
+		self.semaphore.release()
+		return False
+
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
 		'''
 		AsyncExecutor class to run commands in parallel asynchronously
+
+		Commands are queued and a dispatcher thread starts each one only after taking a permit
+		from the semaphore, so the executor holds at most one thread per permit it uses plus the
+		dispatcher, however many commands are queued. A queued command's task.thread stays None
+		until it starts.
 		@params:
 			max_threads: The maximum number of threads to use ( int ) ( Note: if passing semaphore, this likely will be ignored )
 			semaphore: The semaphore to use for threading ( threading.Semaphore )
@@ -85,13 +110,19 @@ class AsyncExecutor:
 		if semaphore is ...:
 			semaphore = threading.Semaphore(max_threads)
 		self.semaphore = semaphore
-		self.runningThreads = []
 		self.tasks = []
 		self.timeout = timeout
 		self.quiet = quiet
 		self.dry_run = dry_run
 		self.parse = parse
-		self.__lastNotJoined = 0
+		self._lock = threading.Lock()
+		# (task, sem, timeout, quiet, dry_run) waiting for a permit
+		self._queue = collections.deque()
+		self._dispatching = False
+		# started threads not yet joined, in start order ( dict used as an ordered set )
+		self._threads = {}
+		# threads append themselves here when done, so _reap() joins them without scanning
+		self._finished = collections.deque()
 
 	def __iter__(self):
 		return iter(self.tasks)
@@ -107,10 +138,82 @@ class AsyncExecutor:
 	
 	def __bool__(self):
 		return bool(self.tasks)
-	
+
+	@property
+	def runningThreads(self):
+		'''
+		The threads that have not finished yet: the dispatcher while commands are queued, and the started commands
+		@returns:
+			list[threading.Thread]: The unfinished threads
+		'''
+		self._reap()
+		with self._lock:
+			return list(self._threads)
+
+	def _reap(self):
+		'''
+		Join the threads that finished and forget them ( internal )
+		Joining releases the thread's stack: a finished thread that is still referenced but never
+		joined keeps its stack mapped.
+		'''
+		while True:
+			try:
+				thread = self._finished.popleft()
+			except IndexError:
+				return
+			thread.join()
+			with self._lock:
+				self._threads.pop(thread, None)
+
+	def _start_thread(self, target, args):
+		thread = threading.Thread(target=target, args=args, daemon=True)
+		# registered before it starts, so it is tracked before it can report itself finished
+		with self._lock:
+			self._threads[thread] = None
+			try:
+				thread.start()
+			except BaseException:
+				# never started: it would never report itself finished
+				del self._threads[thread]
+				raise
+		return thread
+
+	def _dispatch(self):
+		'''
+		Start queued commands one permit at a time ( internal )
+		'''
+		try:
+			while True:
+				with self._lock:
+					if not self._queue:
+						self._dispatching = False
+						break
+					task, sem, timeout, quiet, dry_run = self._queue.popleft()
+				# wait for a permit, but give up on a command that gets stopped meanwhile
+				acquired = False
+				while not task.stop and not acquired:
+					acquired = sem.acquire(timeout=0.1)
+				if task.stop:
+					if acquired:
+						sem.release()
+					continue
+				self._reap()
+				try:
+					task.thread = self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished))
+				except BaseException:
+					sem.release()
+					raise
+		except BaseException:
+			# let the next run_commands() start a new dispatcher for what is still queued
+			with self._lock:
+				self._dispatching = False
+			raise
+		finally:
+			self._finished.append(threading.current_thread())
+
 	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
 		'''
-		Run multiple commands in parallel asynchronously
+		Run multiple commands in parallel asynchronously. Returns right away, the commands are queued
 		@params:
 			commands: A list of commands to run ( list[str] | list[list[str]] )
 			timeout: The timeout for each command to override the object default
@@ -134,19 +237,26 @@ class AsyncExecutor:
 			parse = self.parse
 		if sem is ...:
 			sem = self.semaphore
-		if len(self.runningThreads) > 130000:
-			self.wait(timeout=0)
-			if len(self.runningThreads) > 130000:
-				print('The amount of running threads approching cpython limit of 130704. Waiting until some available.')
-				while len(self.runningThreads) > 120000:
-					self.wait(timeout=1)
-		elif len(self.runningThreads) + self.__lastNotJoined > 1000:
-			self.wait(timeout=0)
-			self.__lastNotJoined = len(self.runningThreads)
-		taskObjects: list[Task] = run_commands(commands,timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=False,
-				 return_code_only=False,return_object=True, parse = parse, wait_for_return = False, sem = sem)
-		self.tasks.extend(taskObjects)
-		self.runningThreads.extend([task.thread for task in taskObjects])
+		taskObjects, use_sudo = _build_tasks(commands, parse=parse)
+		if not sem:
+			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
+		if use_sudo:
+			_validate_sudo(sem)
+		self._reap()
+		with self._lock:
+			self.tasks.extend(taskObjects)
+			self._queue.extend((task, sem, timeout, quiet, dry_run) for task in taskObjects)
+			start_dispatcher = not self._dispatching and bool(self._queue)
+			if start_dispatcher:
+				# only the dispatcher clears this, under the lock, once it sees the queue empty
+				self._dispatching = True
+		if start_dispatcher:
+			try:
+				self._start_thread(self._dispatch, ())
+			except BaseException:
+				with self._lock:
+					self._dispatching = False
+				raise
 		return taskObjects
 	
 	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
@@ -169,26 +279,30 @@ class AsyncExecutor:
 		'''
 		Wait for the threads to finish
 		@params:
-			timeout: The timeout for each command to override the object default
-			threads: The threads to join, default to all running threads managed by this object
+			timeout: The timeout for each thread to override the object default ( negative waits forever )
+			threads: The threads to join, default to all running threads managed by this object,
+				including the ones the dispatcher starts while waiting
 		@returns:
 			list[threading.Thread]: The list of running threads that are still running
 		'''
-		if threads is ...:
-			threads = self.runningThreads
 		if timeout is ...:
 			timeout = self.timeout
-		for thread in threads:
-			if timeout >= 0:
-				thread.join(timeout=timeout)
-			else:
-				thread.join()
-		self.runningThreads = [thread for thread in self.runningThreads if thread.is_alive()]
+		while True:
+			pending = self.runningThreads if threads is ... else list(threads)
+			for thread in pending:
+				if timeout >= 0:
+					thread.join(timeout=timeout)
+				else:
+					thread.join()
+			# once a pass finishes every thread, look again for commands the dispatcher started meanwhile
+			if threads is not ... or not pending or any(thread.is_alive() for thread in pending):
+				break
 		return self.runningThreads
 	
 	def stop(self,timeout=...):
 		'''
-		Stop all running threads. This signals all threads to stop and joins them
+		Stop all running threads. This signals all threads to stop and joins them.
+		Commands still queued are skipped: they keep task.thread None and returncode None
 		@params:
 			None
 		@returns:
@@ -208,8 +322,10 @@ class AsyncExecutor:
 			list[Task]: The list of tasks that are managed by this object
 		'''
 		self.stop(timeout)
-		self.tasks = []
-		self.runningThreads = []
+		with self._lock:
+			self.tasks = []
+			self._queue.clear()
+			self._threads.clear()
 		return self.tasks
 	
 	def join(self, timeout=..., threads = ..., print_error=True):
@@ -578,6 +694,69 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
+def _run_executor_task(task, permit, timeout, quiet, dry_run, finished):
+	'''
+	Run an AsyncExecutor command, then report this thread finished so the executor joins it ( internal )
+	'''
+	try:
+		__run_command(task, permit, timeout, quiet, dry_run, identity=...)
+	finally:
+		finished.append(threading.current_thread())
+
+def __run_tracked_command(task, sem, timeout, quiet, dry_run, identity):
+	'''
+	Run a fire-and-forget command, then report this thread finished so it leaves __running_threads ( internal )
+	'''
+	try:
+		__run_command(task, sem, timeout, quiet, dry_run, identity=identity)
+	finally:
+		__finished_threads.append(threading.current_thread())
+
+def __reap_finished_threads():
+	'''
+	Join finished fire-and-forget threads and drop them from __running_threads ( internal )
+	Joining releases the thread's stack: a finished thread that is still referenced but never
+	joined keeps its stack mapped.
+	'''
+	while True:
+		try:
+			thread = __finished_threads.popleft()
+		except IndexError:
+			return
+		thread.join()
+		with __running_threads_lock:
+			__running_threads.discard(thread)
+
+def _build_tasks(commands, parse=False, use_sudo=...):
+	'''
+	Format commands into Tasks, prefixing sudo when requested and available ( internal )
+
+	@returns:
+		tuple[list[Task], bool]: The tasks and whether sudo is used
+	'''
+	global USE_SUDO
+	global SUDO_PATH
+	if use_sudo is ...:
+		use_sudo = USE_SUDO
+	# Guard against requesting sudo when it is not available. Without this,
+	# prepending a None SUDO_PATH would crash subprocess.Popen with a TypeError.
+	if use_sudo and not SUDO_PATH:
+		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+		use_sudo = False
+	# split the commands in commands if it is a string
+	formatedCommands = []
+	for command in commands:
+		formatedCommands.extend(__format_command(command,expand=parse))
+	if use_sudo:
+		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
+	return [Task(command) for command in formatedCommands], bool(use_sudo)
+
+def _validate_sudo(sem):
+	'''
+	Validate sudo access before running sudo commands ( internal )
+	'''
+	__run_command(Task([SUDO_PATH, '-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)
+
 def __format_command(command,expand = False):
 	'''
 	Format a command
@@ -714,41 +893,31 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
-	global USE_SUDO
-	global SUDO_PATH
-	if use_sudo is ...:
-		use_sudo = USE_SUDO
-	# Guard against requesting sudo when it is not available. Without this,
-	# prepending a None SUDO_PATH would crash subprocess.Popen with a TypeError.
-	if use_sudo and not SUDO_PATH:
-		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
-		use_sudo = False
-	# split the commands in commands if it is a string
-	formatedCommands = []
-	for command in commands:
-		formatedCommands.extend(__format_command(command,expand=parse))
 	# initialize the tasks
-	if use_sudo:
-		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
-	tasks = [Task(command) for command in formatedCommands]
+	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo)
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
-		max_threads = len(formatedCommands)
+		max_threads = len(tasks)
 	if not sem:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 	if use_sudo:
-		# validate sudo access
-		__run_command(Task([SUDO_PATH, '-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)	
-	if max_threads > 1 or not wait_for_return:
+		_validate_sudo(sem)
+	if not wait_for_return:
+		__reap_finished_threads()
+		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
+		# tracked before they start, so a thread is always registered before it reports itself finished
+		with __running_threads_lock:
+			__running_threads.update(threads)
+		for thread,task in zip(threads,tasks):
+			task.thread = thread
+			thread.start()
+	elif max_threads > 1:
 		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
 		for thread,task in zip(threads,tasks):
 			task.thread = thread
 			thread.start()
-		if wait_for_return:
-			for thread in threads:
-				thread.join()
-		else:
-			__running_threads.update(threads)
+		for thread in threads:
+			thread.join()
 	else:
 		for task in tasks:
 			__run_command(task,sem,timeout,quiet,dry_run,identity=None)
@@ -777,13 +946,12 @@ def join_threads(threads=...,timeout=None):
 	@returns:
 		None
 	'''
-	global __running_threads
 	if threads is ...:
-		threads = __running_threads
+		with __running_threads_lock:
+			threads = list(__running_threads)
 	for thread in threads:
 		thread.join(timeout=timeout)
-	if threads is __running_threads:
-		__running_threads = {t for t in threads if t.is_alive()}
+	__reap_finished_threads()
 
 def main():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
