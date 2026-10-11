@@ -10,6 +10,7 @@ import argparse
 import atexit
 import collections
 import errno
+import io
 import itertools
 import math
 import os
@@ -64,6 +65,8 @@ _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
 # commands still running: Popen -> process group id ( None when the command has no group of its own )
 _live_procs = {}
 _live_procs_lock = threading.Lock()
+# set once the "cannot use a pty" warning has been printed
+_PTY_WARNED = False
 
 #%% objects
 class Task:
@@ -944,6 +947,53 @@ def kill_all(sig=None):
 
 atexit.register(kill_all)
 
+def _resolve_pty(pty):
+	'''
+	Whether commands write to a pty: only on POSIX, with a one-time warning elsewhere ( internal )
+	'''
+	global _PTY_WARNED
+	if not pty:
+		return False
+	if _IS_POSIX:
+		return True
+	if not _PTY_WARNED:
+		_PTY_WARNED = True
+		print('multiCMD: pty mode needs a POSIX system, using pipes', file=sys.stderr)
+	return False
+
+def _open_pty(reserved=0):
+	'''
+	Open a pseudo-terminal for a command's output ( internal )
+	Output post-processing is off, so bytes arrive exactly as written ( no '\n' to '\r\n' ), and
+	the window size is the real terminal's, less the reserved columns ( the [#] prefix ).
+	The pty is only the command's output, never its controlling terminal.
+	@params:
+		reserved: Columns to take off the terminal width
+	@returns:
+		( int, int ) | ( None, None ): The master and slave file descriptors, or None when no pty can be opened
+	'''
+	global _PTY_WARNED
+	try:
+		import pty as _pty_module
+		master, slave = _pty_module.openpty()
+	except (ImportError, OSError) as e:
+		if not _PTY_WARNED:
+			_PTY_WARNED = True
+			print(f'multiCMD: cannot open a pty ({e}), using pipes', file=sys.stderr)
+		return None, None
+	try:
+		import fcntl
+		import struct
+		import termios
+		attrs = termios.tcgetattr(slave)
+		attrs[1] &= ~termios.OPOST
+		termios.tcsetattr(slave, termios.TCSANOW, attrs)
+		columns, rows = get_terminal_size()[:2]
+		fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, max(columns - reserved, 20), 0, 0))
+	except Exception:
+		pass
+	return master, slave
+
 def _watch(task, proc, timeout):
 	'''
 	Wait for a command to exit ( internal )
@@ -1012,8 +1062,23 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		decor: ( prefix, color start, color end ) for displayed lines
 		use_pty: Whether the command writes to a pty instead of pipes ( POSIX only )
 	'''
-	proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE)
-	streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
+	master = slave = None
+	if use_pty:
+		master, slave = _open_pty(len(decor[0]))
+	if master is not None:
+		try:
+			proc, pgid = _spawn(task.command, slave, slave, dict(os.environ, PAGER='cat', GIT_PAGER='cat'))
+		except BaseException:
+			os.close(master)
+			raise
+		finally:
+			# only the command keeps the terminal side open, so the master sees EIO once it is gone
+			os.close(slave)
+		task._pty = True
+		streams = [(io.open(master, 'rb'), task.stdout)]
+	else:
+		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE)
+		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
 	task.start_time = time.time()
 	task._last_output = time.monotonic()
 	_register(proc, pgid)
@@ -1292,7 +1357,7 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
-				use_sudo = ..., raise_error = False, prefix = False, color = None):
+				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False):
 	'''
 	Run a command
 
@@ -1313,6 +1378,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		raise_error: Whether to raise an error if the command fails
 		prefix: Whether to prefix output lines with [#] when commands run at once ( never for one command )
 		color: Whether to color output lines ( None: when commands run at once on a terminal without NO_COLOR )
+		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
@@ -1320,11 +1386,11 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
-					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color)[0]
+					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
-				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None):
+				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False):
 	'''
 	Run multiple commands in parallel
 
@@ -1346,6 +1412,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		raise_error: Whether to raise an error if the command fails
 		prefix: Whether to prefix output lines with [#], the command's 1-based position, when commands run at once
 		color: Whether to color output lines per command ( None: when commands run at once on a terminal without NO_COLOR )
+		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
@@ -1360,13 +1427,14 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	use_color = _resolve_color(color, concurrent)
 	width = len(str(len(tasks)))
 	decors = [_decor(index, width, prefix and concurrent, use_color) for index in range(1, len(tasks) + 1)]
+	use_pty = _resolve_pty(pty)
 	if not sem:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 	if use_sudo:
 		_validate_sudo()
 	if not wait_for_return:
 		__reap_finished_threads()
-		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,decor),daemon=True) for task, decor in zip(tasks, decors)]
+		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]
 		# tracked before they start, so a thread is always registered before it reports itself finished
 		with __running_threads_lock:
 			__running_threads.update(threads)
@@ -1374,11 +1442,11 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task.thread = thread
 			thread.start()
 	elif max_threads > 1:
-		_run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads)
+		_run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty)
 	else:
 		try:
 			for task, decor in zip(tasks, decors):
-				__run_command(task, sem, timeout, quiet, dry_run, decor=decor)
+				__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
 		except KeyboardInterrupt:
 			_stop_tasks(tasks)
 			raise
