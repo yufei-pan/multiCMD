@@ -16,12 +16,9 @@ MULTICMD_PY = PACKAGE_ROOT / "multiCMD.py"
 def restore_module_globals():
 	saved_use_sudo = multiCMD.USE_SUDO
 	saved_sudo_path = multiCMD.SUDO_PATH
-	saved_vars = dict(multiCMD.__variables)
 	yield
 	multiCMD.USE_SUDO = saved_use_sudo
 	multiCMD.SUDO_PATH = saved_sudo_path
-	multiCMD.__variables.clear()
-	multiCMD.__variables.update(saved_vars)
 	multiCMD.join_threads(timeout=2)
 
 

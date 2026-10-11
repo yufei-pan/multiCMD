@@ -35,12 +35,13 @@ __running_threads = set()
 __running_threads_lock = threading.Lock()
 # fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
 __finished_threads = collections.deque()
-__variables = {}
 
 # immutable helpers compiled once at import time
 _BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
 _ALPHANUM     = string.digits + string.ascii_letters
 _ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
+# a ':' not preceded by a backslash; '\:' is a literal colon inside [...]
+_UNESCAPED_COLON_RX = re.compile(r'(?<!\\):')
 
 SUDO_PATH = shutil.which("sudo")
 USE_SUDO = False
@@ -501,11 +502,13 @@ def _expand_piece(piece, vars_):
 	"""Turn one comma-separated element from inside [...] into a list of strings."""
 	piece = piece.strip()
 
-	# variable assignment  foo:BAR
-	if ':' in piece:
-		var, _, value = piece.partition(':')
-		vars_[var] = __evaluate_value(value.strip(), vars_, dereference=False)
+	# variable assignment  foo:BAR  ( exactly one unescaped ':' with an identifier before it,
+	# so IPv6 addresses pass through and '\:' gives a literal colon )
+	parts = _UNESCAPED_COLON_RX.split(piece)
+	if len(parts) == 2 and parts[0].isidentifier():
+		vars_[parts[0]] = __evaluate_value(parts[1].strip().replace('\\:', ':'), vars_, dereference=False)
 		return
+	piece = piece.replace('\\:', ':')
 
 	# explicit range  start-end
 	if '-' in piece:
@@ -518,14 +521,15 @@ def _expand_piece(piece, vars_):
 			pad = min(len(start), len(end))
 			return [f"{i:0{pad}d}" for i in range(int(start), int(end) + 1)]
 
-		if all(c in string.hexdigits for c in start + end):
-			return [format(i, 'x') for i in range(int(start, 16),int(end,16) + 1)]
-
-		# alphanumeric range (0-9a-zA-Z)
-		try:
+		# single characters in 0-9a-zA-Z order, case kept ( before hex, so [A-C] stays upper case )
+		if start in _ALPHA_IDX and end in _ALPHA_IDX:
 			return [_ALPHANUM[i] for i in range(_ALPHA_IDX[start], _ALPHA_IDX[end] + 1)]
-		except KeyError:
-			pass
+
+		# hex, zero-padded to the shorter end like decimal; upper case only when the input is
+		if start and end and all(c in string.hexdigits for c in start + end):
+			upper = ''.join(c for c in start + end if c.isalpha()).isupper()
+			pad = min(len(start), len(end))
+			return [format(i, f'0{pad}{"X" if upper else "x"}') for i in range(int(start, 16), int(end, 16) + 1)]
 
 	# plain token or ${var}
 	value = __evaluate_value(piece, vars_)
@@ -537,8 +541,18 @@ def _expand_piece(piece, vars_):
 		except Exception:
 			return [str(value)] 
 
-def _expand_ranges_fast(inStr):
-	global __variables
+def _expand_ranges_fast(inStr, variables=None):
+	'''
+	Expand [...] ranges in a string into every combination
+	@params:
+		inStr: The string to expand
+		variables: The range variables ( name:value assignments ) shared with the other expansions
+			of the same batch; None gives this call its own
+	@returns:
+		list[str]: The expanded strings
+	'''
+	if variables is None:
+		variables = {}
 	segments = []
 	pos = 0
 	# split the template into literal pieces + expandable pieces
@@ -547,7 +561,7 @@ def _expand_ranges_fast(inStr):
 			segments.append([inStr[pos:match.start()]])
 		choices = []
 		for sub in match.group(1).split(','):
-			expandedPieces = _expand_piece(sub, __variables)
+			expandedPieces = _expand_piece(sub, variables)
 			if expandedPieces:
 				choices.extend(expandedPieces)
 		if choices:
@@ -1251,9 +1265,11 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False):
 		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
 		use_sudo = False
 	# split the commands in commands if it is a string
+	# one set of range variables per batch: shared by its commands, never by the next call
+	variables = {}
 	formatedCommands = []
 	for command in commands:
-		formatedCommands.extend(__format_command(command,expand=parse,shell=shell))
+		formatedCommands.extend(__format_command(command,expand=parse,shell=shell,variables=variables))
 	if use_sudo:
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	return [Task(command) for command in formatedCommands], bool(use_sudo)
@@ -1269,7 +1285,7 @@ def _validate_sudo():
 	except OSError as e:
 		print(f'sudo validation failed: {e}', file=sys.stderr)
 
-def __format_command(command,expand = False,shell = False):
+def __format_command(command,expand = False,shell = False,variables = None):
 	'''
 	Format a command
 
@@ -1277,13 +1293,16 @@ def __format_command(command,expand = False,shell = False):
 		command: The command to format
 		expand: Whether to expand ranges
 		shell: Whether to run the command through the system shell
+		variables: The range variables shared with the other commands of the batch
 
 	@returns:
 		list[list[str]]: The formatted commands sequence
 	'''
+	if variables is None:
+		variables = {}
 	if isinstance(command,str):
 		if expand:
-			commands = _expand_ranges_fast(command)
+			commands = _expand_ranges_fast(command, variables)
 		else:
 			commands = [command]
 		if shell:
@@ -1300,7 +1319,7 @@ def __format_command(command,expand = False,shell = False):
 		if not expand:
 			commands = [sanitized_command]
 		else:
-			sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
+			sanitized_expanded_command = [_expand_ranges_fast(field, variables) for field in sanitized_command]
 			# now the command had been expanded to list of list of fields with each field expanded to all possible options
 			# we need to generate all possible combinations of the fields
 			# we will use the cartesian product to do this
@@ -1309,7 +1328,7 @@ def __format_command(command,expand = False,shell = False):
 			return [_shell_argv(command) for command in commands]
 		return commands
 	else:
-		return __format_command(str(command),expand=expand,shell=shell)
+		return __format_command(str(command),expand=expand,shell=shell,variables=variables)
 
 #%% core funcitons
 def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,

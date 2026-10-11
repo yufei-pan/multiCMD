@@ -1,5 +1,4 @@
-import multiCMD
-from multiCMD import _expand_ranges, _expand_ranges_fast
+from multiCMD import _expand_ranges, _expand_ranges_fast, run_commands
 
 
 def test_alias_is_fast_implementation():
@@ -34,15 +33,52 @@ def test_multi_bracket_cartesian():
 
 
 def test_variable_assignment_and_reference():
-	multiCMD.__variables.clear()
 	assert _expand_ranges("[n:3]host[1-n]") == ["host1", "host2", "host3"]
 
 
 def test_brace_expression_eval():
-	multiCMD.__variables.clear()
 	assert _expand_ranges("host[{2+3}]") == ["host5"]
 
 
 def test_passthrough_without_brackets():
 	assert _expand_ranges("plainhost") == ["plainhost"]
 	assert _expand_ranges("") == [""]
+
+
+def test_letter_ranges_keep_their_case():
+	assert _expand_ranges('host[A-C]') == ['hostA', 'hostB', 'hostC']
+	assert _expand_ranges('host[a-c]') == ['hosta', 'hostb', 'hostc']
+
+
+def test_hex_ranges_keep_padding_and_case():
+	assert _expand_ranges('n[08-0b]') == ['n08', 'n09', 'n0a', 'n0b']
+	assert _expand_ranges('n[08-0B]') == ['n08', 'n09', 'n0A', 'n0B']
+	assert _expand_ranges('[a-10]') == ['a', 'b', 'c', 'd', 'e', 'f', '10']
+
+
+def test_range_with_an_empty_end_is_a_plain_token():
+	assert _expand_ranges('[-5]') == ['-5']
+
+
+def test_ipv6_addresses_pass_through():
+	assert _expand_ranges('ping [fe80::1,fe80::2]') == ['ping fe80::1', 'ping fe80::2']
+
+
+def test_escaped_colon_is_literal():
+	assert _expand_ranges('curl [web1\\:8080,web2\\:8080]') == ['curl web1:8080', 'curl web2:8080']
+
+
+def test_variables_do_not_leak_between_calls():
+	assert _expand_ranges('[n:3]host[1-n]') == ['host1', 'host2', 'host3']
+	assert _expand_ranges('disk[n]') == ['diskn']
+
+
+def test_variables_are_shared_within_one_run_commands_call():
+	assert run_commands(['echo [n:2]first', 'echo second[1-n]'], parse=True, quiet=True) == \
+		[['first'], ['second1'], ['second2']]
+
+
+def test_explicit_variables_dict_is_used():
+	variables = {}
+	_expand_ranges('[n:2]', variables)
+	assert variables == {'n': '2'}
