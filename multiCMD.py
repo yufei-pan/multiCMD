@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.6"
-# dependencies = [
-#     "argparse",
-# ]
+# dependencies = []
 # ///
 #%% imports
 import argparse

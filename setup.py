@@ -18,9 +18,6 @@ setup(
             'multicmd=multiCMD:main',
         ],
     },
-    install_requires=[
-        'argparse',
-    ],
     classifiers=[
         'Programming Language :: Python :: 3',
         'License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)',
