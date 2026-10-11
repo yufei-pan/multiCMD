@@ -1205,7 +1205,36 @@ def __reap_finished_threads():
 		with __running_threads_lock:
 			__running_threads.discard(thread)
 
-def _build_tasks(commands, parse=False, use_sudo=...):
+def _split_command(command):
+	'''
+	Split a command line into arguments the way a POSIX shell would, quotes and backslashes included ( internal )
+	@params:
+		command: The command line ( str )
+	@returns:
+		list[str]: The arguments
+	@raises:
+		ValueError: The command line has an unbalanced quote
+	'''
+	try:
+		return shlex.split(command)
+	except ValueError as e:
+		raise ValueError(f'cannot parse command {command!r}: {e}') from None
+
+def _shell_argv(command):
+	'''
+	The argv that runs a command line through the system shell ( internal )
+	@params:
+		command: The command line, or arguments to quote and join ( str | list[str] )
+	@returns:
+		list[str]: /bin/sh -c ... on POSIX, %COMSPEC% /c ... on Windows
+	'''
+	if not isinstance(command, str):
+		command = _quote_command(command)
+	if _IS_POSIX:
+		return ['/bin/sh', '-c', command]
+	return [os.environ.get('COMSPEC', 'cmd.exe'), '/c', command]
+
+def _build_tasks(commands, parse=False, use_sudo=..., shell=False):
 	'''
 	Format commands into Tasks, prefixing sudo when requested and available ( internal )
 
@@ -1224,7 +1253,7 @@ def _build_tasks(commands, parse=False, use_sudo=...):
 	# split the commands in commands if it is a string
 	formatedCommands = []
 	for command in commands:
-		formatedCommands.extend(__format_command(command,expand=parse))
+		formatedCommands.extend(__format_command(command,expand=parse,shell=shell))
 	if use_sudo:
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	return [Task(command) for command in formatedCommands], bool(use_sudo)
@@ -1240,13 +1269,14 @@ def _validate_sudo():
 	except OSError as e:
 		print(f'sudo validation failed: {e}', file=sys.stderr)
 
-def __format_command(command,expand = False):
+def __format_command(command,expand = False,shell = False):
 	'''
 	Format a command
 
 	@params:
 		command: The command to format
 		expand: Whether to expand ranges
+		shell: Whether to run the command through the system shell
 
 	@returns:
 		list[list[str]]: The formatted commands sequence
@@ -1256,7 +1286,9 @@ def __format_command(command,expand = False):
 			commands = _expand_ranges_fast(command)
 		else:
 			commands = [command]
-		return [command.split() for command in commands]
+		if shell:
+			return [_shell_argv(command) for command in commands]
+		return [_split_command(command) for command in commands]
 	# elif it is a iterable
 	elif hasattr(command,'__iter__'):
 		sanitized_command = []
@@ -1266,15 +1298,18 @@ def __format_command(command,expand = False):
 			else:
 				sanitized_command.append(repr(field))
 		if not expand:
-			return [sanitized_command]
-		sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
-		# now the command had been expanded to list of list of fields with each field expanded to all possible options
-		# we need to generate all possible combinations of the fields
-		# we will use the cartesian product to do this
-		commands = list(itertools.product(*sanitized_expanded_command))
-		return [list(command) for command in commands]
+			commands = [sanitized_command]
+		else:
+			sanitized_expanded_command = [_expand_ranges_fast(field) for field in sanitized_command]
+			# now the command had been expanded to list of list of fields with each field expanded to all possible options
+			# we need to generate all possible combinations of the fields
+			# we will use the cartesian product to do this
+			commands = [list(command) for command in itertools.product(*sanitized_expanded_command)]
+		if shell:
+			return [_shell_argv(command) for command in commands]
+		return commands
 	else:
-		return __format_command(str(command),expand=expand)
+		return __format_command(str(command),expand=expand,shell=shell)
 
 #%% core funcitons
 def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=False,
@@ -1357,7 +1392,7 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
-				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False):
+				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False, shell = False):
 	'''
 	Run a command
 
@@ -1379,6 +1414,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		prefix: Whether to prefix output lines with [#] when commands run at once ( never for one command )
 		color: Whether to color output lines ( None: when commands run at once on a terminal without NO_COLOR )
 		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
+		shell: Whether to run the command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
@@ -1386,11 +1422,11 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
-					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty)[0]
+					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty, shell=shell)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
-				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False):
+				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False, shell = False):
 	'''
 	Run multiple commands in parallel
 
@@ -1413,12 +1449,13 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		prefix: Whether to prefix output lines with [#], the command's 1-based position, when commands run at once
 		color: Whether to color output lines per command ( None: when commands run at once on a terminal without NO_COLOR )
 		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
+		shell: Whether to run each command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
 	# initialize the tasks
-	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo)
+	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell)
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(tasks)
