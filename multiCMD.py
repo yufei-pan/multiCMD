@@ -1613,23 +1613,75 @@ def join_threads(threads=...,timeout=None):
 		thread.join(timeout=timeout)
 	__reap_finished_threads()
 
+_EXIT_STATUS_HELP = '''exit status:
+  0      every command succeeded, or --dry-run
+  N      one command: its own exit code ( killed by signal S: 128+S )
+  N      several commands: how many failed, capped at 101
+  2      usage error
+  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'''
+
+def _exit_status(tasks):
+	'''
+	The CLI exit status for finished tasks ( internal )
+	One command: its own return code ( killed by signal N: 128+N ). Several: how many failed, capped at 101.
+	'''
+	if len(tasks) == 1:
+		returncode = tasks[0].returncode
+		if returncode is None:
+			return 1
+		return 128 - returncode if returncode < 0 else returncode
+	return min(sum(1 for task in tasks if task.returncode not in (0, None)), 101)
+
+def _install_cli_signal_handlers():
+	'''
+	Make SIGTERM / SIGHUP stop the commands too, and terminal reads fail in every command ( internal )
+	The commands run in process groups of their own, so signals sent to mcmd's group ( e.g. by
+	`timeout`, or a closed terminal ) would not reach them. A signal mcmd was started with
+	ignored stays ignored: `nohup mcmd ...` must keep its commands running when the session ends.
+	SIGTTIN / SIGTTOU are ignored, which every command inherits through exec and through any
+	shell ( dash clears the blocked mask _spawn sets ), so a command that reads the terminal from
+	its background group fails at once instead of hanging.
+	'''
+	def handler(signum, frame):
+		kill_all(signum)
+		sys.exit(128 + signum)
+	for name in ('SIGTERM', 'SIGHUP'):
+		signum = getattr(signal, name, None)
+		if signum is not None and signal.getsignal(signum) != signal.SIG_IGN:
+			signal.signal(signum, handler)
+	for signum in _TTY_SIGNALS:
+		signal.signal(signum, signal.SIG_IGN)
+
 def main():
-	parser = argparse.ArgumentParser(description='Run multiple commands in parallel')
+	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
+		formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
 	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
-	parser.add_argument('-t','--timeout', metavar='timeout', type=int, default=60,help='timeout for each command')
-	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of threads to use')
+	parser.add_argument('-t','--timeout', metavar='SECONDS', type=float, default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )')
+	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of commands to run at once ( 0 = all )')
 	parser.add_argument('--sudo', action='store_true',help='use sudo for commands')
-	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode')
+	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode: hide command output')
+	parser.add_argument('-n','--dry-run', action='store_true',help='print each command, quoted, instead of running it')
+	parser.add_argument('--shell', action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
 	args = parser.parse_args()
 	# set_sudo() validates that sudo exists and that we are not already root
 	# before enabling it, and updates the USE_SUDO global accordingly.
 	set_sudo(args.sudo)
-	run_commands(args.commands, args.timeout, args.max_threads, args.quiet,parse = args.parse, with_stdErr=True)
-
-if __name__ == '__main__':
-	main()
+	_install_cli_signal_handlers()
+	try:
+		tasks = run_commands(args.commands, timeout=args.timeout, max_threads=args.max_threads,
+			quiet=args.quiet and not args.dry_run, parse=args.parse, dry_run=args.dry_run,
+			with_stdErr=True, return_object=True, shell=args.shell)
+	except ValueError as e:
+		print(f'mcmd: {e}', file=sys.stderr)
+		return 2
+	except KeyboardInterrupt:
+		print('\nInterrupted', file=sys.stderr)
+		return 130
+	if args.dry_run:
+		return 0
+	return _exit_status(tasks)
 
 #%% misc functions
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
@@ -2043,3 +2095,5 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			pass
 		return 0
 
+if __name__ == '__main__':
+	sys.exit(main())
