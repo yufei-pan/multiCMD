@@ -966,6 +966,22 @@ def _watch(task, proc, timeout):
 			sleep_time *= 2
 	return None
 
+def _join(thread, timeout=None):
+	'''
+	Join a thread in short steps ( internal )
+	A plain join() blocks in C, where a KeyboardInterrupt only arrives if the signal happens to
+	land on this very thread; short steps let the waiting thread see it within 0.1s.
+	@params:
+		thread: The thread to join
+		timeout: The longest to wait, in seconds ( None: until it ends )
+	'''
+	deadline = None if timeout is None else time.monotonic() + timeout
+	while thread.is_alive():
+		step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
+		if step <= 0:
+			return
+		thread.join(step)
+
 def _join_readers(readers, limit):
 	'''
 	Wait for a command's output readers to reach the end of their streams ( internal )
@@ -975,7 +991,7 @@ def _join_readers(readers, limit):
 	'''
 	deadline = None if limit is None else time.monotonic() + limit
 	for reader in readers:
-		reader.join(None if deadline is None else max(0, deadline - time.monotonic()))
+		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
 
 def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
@@ -1237,9 +1253,46 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 		else:
 			return results
 
+def _stop_tasks(tasks):
+	'''
+	Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )
+	'''
+	for task in tasks:
+		task.stop = True
+
+def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=False):
+	'''
+	Run tasks on at most max_threads worker threads and wait for all of them ( internal )
+	Each worker takes the next task in order, so at most max_threads commands ( and their two
+	output readers each ) exist at any time, however many tasks there are.
+	On KeyboardInterrupt every task is stopped: running commands are killed, the rest never start.
+	'''
+	pending = iter(list(zip(tasks, decors)))
+	lock = threading.Lock()
+	def worker():
+		while True:
+			with lock:
+				try:
+					task, decor = next(pending)
+				except StopIteration:
+					return
+			task.thread = threading.current_thread()
+			__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
+	workers = [threading.Thread(target=worker, daemon=True) for _ in range(min(max_threads, len(tasks)))]
+	for thread in workers:
+		thread.start()
+	try:
+		for thread in workers:
+			_join(thread)
+	except KeyboardInterrupt:
+		_stop_tasks(tasks)
+		for thread in workers:
+			_join(thread, 5)
+		raise
+
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
-				use_sudo = ..., raise_error = False):
+				use_sudo = ..., raise_error = False, prefix = False, color = None):
 	'''
 	Run a command
 
@@ -1258,6 +1311,8 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		sem: The semaphore to use for threading
 		use_sudo: Whether to use sudo for commands
 		raise_error: Whether to raise an error if the command fails
+		prefix: Whether to prefix output lines with [#] when commands run at once ( never for one command )
+		color: Whether to color output lines ( None: when commands run at once on a terminal without NO_COLOR )
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
@@ -1265,11 +1320,11 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
-					 use_sudo=use_sudo, raise_error=raise_error)[0]
+					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
-				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False):
+				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None):
 	'''
 	Run multiple commands in parallel
 
@@ -1278,7 +1333,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		timeout: Inactivity timeout in seconds. A command is killed, with everything it started,
 			once it has produced no output at all for this many seconds. It is not a limit on
 			the total runtime. Use 0 (the default) to disable it.
-		max_threads: The maximum number of threads to use
+		max_threads: The maximum number of commands to run at once ( 0: all of them )
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the commands
 		with_stdErr: Whether to append the standard error output to the standard output
@@ -1289,6 +1344,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		sem: The semaphore to use for threading
 		use_sudo: Whether to use sudo for commands
 		raise_error: Whether to raise an error if the command fails
+		prefix: Whether to prefix output lines with [#], the command's 1-based position, when commands run at once
+		color: Whether to color output lines per command ( None: when commands run at once on a terminal without NO_COLOR )
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
@@ -1298,13 +1355,18 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(tasks)
+	# concurrent runs get [#] prefixes ( when asked ) and colors ( on a terminal )
+	concurrent = len(tasks) > 1 and max_threads != 1
+	use_color = _resolve_color(color, concurrent)
+	width = len(str(len(tasks)))
+	decors = [_decor(index, width, prefix and concurrent, use_color) for index in range(1, len(tasks) + 1)]
 	if not sem:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 	if use_sudo:
 		_validate_sudo()
 	if not wait_for_return:
 		__reap_finished_threads()
-		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run),daemon=True) for task in tasks]
+		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,decor),daemon=True) for task, decor in zip(tasks, decors)]
 		# tracked before they start, so a thread is always registered before it reports itself finished
 		with __running_threads_lock:
 			__running_threads.update(threads)
@@ -1312,15 +1374,14 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task.thread = thread
 			thread.start()
 	elif max_threads > 1:
-		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run),daemon=True) for task in tasks]
-		for thread,task in zip(threads,tasks):
-			task.thread = thread
-			thread.start()
-		for thread in threads:
-			thread.join()
+		_run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads)
 	else:
-		for task in tasks:
-			__run_command(task,sem,timeout,quiet,dry_run)
+		try:
+			for task, decor in zip(tasks, decors):
+				__run_command(task, sem, timeout, quiet, dry_run, decor=decor)
+		except KeyboardInterrupt:
+			_stop_tasks(tasks)
+			raise
 	# return the only the output for the tasks
 	if raise_error:
 		errors = [task for task in tasks if task.returncode != 0]
