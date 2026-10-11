@@ -1652,10 +1652,71 @@ def _install_cli_signal_handlers():
 	for signum in _TTY_SIGNALS:
 		signal.signal(signum, signal.SIG_IGN)
 
+def _read_input(path):
+	'''
+	The lines of an input file without their line endings ( '-' reads stdin ) ( internal )
+	'''
+	if path == '-':
+		return sys.stdin.read().splitlines()
+	with open(path) as f:
+		return f.read().splitlines()
+
+def _fill_templates(templates, lines, shell=False):
+	'''
+	One command per template and input line, with {} replaced by the line ( internal )
+	The line is substituted after the template is split into arguments, so it always stays one
+	argument; a template without {} gets the line as its last argument. In shell mode the line is
+	shell-quoted into the template string instead.
+	@params:
+		templates: The command templates ( list[str] )
+		lines: The input lines ( list[str] )
+		shell: Whether the commands run through the system shell
+	@returns:
+		list[str | list[str]]: Command strings in shell mode, argument lists otherwise
+	'''
+	commands = []
+	for template in templates:
+		argv = None if shell else _split_command(template)
+		for line in lines:
+			if shell:
+				quoted = shlex.quote(line)
+				commands.append(template.replace('{}', quoted) if '{}' in template else template + ' ' + quoted)
+			elif any('{}' in arg for arg in argv):
+				commands.append([arg.replace('{}', line) for arg in argv])
+			else:
+				commands.append(argv + [line])
+	return commands
+
+def _cli_commands(args):
+	'''
+	The commands one mcmd invocation runs ( internal )
+	Positional commands come first ( or, with -a, the templates filled from its input ), then the
+	-f commands. With -p every command and template is range-expanded, sharing one set of range
+	variables; input lines themselves are never expanded.
+	@returns:
+		list[str | list[str]]: Command strings, and argument lists for filled templates
+	'''
+	variables = {}
+	def expand(command):
+		return _expand_ranges_fast(command, variables) if args.parse else [command]
+	if args.arg_file:
+		lines = []
+		for path in args.arg_file:
+			lines.extend(line for line in _read_input(path) if line.strip())
+		templates = [template for command in args.commands for template in expand(command)]
+		commands = _fill_templates(templates, lines, args.shell)
+	else:
+		commands = [expanded for command in args.commands for expanded in expand(command)]
+	for path in args.file or []:
+		for line in _read_input(path):
+			if line.strip() and not line.lstrip().startswith('#'):
+				commands.extend(expand(line))
+	return commands
+
 def main():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
 		formatter_class=argparse.RawDescriptionHelpFormatter)
-	parser.add_argument('commands', metavar='command', type=str, nargs='+',help='commands to run')
+	parser.add_argument('commands', metavar='command', type=str, nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )')
 	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')
 	parser.add_argument('-t','--timeout', metavar='SECONDS', type=float, default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )')
 	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of commands to run at once ( 0 = all )')
@@ -1663,17 +1724,29 @@ def main():
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode: hide command output')
 	parser.add_argument('-n','--dry-run', action='store_true',help='print each command, quoted, instead of running it')
 	parser.add_argument('--shell', action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )')
+	parser.add_argument('-f','--file', metavar='FILE', action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )')
+	parser.add_argument('-a','--arg-file', metavar='FILE', action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )')
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
 	args = parser.parse_args()
+	if not args.commands and not args.file:
+		parser.error('no commands given')
+	if args.arg_file and not args.commands:
+		parser.error('-a/--arg-file needs at least one command template')
+	if '-' in (args.file or []) and '-' in (args.arg_file or []):
+		parser.error('-f - and -a - cannot both read stdin')
 	# set_sudo() validates that sudo exists and that we are not already root
 	# before enabling it, and updates the USE_SUDO global accordingly.
 	set_sudo(args.sudo)
 	_install_cli_signal_handlers()
 	try:
-		tasks = run_commands(args.commands, timeout=args.timeout, max_threads=args.max_threads,
-			quiet=args.quiet and not args.dry_run, parse=args.parse, dry_run=args.dry_run,
+		commands = _cli_commands(args)
+		if not commands:
+			print('mcmd: no commands to run', file=sys.stderr)
+			return 2
+		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
+			quiet=args.quiet and not args.dry_run, dry_run=args.dry_run,
 			with_stdErr=True, return_object=True, shell=args.shell)
-	except ValueError as e:
+	except (OSError, ValueError) as e:
 		print(f'mcmd: {e}', file=sys.stderr)
 		return 2
 	except KeyboardInterrupt:
