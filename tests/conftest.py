@@ -80,3 +80,9 @@ def pid_gone(pid, wait=3.0):
 		if time.monotonic() > deadline:
 			return False
 		time.sleep(0.05)
+
+
+@pytest.fixture(autouse=True)
+def fresh_display(monkeypatch):
+	'''Every test starts with a display that has written nothing yet'''
+	monkeypatch.setattr(multiCMD, '_display', multiCMD._Display())

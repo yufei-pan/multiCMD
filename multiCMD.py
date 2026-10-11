@@ -15,6 +15,7 @@ import math
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import string
@@ -111,6 +112,66 @@ class _HeldPermit:
 	def __exit__(self, *exc_info):
 		self.semaphore.release()
 		return False
+
+class _Display:
+	'''
+	Writes multiCMD's live output to sys.stdout, one write per call under one lock ( internal )
+
+	Command output lines are written newline-first, so the cursor stays at the end of the last
+	line. redrawable is True when that last line ended with '\r': the next line that replaces a
+	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
+	'''
+	def __init__(self):
+		self.lock = threading.Lock()
+		self.redrawable = False
+		self.at_line_start = True
+
+	def lines(self, texts, decor=('', '', ''), replace_first=False, ends_with_cr=False):
+		'''
+		Show consecutive output lines of one command
+		@params:
+			texts: The lines ( list[str] )
+			decor: ( prefix, color start, color end ) for this command
+			replace_first: Whether the first line replaces this command's previous '\r' line
+			ends_with_cr: Whether the last line ended with '\r', so the next line may replace it
+		'''
+		prefix, start, end = decor
+		with self.lock:
+			parts = []
+			for i, text in enumerate(texts):
+				if i == 0 and replace_first and self.redrawable:
+					parts.append('\r' + prefix + start + text + end + ('\x1b[K' if _stdout_isatty() else ''))
+				else:
+					parts.append('\n' + prefix + start + text + end)
+			self.redrawable = ends_with_cr
+			self.at_line_start = False
+			sys.stdout.write(''.join(parts))
+			sys.stdout.flush()
+
+	def message(self, text, decor=('', '', '')):
+		'''
+		Show a status line ( or several, split on '\n' ) on lines of its own
+		@params:
+			text: The text
+			decor: ( prefix, color start, color end ) for this command
+		'''
+		prefix, start, end = decor
+		with self.lock:
+			lead = '' if self.at_line_start else '\n'
+			body = '\n'.join(prefix + start + line + end for line in text.split('\n'))
+			sys.stdout.write(lead + body + '\n')
+			sys.stdout.flush()
+			self.redrawable = False
+			self.at_line_start = True
+
+	def settle(self):
+		'''
+		Mark the last line as finished, so no redraw overwrites it ( a '\r\n' line ending )
+		'''
+		with self.lock:
+			self.redrawable = False
+
+_display = _Display()
 
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
@@ -639,6 +700,58 @@ def _spawn(argv, stdout, stderr, env=None):
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
+
+def _stdout_isatty():
+	'''
+	Whether sys.stdout is a terminal ( internal )
+	'''
+	try:
+		return sys.stdout.isatty()
+	except Exception:
+		return False
+
+def _quote_command(command):
+	'''
+	Join a command's arguments into one line a POSIX shell splits back the same way ( internal )
+	@params:
+		command: The command ( list[str] | str )
+	@returns:
+		str: The quoted command line
+	'''
+	if isinstance(command, str):
+		return command
+	return ' '.join(shlex.quote(str(arg)) for arg in command)
+
+def _decor(index, width, prefix, color):
+	'''
+	The ( prefix, color start, color end ) a command's displayed lines get ( internal )
+	@params:
+		index: The command's 1-based position in its batch
+		width: The width to right-align the index to ( 0: no padding )
+		prefix: Whether to show '[index] '
+		color: Whether to color the lines
+	@returns:
+		( str, str, str ): The prefix text, the color start sequence and the color end sequence
+	'''
+	pre = '[%*d] ' % (width, index) if prefix else ''
+	if not color:
+		return (pre, '', '')
+	# spread consecutive indexes across the color space; the same index always gets the same color
+	r, g, b = int_to_color((index * 0x9E3779B1) & 0xFFFFFF)
+	return (pre, f'\x1b[38;2;{r};{g};{b}m', '\x1b[0m')
+
+def _resolve_color(color, concurrent):
+	'''
+	Whether displayed lines get colors ( internal )
+	@params:
+		color: True / False to force, None for auto: only for concurrent runs on a terminal without NO_COLOR
+		concurrent: Whether more than one command can run at once
+	@returns:
+		bool: Whether to color
+	'''
+	if color is not None:
+		return bool(color)
+	return concurrent and _stdout_isatty() and not os.environ.get('NO_COLOR')
 
 def _register(proc, pgid):
 	'''
