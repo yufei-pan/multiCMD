@@ -12,7 +12,7 @@ def test_command_file_skips_blank_lines_and_comments(tmp_path):
 
 def test_command_file_from_stdin():
 	proc = subprocess.run([sys.executable, str(MULTICMD_PY), '-n', '-f', '-'],
-		input='echo a\necho b\n', capture_output=True, text=True, timeout=30)
+		input='echo a\necho b\n', stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
 	assert proc.stdout.splitlines() == ['echo a', 'echo b']
 
 

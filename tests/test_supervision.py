@@ -199,7 +199,7 @@ def test_exit_leaves_alone_what_a_finished_fire_and_forget_command_started(tmp_p
 	# statbtrfs starts `btrfs scrub start`, which leaves the scrub running in the background on purpose
 	probe = tmp_path / 'probe.py'
 	probe.write_text(EXIT_PROBE.format(root=str(PACKAGE_ROOT)))
-	out = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=30).stdout
+	out = subprocess.run([sys.executable, str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30).stdout
 	child = int(out.split()[0])
 	try:
 		assert not pid_gone(child, wait=0.5)

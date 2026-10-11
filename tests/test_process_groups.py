@@ -63,7 +63,7 @@ def test_reading_the_terminal_fails_instead_of_stopping(launcher, tmp_path):
 	probe.write_text(TTY_PROBE.format(root=str(PACKAGE_ROOT), native=launcher == 'native'))
 	command = f'{shlex.quote(sys.executable)} {shlex.quote(str(probe))}'
 	result = subprocess.run(['script', '-qec', command, '/dev/null'],
-		stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+		stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
 	assert 'RESULT rc=1' in result.stdout.replace('\r', '')
 
 
@@ -140,7 +140,7 @@ EXIT_PROBE = textwrap.dedent(r"""
 def test_kill_all_runs_when_the_interpreter_exits(tmp_path):
 	probe = tmp_path / 'probe.py'
 	probe.write_text(EXIT_PROBE.format(root=str(PACKAGE_ROOT)))
-	out = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=30).stdout
+	out = subprocess.run([sys.executable, str(probe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30).stdout
 	leader, child = (int(pid) for pid in out.split())
 	assert pid_gone(leader)
 	assert pid_gone(child)

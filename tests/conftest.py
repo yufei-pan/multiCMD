@@ -25,8 +25,9 @@ def restore_module_globals():
 def run_cli(args, timeout=30, check=False):
 	return subprocess.run(
 		[sys.executable, str(MULTICMD_PY), *args],
-		capture_output=True,
-		text=True,
+		stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE,
+		universal_newlines=True,
 		timeout=timeout,
 		check=check,
 	)
@@ -40,7 +41,8 @@ def loopback_ping_works():
 	try:
 		r = subprocess.run(
 			["ping", "-c", "1", "-W", "1", "127.0.0.1"],
-			capture_output=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
 			timeout=5,
 		)
 		return r.returncode == 0

@@ -111,7 +111,7 @@ def test_commands_started_through_a_shell_still_ignore_terminal_reads():
 
 def _start_cli(*args):
 	return subprocess.Popen([sys.executable, str(MULTICMD_PY), *args],
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 
 
 def _read_pid(proc):
@@ -145,7 +145,7 @@ def test_sigterm_stops_the_commands():
 def test_nohup_keeps_the_commands_running_after_a_hangup():
 	# nohup leaves SIGHUP ignored; mcmd must not replace that with its kill-everything handler
 	proc = subprocess.Popen(['nohup', sys.executable, str(MULTICMD_PY), "sh -c 'echo $$; echo started; sleep 2'"],
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
 	_read_pid(proc)
 	proc.send_signal(signal.SIGHUP)
 	assert proc.wait(timeout=10) == 0

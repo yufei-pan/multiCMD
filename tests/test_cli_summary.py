@@ -81,7 +81,7 @@ def test_colors_on_a_terminal_and_the_no_color_flag():
 	def under_terminal(*args):
 		command = ' '.join(shlex.quote(arg) for arg in [sys.executable, str(MULTICMD_PY), *args])
 		return subprocess.run(['script', '-qec', command, '/dev/null'], stdin=subprocess.DEVNULL,
-			capture_output=True, text=True, timeout=60, env=env).stdout
+			stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60, env=env).stdout
 	assert '\x1b[38;2;' in under_terminal('-m', '2', 'echo a', 'echo b')
 	assert '\x1b[38;2;' not in under_terminal('--no-color', '-m', '2', 'echo a', 'echo b')
 
