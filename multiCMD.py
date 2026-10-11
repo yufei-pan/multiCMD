@@ -1652,6 +1652,50 @@ def _install_cli_signal_handlers():
 	for signum in _TTY_SIGNALS:
 		signal.signal(signum, signal.SIG_IGN)
 
+_RETURNCODE_LABELS = {124: 'timeout', 126: 'cannot execute', 127: 'not found'}
+
+def _format_returncode(returncode):
+	'''
+	A return code with its meaning, for the summary ( internal )
+	'''
+	if returncode is None:
+		return 'not run'
+	if returncode < 0:
+		try:
+			name = signal.Signals(-returncode).name
+		except ValueError:
+			name = f'signal {-returncode}'
+		return f'{returncode} ({name})'
+	if returncode in _RETURNCODE_LABELS:
+		return f'{returncode} ({_RETURNCODE_LABELS[returncode]})'
+	return str(returncode)
+
+def _summary(tasks, show_all=False):
+	'''
+	The end-of-run summary: a table of the failed commands ( or of all of them ) and a tally line ( internal )
+	@params:
+		tasks: The finished tasks
+		show_all: Whether to list every command instead of only the failed ones
+	@returns:
+		str: The summary, without a trailing newline
+	'''
+	failed = [index for index, task in enumerate(tasks, 1) if task.returncode not in (0, None)]
+	rows = range(1, len(tasks) + 1) if show_all else failed
+	table = ''
+	if rows:
+		data = [['#', 'Command', 'Return code', 'Time']]
+		for index in rows:
+			task = tasks[index - 1]
+			duration = task.duration
+			data.append([str(index), _quote_command(task.command), _format_returncode(task.returncode),
+				'-' if duration is None else f'{duration:.2f}s'])
+		table = pretty_format_table(data)
+	if failed:
+		tally = f'{len(tasks)} commands: {len(tasks) - len(failed)} succeeded, {len(failed)} failed'
+	else:
+		tally = f'{len(tasks)} commands: all succeeded'
+	return table + tally
+
 def _read_input(path):
 	'''
 	The lines of an input file without their line endings ( '-' reads stdin ) ( internal )
@@ -1721,11 +1765,20 @@ def main():
 	parser.add_argument('-t','--timeout', metavar='SECONDS', type=float, default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )')
 	parser.add_argument('-m','--max_threads', metavar='max_threads', type=int, default=1,help='maximum number of commands to run at once ( 0 = all )')
 	parser.add_argument('--sudo', action='store_true',help='use sudo for commands')
-	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode: hide command output')
+	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode: hide command output ( the summary still shows )')
 	parser.add_argument('-n','--dry-run', action='store_true',help='print each command, quoted, instead of running it')
 	parser.add_argument('--shell', action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )')
 	parser.add_argument('-f','--file', metavar='FILE', action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )')
 	parser.add_argument('-a','--arg-file', metavar='FILE', action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )')
+	summary = parser.add_mutually_exclusive_group()
+	summary.add_argument('--summary', dest='summary', action='store_const', const='all',help='list every command in the end-of-run summary ( default: only failed ones )')
+	summary.add_argument('--no-summary', dest='summary', action='store_const', const='none',help='do not print the end-of-run summary')
+	parser.add_argument('--no-prefix', action='store_true',help='do not prefix output lines with [#] when commands run at once')
+	parser.add_argument('--no-color', action='store_true',help='do not color output lines per command')
+	pty_mode = parser.add_mutually_exclusive_group()
+	pty_mode.add_argument('--pty', dest='pty', action='store_true',help='give commands a pseudo-terminal so they print live ( default when stdout is a terminal )')
+	pty_mode.add_argument('--no-pty', dest='pty', action='store_false',help='give commands plain pipes')
+	parser.set_defaults(summary='failed', pty=None)
 	parser.add_argument('-V','--version', action='version', version=f'%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us')
 	args = parser.parse_args()
 	if not args.commands and not args.file:
@@ -1743,9 +1796,11 @@ def main():
 		if not commands:
 			print('mcmd: no commands to run', file=sys.stderr)
 			return 2
+		use_pty = args.pty if args.pty is not None else (_stdout_isatty() and not args.quiet and not args.dry_run)
 		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
 			quiet=args.quiet and not args.dry_run, dry_run=args.dry_run,
-			with_stdErr=True, return_object=True, shell=args.shell)
+			with_stdErr=True, return_object=True, shell=args.shell,
+			prefix=not args.no_prefix, color=False if args.no_color else None, pty=use_pty)
 	except (OSError, ValueError) as e:
 		print(f'mcmd: {e}', file=sys.stderr)
 		return 2
@@ -1754,6 +1809,8 @@ def main():
 		return 130
 	if args.dry_run:
 		return 0
+	if len(tasks) > 1 and args.summary != 'none':
+		_display.message(_summary(tasks, show_all=args.summary == 'all'))
 	return _exit_status(tasks)
 
 #%% misc functions
