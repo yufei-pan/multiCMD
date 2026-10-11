@@ -8,6 +8,7 @@
 #%% imports
 import argparse
 import collections
+import errno
 import itertools
 import math
 import os
@@ -40,6 +41,24 @@ _ALPHA_IDX    = {c: i for i, c in enumerate(_ALPHANUM)}
 
 SUDO_PATH = shutil.which("sudo")
 USE_SUDO = False
+_IS_POSIX = os.name == 'posix'
+# Popen(process_group=) exists from Python 3.11; older Pythons start commands through _PGROUP_EXEC
+_HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
+# exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
+# preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo
+_PGROUP_EXEC = (
+	"import os,sys\n"
+	"os.setpgid(0,0)\n"
+	"try:\n"
+	"\tos.execvp(sys.argv[1],sys.argv[1:])\n"
+	"except FileNotFoundError as e:\n"
+	"\tsys.stderr.write(str(e)+'\\n');sys.exit(127)\n"
+	"except OSError as e:\n"
+	"\tsys.stderr.write(str(e)+'\\n');sys.exit(126)\n"
+)
+# blocked while a command starts and inherited by it: reading the terminal from a background
+# process group then fails with EIO instead of the kernel stopping the command
+_TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
 
 #%% objects
 class Task:
@@ -576,6 +595,46 @@ def set_sudo(use_sudo):
 	else:
 		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
 		USE_SUDO = False
+
+def _spawn(argv, stdout, stderr, env=None):
+	'''
+	Start a command in a process group of its own ( internal )
+
+	The group lets a timeout / stop / Ctrl-C reach everything the command starts. SIGTTIN and
+	SIGTTOU are blocked while it starts and the command inherits that, so if it reads the
+	terminal from its background group the read fails with EIO instead of the kernel stopping it.
+	Python 3.11+ uses Popen(process_group=0); older Pythons run the command through the exec
+	wrapper _PGROUP_EXEC. Windows gets a plain Popen.
+
+	@params:
+		argv: The command ( list[str] )
+		stdout: Where the command's stdout goes ( subprocess.PIPE or a file descriptor )
+		stderr: Where the command's stderr goes
+		env: The environment, None to inherit
+
+	@returns:
+		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
+	'''
+	kwargs = {'stdin': subprocess.DEVNULL, 'stdout': stdout, 'stderr': stderr, 'env': env}
+	if not _IS_POSIX:
+		return subprocess.Popen(argv, **kwargs), None
+	grouped = True
+	if _HAS_PROCESS_GROUP:
+		kwargs['process_group'] = 0
+	elif sys.executable:
+		# the wrapper would only report a missing command through its exit code; fail like Popen does
+		search_path = (env if env is not None else os.environ).get('PATH')
+		if os.sep not in argv[0] and shutil.which(argv[0], path=search_path) is None:
+			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), argv[0])
+		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC] + list(argv)
+	else:
+		grouped = False
+	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
+	try:
+		proc = subprocess.Popen(argv, **kwargs)
+	finally:
+		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+	return proc, (proc.pid if grouped else None)
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	'''

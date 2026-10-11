@@ -47,3 +47,15 @@ def loopback_ping_works():
 		return r.returncode == 0
 	except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
 		return False
+
+
+@pytest.fixture(params=['native', 'wrapper'])
+def launcher(request, monkeypatch):
+	'''Run a test once with Popen(process_group=0) ( Python 3.11+ ) and once with the exec wrapper'''
+	if request.param == 'native':
+		if sys.version_info < (3, 11):
+			pytest.skip('Popen(process_group=) needs Python 3.11+')
+		monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', True)
+	else:
+		monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', False)
+	return request.param
