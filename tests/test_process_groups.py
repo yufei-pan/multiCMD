@@ -5,11 +5,12 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
 import multiCMD
-from conftest import PACKAGE_ROOT
+from conftest import PACKAGE_ROOT, pid_gone
 
 pytestmark = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='process groups are checked on Linux')
 
@@ -64,3 +65,82 @@ def test_reading_the_terminal_fails_instead_of_stopping(launcher, tmp_path):
 	result = subprocess.run(['script', '-qec', command, '/dev/null'],
 		stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
 	assert 'RESULT rc=1' in result.stdout.replace('\r', '')
+
+
+def _state(pid):
+	try:
+		with open(f'/proc/{pid}/stat') as f:
+			return f.read().rsplit(')', 1)[1].split()[0]
+	except OSError:
+		return '?'
+
+
+def test_kill_commands_reaches_grandchildren(launcher):
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'sleep 30 & echo $!; wait'], subprocess.PIPE, subprocess.DEVNULL)
+	child = int(proc.stdout.readline())
+	start = time.monotonic()
+	multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
+	assert proc.poll() is not None
+	assert pid_gone(child)
+	assert time.monotonic() - start < 3
+	proc.stdout.close()
+
+
+def test_kill_commands_continues_stopped_commands(launcher):
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'kill -STOP $$; sleep 30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	deadline = time.monotonic() + 5
+	while _state(proc.pid) != 'T' and time.monotonic() < deadline:
+		time.sleep(0.02)
+	assert _state(proc.pid) == 'T'
+	multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
+	assert proc.poll() is not None
+
+
+def test_kill_commands_escalates_to_sigkill(launcher):
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'trap "" INT TERM; echo ready; while :; do sleep 0.1; done'],
+		subprocess.PIPE, subprocess.DEVNULL)
+	proc.stdout.readline()
+	start = time.monotonic()
+	multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
+	elapsed = time.monotonic() - start
+	assert proc.returncode == -signal.SIGKILL
+	assert 0.9 < elapsed < 3
+	proc.stdout.close()
+
+
+def test_kill_all_stops_registered_commands():
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'sleep 30 & echo $!; wait'], subprocess.PIPE, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		child = int(proc.stdout.readline())
+		multiCMD.kill_all()
+		assert proc.poll() is not None
+		assert pid_gone(child)
+	finally:
+		multiCMD._unregister(proc)
+		proc.stdout.close()
+
+
+def test_kill_all_with_nothing_running_returns_at_once():
+	start = time.monotonic()
+	multiCMD.kill_all()
+	assert time.monotonic() - start < 0.5
+
+
+EXIT_PROBE = textwrap.dedent(r"""
+	import subprocess, sys
+	sys.path.insert(0, {root!r})
+	import multiCMD
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'sleep 30 & echo $!; wait'], subprocess.PIPE, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	print(proc.pid, proc.stdout.readline().decode().strip(), flush=True)
+""")
+
+
+def test_kill_all_runs_when_the_interpreter_exits(tmp_path):
+	probe = tmp_path / 'probe.py'
+	probe.write_text(EXIT_PROBE.format(root=str(PACKAGE_ROOT)))
+	out = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=30).stdout
+	leader, child = (int(pid) for pid in out.split())
+	assert pid_gone(leader)
+	assert pid_gone(child)

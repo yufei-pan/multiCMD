@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -59,3 +61,22 @@ def launcher(request, monkeypatch):
 	else:
 		monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', False)
 	return request.param
+
+
+def pid_gone(pid, wait=3.0):
+	'''Whether a process has exited within wait seconds ( a zombie counts as exited )'''
+	deadline = time.monotonic() + wait
+	while True:
+		try:
+			os.kill(pid, 0)
+		except ProcessLookupError:
+			return True
+		try:
+			with open(f'/proc/{pid}/stat') as f:
+				if f.read().rsplit(')', 1)[1].split()[0] == 'Z':
+					return True
+		except OSError:
+			return True
+		if time.monotonic() > deadline:
+			return False
+		time.sleep(0.05)

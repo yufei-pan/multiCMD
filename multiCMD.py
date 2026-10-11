@@ -7,6 +7,7 @@
 # ///
 #%% imports
 import argparse
+import atexit
 import collections
 import errno
 import itertools
@@ -59,6 +60,9 @@ _PGROUP_EXEC = (
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
 _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
+# commands still running: Popen -> process group id ( None when the command has no group of its own )
+_live_procs = {}
+_live_procs_lock = threading.Lock()
 
 #%% objects
 class Task:
@@ -635,6 +639,129 @@ def _spawn(argv, stdout, stderr, env=None):
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
+
+def _register(proc, pgid):
+	'''
+	Track a running command so kill_all() can reach it ( internal )
+	'''
+	with _live_procs_lock:
+		_live_procs[proc] = pgid
+
+def _unregister(proc):
+	'''
+	Stop tracking a command once it is reaped ( internal )
+	'''
+	with _live_procs_lock:
+		_live_procs.pop(proc, None)
+
+def _send(proc, pgid, sig):
+	'''
+	Send sig to a command's process group, or to the process alone without a group ( internal )
+	'''
+	try:
+		if pgid is not None:
+			os.killpg(pgid, sig)
+		elif proc.poll() is None:
+			proc.send_signal(sig)
+	except OSError:
+		# already gone, or not ours to signal ( a root command under sudo: sudo relays the signal )
+		pass
+
+def _group_alive(proc, pgid):
+	'''
+	Whether anything in a command's process group is still running ( internal )
+	'''
+	if pgid is None:
+		return proc.poll() is None
+	try:
+		os.killpg(pgid, 0)
+	except ProcessLookupError:
+		return False
+	except OSError:
+		pass
+	return True
+
+def _wait_all(commands, timeout):
+	'''
+	Wait up to timeout seconds in total for commands to exit ( internal )
+	@returns:
+		bool: Whether all of them exited
+	'''
+	deadline = time.monotonic() + timeout
+	for proc, _ in commands:
+		try:
+			proc.wait(timeout=max(0, deadline - time.monotonic()))
+		except subprocess.TimeoutExpired:
+			pass
+	return all(proc.poll() is not None for proc, _ in commands)
+
+def _kill_commands(commands, first_signal):
+	'''
+	Stop commands and everything they started ( internal )
+
+	POSIX: first_signal, 0.01s later SIGTERM and SIGCONT ( a stopped process acts on signals only
+	once continued ), up to 1s for the commands to exit, then SIGKILL for any group that still has
+	members and up to 1s more. Every signal goes to the whole process group, and each step goes to
+	every command before waiting, so the total stays near 2s however many commands there are.
+	Windows: terminate(), up to 1s, kill(), up to 1s.
+
+	@params:
+		commands: ( Popen, process group id | None ) pairs
+		first_signal: The first signal to send ( POSIX only )
+	'''
+	commands = list(commands)
+	if not commands:
+		return
+	if not _IS_POSIX:
+		for proc, _ in commands:
+			if proc.poll() is None:
+				try:
+					proc.terminate()
+				except OSError:
+					pass
+		if not _wait_all(commands, 1):
+			for proc, _ in commands:
+				if proc.poll() is None:
+					try:
+						proc.kill()
+					except OSError:
+						pass
+			_wait_all(commands, 1)
+		return
+	for proc, pgid in commands:
+		_send(proc, pgid, first_signal)
+	time.sleep(0.01)
+	for proc, pgid in commands:
+		_send(proc, pgid, signal.SIGTERM)
+		_send(proc, pgid, signal.SIGCONT)
+	_wait_all(commands, 1)
+	leftovers = [(proc, pgid) for proc, pgid in commands if _group_alive(proc, pgid)]
+	for proc, pgid in leftovers:
+		_send(proc, pgid, signal.SIGKILL)
+	_wait_all(leftovers, 1)
+
+def kill_all(sig=None):
+	'''
+	Stop every command multiCMD started that is still running, and everything those commands started
+
+	Commands run in process groups of their own, so signals sent to your program's group ( e.g. by
+	`timeout`, or a closed terminal ) do not reach them. Call this from your own SIGTERM / SIGHUP
+	handlers. A multiCMD call waiting on the main thread stops its own commands on Ctrl-C, but one
+	waiting on another thread never sees the interrupt: a program that runs multiCMD from its own
+	threads should call this from its KeyboardInterrupt handler. multiCMD also calls it when the
+	interpreter exits.
+
+	@params:
+		sig: The first signal to send ( default SIGTERM; POSIX only ), followed by SIGTERM and SIGKILL as needed
+
+	@returns:
+		None
+	'''
+	with _live_procs_lock:
+		commands = list(_live_procs.items())
+	_kill_commands(commands, signal.SIGTERM if sig is None else sig)
+
+atexit.register(kill_all)
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
 	'''
