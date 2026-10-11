@@ -84,3 +84,20 @@ def test_colors_on_a_terminal_and_the_no_color_flag():
 			capture_output=True, text=True, timeout=60, env=env).stdout
 	assert '\x1b[38;2;' in under_terminal('-m', '2', 'echo a', 'echo b')
 	assert '\x1b[38;2;' not in under_terminal('--no-color', '-m', '2', 'echo a', 'echo b')
+
+
+def test_internal_errors_are_not_reported_as_sighup():
+	import multiCMD
+	task = multiCMD.Task(['x'])
+	task.returncode = -1
+	task._error = True
+	assert multiCMD._format_returncode(task) == '-1 (error)'
+	assert multiCMD._exit_status([task]) == 1
+	# a real SIGHUP death still maps to 128+1
+	assert run_cli(['-q', "sh -c 'kill -HUP $$'"]).returncode == 129
+
+
+def test_empty_command_is_a_usage_error():
+	proc = run_cli(['-q', ''])
+	assert proc.returncode == 2
+	assert 'empty command' in proc.stderr

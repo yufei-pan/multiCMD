@@ -144,3 +144,12 @@ def test_kill_all_runs_when_the_interpreter_exits(tmp_path):
 	leader, child = (int(pid) for pid in out.split())
 	assert pid_gone(leader)
 	assert pid_gone(child)
+
+
+def test_spawn_restores_default_sigpipe_and_sigxfsz(launcher):
+	# the exec wrapper is a Python interpreter, which ignores SIGPIPE and SIGXFSZ; commands must not inherit that
+	proc, _ = multiCMD._spawn(['grep', 'SigIgn', '/proc/self/status'], subprocess.PIPE, subprocess.DEVNULL)
+	out, _ = proc.communicate(timeout=10)
+	ignored = int(out.split()[1], 16)
+	assert not ignored & (1 << (signal.SIGPIPE - 1))
+	assert not ignored & (1 << (signal.SIGXFSZ - 1))

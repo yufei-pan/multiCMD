@@ -88,3 +88,29 @@ def test_posix_only_modules_are_imported_lazily():
 		elif isinstance(node, ast.ImportFrom):
 			top_level.add(node.module)
 	assert not top_level & {'pty', 'termios', 'fcntl', 'msvcrt'}
+
+
+def test_cli_leaves_pty_mode_off_without_posix(monkeypatch):
+	seen = {}
+	def fake_run_commands(commands, **kwargs):
+		seen.update(kwargs)
+		task = multiCMD.Task(['true'])
+		task.returncode = 0
+		return [task]
+	monkeypatch.setattr(multiCMD, 'run_commands', fake_run_commands)
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', lambda: None)
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
+	monkeypatch.setattr(multiCMD, '_stdout_isatty', lambda: True)
+	monkeypatch.setattr(sys, 'argv', ['mcmd', 'true'])
+	assert multiCMD.main() == 0
+	assert seen['pty'] is False
+
+
+def test_frozen_executable_is_never_used_as_the_exec_wrapper(monkeypatch):
+	# a PyInstaller-style app would receive "-I -S -c ..." as its own arguments
+	monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', False)
+	monkeypatch.setattr(sys, 'frozen', True, raising=False)
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'echo $0'], subprocess.PIPE, subprocess.DEVNULL)
+	out, _ = proc.communicate(timeout=10)
+	assert out.strip() == b'sh'
+	assert pgid is None

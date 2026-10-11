@@ -1,14 +1,17 @@
 import _thread
+import os
+import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 
 import pytest
 
 import multiCMD
-from conftest import pid_gone
-from multiCMD import AsyncExecutor, run_command
+from conftest import PACKAGE_ROOT, pid_gone
+from multiCMD import AsyncExecutor, run_command, run_commands
 
 linux_only = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
 
@@ -123,3 +126,82 @@ def test_stopped_task_is_skipped_before_it_starts():
 	assert task.returncode is None
 	assert task.start_time is None
 	assert not task._finalized
+
+
+def test_pipelines_stop_when_the_reader_goes_away(launcher):
+	# with SIGPIPE ignored, `yes` complains and an endless writer never stops
+	task = run_command('yes | head -1', shell=True, quiet=True, return_object=True)
+	assert task.stdout == ['y']
+	assert task.stderr == []
+	start = time.monotonic()
+	task = run_command('while :; do echo x; done | head -1', shell=True, quiet=True, return_object=True)
+	assert task.stdout == ['x']
+	assert time.monotonic() - start < 5
+
+
+# the command's own process exits at once, but the background sleep keeps its output open
+LEAVES_A_BACKGROUND_JOB = ['sh', '-c', 'sleep 30 & echo $!']
+
+
+@linux_only
+@pytest.mark.slow
+def test_timeout_reaches_what_a_finished_command_left_running():
+	start = time.monotonic()
+	task = run_command(LEAVES_A_BACKGROUND_JOB, timeout=1, quiet=True, return_object=True)
+	assert time.monotonic() - start < 3.5
+	assert task.returncode == 124
+	assert pid_gone(int(task.stdout[0]))
+
+
+@linux_only
+@pytest.mark.slow
+def test_executor_stop_reaches_what_a_finished_command_left_running():
+	ex = AsyncExecutor(quiet=True)
+	task = ex.run_command(LEAVES_A_BACKGROUND_JOB)
+	deadline = time.monotonic() + 5
+	while not task.stdout and time.monotonic() < deadline:
+		time.sleep(0.02)
+	time.sleep(0.2)
+	start = time.monotonic()
+	ex.stop(timeout=10)
+	assert time.monotonic() - start < 3.5
+	assert pid_gone(int(task.stdout[0]))
+
+
+@linux_only
+@pytest.mark.slow
+def test_pool_ctrl_c_reaches_what_finished_commands_left_running(tmp_path):
+	pidfiles = [tmp_path / f'pid{i}' for i in range(3)]
+	commands = [['sh', '-c', f'sleep 30 & echo $! > {path}'] for path in pidfiles]
+	timer = threading.Timer(0.7, _thread.interrupt_main)
+	timer.start()
+	start = time.monotonic()
+	with pytest.raises(KeyboardInterrupt):
+		run_commands(commands, max_threads=3, quiet=True)
+	assert time.monotonic() - start < 4
+	for path in pidfiles:
+		assert pid_gone(int(path.read_text()))
+
+
+EXIT_PROBE = textwrap.dedent(r"""
+	import sys, time
+	sys.path.insert(0, {root!r})
+	import multiCMD
+	task = multiCMD.run_command(['sh', '-c', 'sleep 30 & echo $!'], quiet=True, wait_for_return=False, return_object=True)
+	while task.returncode is None or not task.stdout:
+		time.sleep(0.02)
+	print(task.stdout[0], flush=True)
+""")
+
+
+@linux_only
+def test_exit_leaves_alone_what_a_finished_fire_and_forget_command_started(tmp_path):
+	# statbtrfs starts `btrfs scrub start`, which leaves the scrub running in the background on purpose
+	probe = tmp_path / 'probe.py'
+	probe.write_text(EXIT_PROBE.format(root=str(PACKAGE_ROOT)))
+	out = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=30).stdout
+	child = int(out.split()[0])
+	try:
+		assert not pid_gone(child, wait=0.5)
+	finally:
+		os.kill(child, signal.SIGKILL)

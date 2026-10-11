@@ -159,3 +159,13 @@ def test_ctrl_c_in_a_sequential_run_skips_the_rest(tmp_path):
 	proc.send_signal(signal.SIGINT)
 	assert proc.wait(timeout=10) == 130
 	assert not marker.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
+def test_sigterm_reaches_what_a_finished_command_left_running():
+	proc = _start_cli("sh -c 'sleep 30 & echo $!; echo started'")
+	child = _read_pid(proc)
+	time.sleep(0.3)
+	proc.send_signal(signal.SIGTERM)
+	assert proc.wait(timeout=10) == 128 + 15
+	assert pid_gone(child)

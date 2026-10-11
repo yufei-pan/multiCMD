@@ -49,7 +49,10 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
 # preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo
 _PGROUP_EXEC = (
-	"import os,sys\n"
+	"import os,signal,sys\n"
+	# Python ignores SIGPIPE / SIGXFSZ at startup and an ignored signal survives exec; give the command the defaults
+	"for n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n"
+	"\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
 	"os.setpgid(0,0)\n"
 	"try:\n"
 	"\tos.execvp(sys.argv[1],sys.argv[1:])\n"
@@ -63,6 +66,9 @@ _PGROUP_EXEC = (
 _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
 # commands still running: Popen -> process group id ( None when the command has no group of its own )
 _live_procs = {}
+# commands that exited while something they started still holds their output open, and a waiting
+# call is still reading it: Popen -> process group id. kill_all() reaches these, the exit hook does not
+_draining = {}
 _live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
@@ -85,6 +91,8 @@ class Task:
 		self._finalized = False
 		# whether stdout and stderr were merged into one pty
 		self._pty = False
+		# whether multiCMD itself failed to run or reap the command ( returncode -1 is then not a SIGHUP death )
+		self._error = False
 
 	def __iter__(self):
 		yield from (
@@ -822,7 +830,8 @@ def _spawn(argv, stdout, stderr, env=None):
 	grouped = True
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
-	elif sys.executable:
+	elif sys.executable and not getattr(sys, 'frozen', False):
+		# ( a frozen app's sys.executable is the app itself, not a Python that can run the wrapper )
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		search_path = (env if env is not None else os.environ).get('PATH')
 		if os.sep not in argv[0] and shutil.which(argv[0], path=search_path) is None:
@@ -1013,8 +1022,9 @@ def kill_all(sig=None):
 	`timeout`, or a closed terminal ) do not reach them. Call this from your own SIGTERM / SIGHUP
 	handlers. A multiCMD call waiting on the main thread stops its own commands on Ctrl-C, but one
 	waiting on another thread never sees the interrupt: a program that runs multiCMD from its own
-	threads should call this from its KeyboardInterrupt handler. multiCMD also calls it when the
-	interpreter exits.
+	threads should call this from its KeyboardInterrupt handler. This also reaches what a finished
+	command left running while a call is still reading its output. When the interpreter exits,
+	multiCMD stops the commands still running itself.
 
 	@params:
 		sig: The first signal to send ( default SIGTERM; POSIX only ), followed by SIGTERM and SIGKILL as needed
@@ -1023,10 +1033,20 @@ def kill_all(sig=None):
 		None
 	'''
 	with _live_procs_lock:
-		commands = list(_live_procs.items())
+		commands = list(_live_procs.items()) + list(_draining.items())
 	_kill_commands(commands, signal.SIGTERM if sig is None else sig)
 
-atexit.register(kill_all)
+def _kill_running_at_exit():
+	'''
+	At interpreter exit, stop the commands that are still running ( internal )
+	What a finished command left running in the background is left alone: a fire-and-forget
+	command may start a long job on purpose ( `btrfs scrub start`, `nohup ...` ).
+	'''
+	with _live_procs_lock:
+		commands = list(_live_procs.items())
+	_kill_commands(commands, signal.SIGTERM)
+
+atexit.register(_kill_running_at_exit)
 
 def _resolve_pty(pty):
 	'''
@@ -1113,6 +1133,25 @@ def _join(thread, timeout=None):
 			return
 		thread.join(step)
 
+def _drain(task, readers, timeout):
+	'''
+	Read a command's output to its end after its own process exited ( internal )
+	@params:
+		task: The Task ( its stop flag and _last_output are watched )
+		readers: The reader threads
+		timeout: Inactivity timeout in seconds ( 0: none )
+	@returns:
+		None | str: None once all output ended, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
+	'''
+	while any(reader.is_alive() for reader in readers):
+		if task.stop:
+			return 'stop'
+		if timeout > 0 and time.monotonic() - task._last_output > timeout:
+			return 'timeout'
+		for reader in readers:
+			reader.join(0.05)
+	return None
+
 def _join_readers(readers, limit):
 	'''
 	Wait for a command's output readers to reach the end of their streams ( internal )
@@ -1177,12 +1216,23 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		_kill_commands([(proc, pgid)], signal.SIGINT)
 	_unregister(proc)
 	task.returncode = proc.poll()
-	try:
-		_join_readers(readers, None if reason is None else 1)
-	except KeyboardInterrupt:
-		interrupted = True
-		_kill_commands([(proc, pgid)], signal.SIGINT)
-		_join_readers(readers, 1)
+	if reason is None:
+		# the command exited, but something it started may still hold its output open: keep reading,
+		# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
+		with _live_procs_lock:
+			_draining[proc] = pgid
+		try:
+			reason = _drain(task, readers, timeout)
+		except KeyboardInterrupt:
+			reason, interrupted = 'stop', True
+		finally:
+			with _live_procs_lock:
+				_draining.pop(proc, None)
+		if reason == 'timeout':
+			task.stderr.append('Timeout!')
+		if reason is not None:
+			_kill_commands([(proc, pgid)], signal.SIGINT)
+	_join_readers(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124
 	elif task.returncode is None:
@@ -1191,6 +1241,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			task.returncode = 137
 		else:
 			task.returncode = -1
+			task._error = True
 	task.end_time = time.time()
 	task._finalized = True
 	if interrupted:
@@ -1243,6 +1294,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			task.stderr.extend(str(e).split('\n'))
 			task.stderr.extend(traceback.format_exc().split('\n'))
 			task.returncode = -1
+			task._error = True
 		finally:
 			task._finalized = True
 		if not quiet:
@@ -1511,8 +1563,10 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			_join(thread)
 	except KeyboardInterrupt:
 		_stop_tasks(tasks)
+		# one shared limit, so stopping many workers stays bounded
+		deadline = time.monotonic() + 5
 		for thread in workers:
-			_join(thread, 5)
+			_join(thread, max(0, deadline - time.monotonic()))
 		raise
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
@@ -1664,7 +1718,7 @@ def _exit_status(tasks):
 	'''
 	if len(tasks) == 1:
 		returncode = tasks[0].returncode
-		if returncode is None:
+		if returncode is None or tasks[0]._error:
 			return 1
 		return 128 - returncode if returncode < 0 else returncode
 	return min(sum(1 for task in tasks if task.returncode not in (0, None)), 101)
@@ -1691,12 +1745,15 @@ def _install_cli_signal_handlers():
 
 _RETURNCODE_LABELS = {124: 'timeout', 126: 'cannot execute', 127: 'not found'}
 
-def _format_returncode(returncode):
+def _format_returncode(task):
 	'''
-	A return code with its meaning, for the summary ( internal )
+	A task's return code with its meaning, for the summary ( internal )
 	'''
+	returncode = task.returncode
 	if returncode is None:
 		return 'not run'
+	if task._error:
+		return f'{returncode} (error)'
 	if returncode < 0:
 		try:
 			name = signal.Signals(-returncode).name
@@ -1724,7 +1781,7 @@ def _summary(tasks, show_all=False):
 		for index in rows:
 			task = tasks[index - 1]
 			duration = task.duration
-			data.append([str(index), _quote_command(task.command), _format_returncode(task.returncode),
+			data.append([str(index), _quote_command(task.command), _format_returncode(task),
 				'-' if duration is None else f'{duration:.2f}s'])
 		table = pretty_format_table(data)
 	if failed:
@@ -1796,6 +1853,9 @@ def _cli_commands(args):
 		for line in _read_input(path):
 			if line.strip() and not line.lstrip().startswith('#'):
 				commands.extend(expand(line))
+	for command in commands:
+		if isinstance(command, str) and not command.strip():
+			raise ValueError('empty command')
 	if args.shell:
 		# filled templates are already argv lists that take their line as "$1"
 		commands = [_shell_argv(command) if isinstance(command, str) else command for command in commands]
@@ -1840,7 +1900,7 @@ def main():
 		if not commands:
 			print('mcmd: no commands to run', file=sys.stderr)
 			return 2
-		use_pty = args.pty if args.pty is not None else (_stdout_isatty() and not args.quiet and not args.dry_run)
+		use_pty = args.pty if args.pty is not None else (_IS_POSIX and _stdout_isatty() and not args.quiet and not args.dry_run)
 		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
 			quiet=args.quiet and not args.dry_run, dry_run=args.dry_run,
 			with_stdErr=True, return_object=True,
