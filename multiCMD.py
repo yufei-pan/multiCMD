@@ -74,6 +74,9 @@ class Task:
 		self.stderr = []
 		self.thread = None
 		self.stop = False
+		# wall-clock times the command started and finished ( None until then )
+		self.start_time = None
+		self.end_time = None
 		# monotonic time of the latest output; drives the inactivity timeout
 		self._last_output = None
 		# set once the command is done with; readers still draining after a kill stop recording
@@ -103,6 +106,15 @@ stop={self.stop!r})"""
 
 	def is_alive(self):
 		return self.thread is not None and self.thread.is_alive()
+
+	@property
+	def duration(self):
+		'''
+		How long the command ran, in seconds ( None if it has not both started and finished )
+		'''
+		if self.start_time is None or self.end_time is None:
+			return None
+		return self.end_time - self.start_time
 
 class _HeldPermit:
 	'''
@@ -340,7 +352,7 @@ class AsyncExecutor:
 		if not sem:
 			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
 		if use_sudo:
-			_validate_sudo(sem)
+			_validate_sudo()
 		self._reap()
 		with self._lock:
 			self.tasks.extend(taskObjects)
@@ -545,52 +557,6 @@ def _expand_ranges_fast(inStr):
 
 # backwards-compatible alias for the pre-rename public name
 _expand_ranges = _expand_ranges_fast
-
-def __handle_stream(stream,target,pre='',post='',quiet=False):
-	'''
-	Handle a stream
-
-	@params:
-		stream: The stream to handle
-		target: The target to write to
-		pre: The prefix to add to each line
-		post: The postfix to add to each line
-		quiet: Whether to suppress output
-
-	@returns:
-		None
-	'''
-	def add_line(current_line,target, keepLastLine=True):
-		if not keepLastLine:
-			if not quiet:
-				sys.stdout.write('\r')
-			target.pop()
-		else:
-			if not quiet:
-				sys.stdout.write('\n')
-		current_line_str = current_line.decode('utf-8',errors='backslashreplace')
-		target.append(current_line_str)
-		if not quiet:
-			sys.stdout.write(pre+current_line_str+post)
-			sys.stdout.flush()
-	current_line = bytearray()
-	lastLineCommited = True
-	for char in iter(lambda:stream.read(1), b''):
-		if char == b'\n':
-			if (not lastLineCommited) and current_line:
-				add_line(current_line,target, keepLastLine=False)
-			elif lastLineCommited:
-				add_line(current_line,target, keepLastLine=True)
-			current_line = bytearray()
-			lastLineCommited = True
-		elif char == b'\r':
-			add_line(current_line,target, keepLastLine=lastLineCommited)
-			current_line = bytearray()
-			lastLineCommited = False
-		else:
-			current_line.extend(char)
-	if current_line:
-		add_line(current_line,target, keepLastLine=lastLineCommited)
 
 def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	'''
@@ -978,117 +944,136 @@ def kill_all(sig=None):
 
 atexit.register(kill_all)
 
-def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,identity=None):
+def _watch(task, proc, timeout):
+	'''
+	Wait for a command to exit ( internal )
+	@params:
+		task: The Task ( its stop flag and _last_output are watched )
+		proc: The command's process
+		timeout: Inactivity timeout in seconds ( 0: none )
+	@returns:
+		None | str: None when it exited, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
+	'''
+	sleep_time = 1.0e-7 # 100 nanoseconds
+	while proc.poll() is None:  # while the process is still running
+		if task.stop:
+			return 'stop'
+		if timeout > 0 and time.monotonic() - task._last_output > timeout:
+			return 'timeout'
+		time.sleep(sleep_time)
+		# exponential backoff
+		if sleep_time < 0.001:
+			sleep_time *= 2
+	return None
+
+def _join_readers(readers, limit):
+	'''
+	Wait for a command's output readers to reach the end of their streams ( internal )
+	@params:
+		readers: The reader threads
+		limit: The longest to wait in total, in seconds ( None: no limit )
+	'''
+	deadline = None if limit is None else time.monotonic() + limit
+	for reader in readers:
+		reader.join(None if deadline is None else max(0, deadline - time.monotonic()))
+
+def _execute(task, timeout, quiet, decor, use_pty=False):
+	'''
+	Run a task's command to the end: start it, stream its output, enforce the timeout and the stop flag, reap it ( internal )
+
+	After a timeout / stop / Ctrl-C the command is killed with everything it started, and its
+	output gets at most one more second to end, so something that escaped the kill cannot hold the
+	call. After a normal exit the output is read to its end, however long that takes. The command
+	leaves the live registry as soon as it is reaped, so kill_all() never touches what it left
+	running in the background on purpose.
+	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is
+	re-raised once the command is dead.
+
+	@params:
+		task: The Task
+		timeout: Inactivity timeout in seconds ( 0: none )
+		quiet: Whether to skip showing output
+		decor: ( prefix, color start, color end ) for displayed lines
+		use_pty: Whether the command writes to a pty instead of pipes ( POSIX only )
+	'''
+	proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE)
+	streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
+	task.start_time = time.time()
+	task._last_output = time.monotonic()
+	_register(proc, pgid)
+	readers = [threading.Thread(target=_read_stream, args=(stream, target, task, decor, quiet), daemon=True) for stream, target in streams]
+	for reader in readers:
+		reader.start()
+	interrupted = False
+	try:
+		reason = _watch(task, proc, timeout)
+	except KeyboardInterrupt:
+		reason, interrupted = 'stop', True
+	if reason == 'timeout':
+		task.stderr.append('Timeout!')
+	if reason is not None:
+		_kill_commands([(proc, pgid)], signal.SIGINT)
+	_unregister(proc)
+	task.returncode = proc.poll()
+	try:
+		_join_readers(readers, None if reason is None else 1)
+	except KeyboardInterrupt:
+		interrupted = True
+		_kill_commands([(proc, pgid)], signal.SIGINT)
+		_join_readers(readers, 1)
+	if reason == 'timeout':
+		task.returncode = 124
+	elif task.returncode is None:
+		# process been killed via sigkill or similar without a normal exit code
+		if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
+			task.returncode = 137
+		else:
+			task.returncode = -1
+	task.end_time = time.time()
+	task._finalized = True
+	if interrupted:
+		raise KeyboardInterrupt
+
+def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,decor=('', '', ''),use_pty=False):
 	'''
 	Run a command ( internal )
 
 	@params:
 		task: The Task object
 		sem: The semaphore
-		timeout: Inactivity timeout in seconds. The command is killed only after
-			it produces no new committed output line for this many seconds (a line
-			is committed on '\n'/'\r'), not after a fixed total runtime. 0 disables it.
+		timeout: Inactivity timeout in seconds. The command is killed, with everything it
+			started, once it has produced no output at all for this many seconds. 0 disables it.
 		quiet: Whether to suppress output
-		dry_run: Whether to simulate running the command
+		dry_run: Whether to only show the command instead of running it
 		with_stdErr: Whether to return the standard error output
-		identity: The identity of the command
+		decor: ( prefix, color start, color end ) for this command's displayed lines
+		use_pty: Whether the command writes to a pty instead of pipes ( POSIX only )
 
 	@returns:
-		None | int | list[str]: The output of the command
+		list[str]: The output of the command
 	'''
-
-	pre = ''
-	post = ''
 	with sem:
+		if task.stop:
+			# stopped before it started: it stays unfinished, like a skipped queued command
+			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
-			if identity is not None:
-				if identity == ...:
-					identity = threading.get_ident()
-				r, g, b = int_to_color(identity)
-				pre = f'\x1b[38;2;{r};{g};{b}m'
-				post = '\x1b[0m'
-			if not quiet:
-				print(pre+'Running command: '+' '.join(task.command)+post)
-				print(pre+'-'*100+post)
 			if dry_run:
-				return task.stdout + task.stderr
-			#host.stdout = []
-			# stdin is connected to DEVNULL: multiCMD does not feed live input to
-			# commands, so any command that reads stdin gets immediate EOF instead
-			# of blocking forever on an empty, never-closed pipe.
-			proc = subprocess.Popen(task.command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,stdin=subprocess.DEVNULL)
-			# create a thread to handle stdout
-			stdout_thread = threading.Thread(target=__handle_stream, args=(proc.stdout,task.stdout,pre,post,quiet),daemon=True)
-			stdout_thread.start()
-			# create a thread to handle stderr
-			#host.stderr = []
-			stderr_thread = threading.Thread(target=__handle_stream, args=(proc.stderr,task.stderr,pre,post,quiet),daemon=True)
-			stderr_thread.start()
-			# Monitor the subprocess and terminate it after the timeout
-			start_time = time.time()
-			outLength = len(task.stdout) + len(task.stderr)
-			time.sleep(0)
-			sleep_time = 1.0e-7 # 100 nanoseconds
-			inactivity_timeout = False
-			while proc.poll() is None:  # while the process is still running
-				if task.stop:
-					proc.send_signal(signal.SIGINT)
-					time.sleep(0.01)
-					proc.terminate()
-					break
-				if timeout > 0:
-					if len(task.stdout) + len(task.stderr) != outLength:
-						start_time = time.time()
-						outLength = len(task.stdout) + len(task.stderr)
-					elif time.time() - start_time > timeout:
-						task.stderr.append('Timeout!')
-						inactivity_timeout = True
-						proc.send_signal(signal.SIGINT)
-						time.sleep(0.01)
-						proc.terminate()
-						break
-				time.sleep(sleep_time)
-				# exponential backoff
-				if sleep_time < 0.001:
-					sleep_time *= 2
-			# Make sure the process is fully reaped. If we broke out of the loop
-			# after signalling it (stop / timeout), it may not have exited yet.
-			try:
-				proc.wait(timeout=1)
-			except subprocess.TimeoutExpired:
-				proc.kill()
-				try:
-					proc.wait(timeout=1)
-				except subprocess.TimeoutExpired:
-					pass
-			task.returncode = proc.poll()
-			# The reader threads exit on their own once the child closes its
-			# stdout/stderr (which happens when it terminates), so joining them
-			# captures all remaining output. We deliberately avoid
-			# proc.communicate() here: it would read the same pipes concurrently
-			# with the reader threads, which can raise or interleave/drop output.
-			stdout_thread.join(timeout=5)
-			stderr_thread.join(timeout=5)
-			# release the pipe file descriptors
-			for stream in (proc.stdout, proc.stderr):
-				try:
-					if stream:
-						stream.close()
-				except Exception:
-					pass
-			if inactivity_timeout:
-				task.returncode = 124
-			elif task.returncode is None:
-				# process been killed via sigkill or similar without a normal exit code
-				if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):
-					task.returncode = 137
-				else:
-					task.returncode = -1
+				if not quiet:
+					_display.message(_quote_command(task.command))
+				return task.stdout + task.stderr if with_stdErr else task.stdout
+			if not quiet:
+				_display.message('Running command: ' + _quote_command(task.command), decor)
+				_display.message('-' * 100, decor)
+			_execute(task, timeout, quiet, decor, use_pty)
 		# if file not found
 		except FileNotFoundError as e:
 			print(f'Command path not found: {task.command[0]}',file=sys.stderr,flush=True)
 			task.stderr.append(str(e))
 			task.returncode = 127
+		except PermissionError as e:
+			print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
+			task.stderr.append(str(e))
+			task.returncode = 126
 		except Exception as e:
 			import traceback
 			print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
@@ -1096,29 +1081,31 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			task.stderr.extend(str(e).split('\n'))
 			task.stderr.extend(traceback.format_exc().split('\n'))
 			task.returncode = -1
+		finally:
+			task._finalized = True
 		if not quiet:
-			print(pre+'\n'+ '-'*100+post)
-			print(pre+f'Process exited with return code {task.returncode}'+post)
+			_display.message('-' * 100, decor)
+			_display.message(f'Process exited with return code {task.returncode}', decor)
 		if with_stdErr:
 			return task.stdout + task.stderr
 		else:
 			return task.stdout
 
-def _run_executor_task(task, permit, timeout, quiet, dry_run, finished):
+def _run_executor_task(task, permit, timeout, quiet, dry_run, finished, decor=('', '', ''), use_pty=False):
 	'''
 	Run an AsyncExecutor command, then report this thread finished so the executor joins it and drops it from the task ( internal )
 	'''
 	try:
-		__run_command(task, permit, timeout, quiet, dry_run, identity=...)
+		__run_command(task, permit, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
 	finally:
 		finished.append((threading.current_thread(), task))
 
-def __run_tracked_command(task, sem, timeout, quiet, dry_run, identity):
+def __run_tracked_command(task, sem, timeout, quiet, dry_run, decor=('', '', ''), use_pty=False):
 	'''
 	Run a fire-and-forget command, then report this thread finished so it leaves __running_threads ( internal )
 	'''
 	try:
-		__run_command(task, sem, timeout, quiet, dry_run, identity=identity)
+		__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
 	finally:
 		__finished_threads.append(threading.current_thread())
 
@@ -1161,11 +1148,16 @@ def _build_tasks(commands, parse=False, use_sudo=...):
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	return [Task(command) for command in formatedCommands], bool(use_sudo)
 
-def _validate_sudo(sem):
+def _validate_sudo():
 	'''
 	Validate sudo access before running sudo commands ( internal )
+	It runs in the foreground on the terminal, so sudo can ask for a password and cache the
+	per-terminal ticket that the commands ( in process groups of their own, same session ) then use.
 	'''
-	__run_command(Task([SUDO_PATH, '-v']),sem,timeout=60,quiet=True,dry_run=False,with_stdErr=False,identity=None)
+	try:
+		subprocess.run([SUDO_PATH, '-v'])
+	except OSError as e:
+		print(f'sudo validation failed: {e}', file=sys.stderr)
 
 def __format_command(command,expand = False):
 	'''
@@ -1253,10 +1245,9 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 
 	@params:
 		command: The command to run
-		timeout: Inactivity timeout in seconds. The command is killed only after
-			it produces no new committed output line for this many seconds, not
-			after a fixed total runtime. A line is "committed" when the stream
-			handler sees a '\n' or '\r'. Use 0 (the default) to disable it.
+		timeout: Inactivity timeout in seconds. A command is killed, with everything it started,
+			once it has produced no output at all for this many seconds. It is not a limit on
+			the total runtime. Use 0 (the default) to disable it.
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the command
@@ -1284,10 +1275,9 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )
-		timeout: Inactivity timeout in seconds. A command is killed only after it
-			produces no new committed output line for this many seconds, not after
-			a fixed total runtime. A line is "committed" when the stream handler
-			sees a '\n' or '\r'. Use 0 (the default) to disable the timeout.
+		timeout: Inactivity timeout in seconds. A command is killed, with everything it started,
+			once it has produced no output at all for this many seconds. It is not a limit on
+			the total runtime. Use 0 (the default) to disable it.
 		max_threads: The maximum number of threads to use
 		quiet: Whether to suppress output
 		dry_run: Whether to simulate running the commands
@@ -1311,10 +1301,10 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	if not sem:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
 	if use_sudo:
-		_validate_sudo(sem)
+		_validate_sudo()
 	if not wait_for_return:
 		__reap_finished_threads()
-		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
+		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run),daemon=True) for task in tasks]
 		# tracked before they start, so a thread is always registered before it reports itself finished
 		with __running_threads_lock:
 			__running_threads.update(threads)
@@ -1322,7 +1312,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task.thread = thread
 			thread.start()
 	elif max_threads > 1:
-		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run,...),daemon=True) for task in tasks]
+		threads = [threading.Thread(target=__run_command, args=(task,sem,timeout,quiet,dry_run),daemon=True) for task in tasks]
 		for thread,task in zip(threads,tasks):
 			task.thread = thread
 			thread.start()
@@ -1330,7 +1320,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			thread.join()
 	else:
 		for task in tasks:
-			__run_command(task,sem,timeout,quiet,dry_run,identity=None)
+			__run_command(task,sem,timeout,quiet,dry_run)
 	# return the only the output for the tasks
 	if raise_error:
 		errors = [task for task in tasks if task.returncode != 0]
