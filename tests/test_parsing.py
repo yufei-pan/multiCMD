@@ -41,3 +41,19 @@ def test_shell_mode_with_sudo_wraps_the_shell(monkeypatch):
 
 def test_shell_mode_expands_ranges_first():
 	assert run_commands(['echo x[1-2] | tr x y'], parse=True, shell=True, quiet=True) == [['y1'], ['y2']]
+
+
+def test_shell_mode_refuses_argument_lists_for_cmd_exe(monkeypatch):
+	# POSIX quoting means nothing to cmd.exe, so a list cannot be joined safely there
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
+	with pytest.raises(ValueError, match='POSIX shell'):
+		multiCMD._shell_argv(['echo', 'a&calc'])
+	assert multiCMD._shell_argv('echo hi')[-2:] == ['/c', 'echo hi']
+
+
+def test_shell_template_keeps_the_placeholder_out_of_the_shell_code():
+	assert multiCMD._shell_template('echo {}') == 'echo "$1"'
+	assert multiCMD._shell_template('echo "x{}y"') == 'echo "x$1y"'
+	assert multiCMD._shell_template("echo '{}'") == "echo ''\"$1\"''"
+	assert multiCMD._shell_template('echo \\"{}') == 'echo \\""$1"'
+	assert multiCMD._shell_template('echo') == 'echo "$1"'

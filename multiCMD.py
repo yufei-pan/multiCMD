@@ -1311,11 +1311,48 @@ def _shell_argv(command):
 	@returns:
 		list[str]: /bin/sh -c ... on POSIX, %COMSPEC% /c ... on Windows
 	'''
-	if not isinstance(command, str):
-		command = _quote_command(command)
 	if _IS_POSIX:
+		if not isinstance(command, str):
+			command = _quote_command(command)
 		return ['/bin/sh', '-c', command]
+	if not isinstance(command, str):
+		# POSIX quoting means nothing to cmd.exe, and its own rules cannot be applied safely
+		raise ValueError(f'shell mode on this system needs a command string, not an argument list ( a POSIX shell is required ): {command!r}')
 	return [os.environ.get('COMSPEC', 'cmd.exe'), '/c', command]
+
+def _shell_template(template):
+	'''
+	Turn a shell command template into a script that takes its input line as "$1" ( internal )
+	Each {} is replaced to suit where it sits, so the line is never parsed as shell code:
+	unquoted -> "$1", inside double quotes -> $1, inside single quotes -> '"$1"'.
+	A template without {} gets "$1" as its last argument.
+	@params:
+		template: The command template ( str )
+	@returns:
+		str: The script for /bin/sh -c, to run with the line as its first positional parameter
+	'''
+	if '{}' not in template:
+		return template + ' "$1"'
+	out = []
+	quote = None  # None: unquoted; "'" or '"': inside those quotes
+	i = 0
+	while i < len(template):
+		if template.startswith('{}', i):
+			out.append('"$1"' if quote is None else '$1' if quote == '"' else '\'"$1"\'')
+			i += 2
+			continue
+		char = template[i]
+		if char == '\\' and quote != "'" and i + 1 < len(template):
+			out.append(template[i:i + 2])
+			i += 2
+			continue
+		if quote is None and char in '\'"':
+			quote = char
+		elif char == quote:
+			quote = None
+		out.append(char)
+		i += 1
+	return ''.join(out)
 
 def _build_tasks(commands, parse=False, use_sudo=..., shell=False):
 	'''
@@ -1710,21 +1747,25 @@ def _fill_templates(templates, lines, shell=False):
 	One command per template and input line, with {} replaced by the line ( internal )
 	The line is substituted after the template is split into arguments, so it always stays one
 	argument; a template without {} gets the line as its last argument. In shell mode the line is
-	shell-quoted into the template string instead.
+	never put into the shell code: it is passed as "$1" to /bin/sh -c ( see _shell_template ).
 	@params:
 		templates: The command templates ( list[str] )
 		lines: The input lines ( list[str] )
 		shell: Whether the commands run through the system shell
 	@returns:
-		list[str | list[str]]: Command strings in shell mode, argument lists otherwise
+		list[list[str]]: The argument lists
+	@raises:
+		ValueError: shell mode without a POSIX shell, or a template with an unbalanced quote
 	'''
+	if shell and not _IS_POSIX:
+		raise ValueError('-a with --shell needs a POSIX shell')
 	commands = []
 	for template in templates:
+		script = _shell_template(template) if shell else None
 		argv = None if shell else _split_command(template)
 		for line in lines:
 			if shell:
-				quoted = shlex.quote(line)
-				commands.append(template.replace('{}', quoted) if '{}' in template else template + ' ' + quoted)
+				commands.append(['/bin/sh', '-c', script, 'mcmd', line])
 			elif any('{}' in arg for arg in argv):
 				commands.append([arg.replace('{}', line) for arg in argv])
 			else:
@@ -1755,6 +1796,9 @@ def _cli_commands(args):
 		for line in _read_input(path):
 			if line.strip() and not line.lstrip().startswith('#'):
 				commands.extend(expand(line))
+	if args.shell:
+		# filled templates are already argv lists that take their line as "$1"
+		commands = [_shell_argv(command) if isinstance(command, str) else command for command in commands]
 	return commands
 
 def main():
@@ -1799,7 +1843,7 @@ def main():
 		use_pty = args.pty if args.pty is not None else (_stdout_isatty() and not args.quiet and not args.dry_run)
 		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
 			quiet=args.quiet and not args.dry_run, dry_run=args.dry_run,
-			with_stdErr=True, return_object=True, shell=args.shell,
+			with_stdErr=True, return_object=True,
 			prefix=not args.no_prefix, color=False if args.no_color else None, pty=use_pty)
 	except (OSError, ValueError) as e:
 		print(f'mcmd: {e}', file=sys.stderr)

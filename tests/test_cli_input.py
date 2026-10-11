@@ -94,3 +94,16 @@ def test_missing_input_file_is_an_error(tmp_path):
 	proc = run_cli(['-f', str(tmp_path / 'nope.txt')])
 	assert proc.returncode == 2
 	assert 'nope.txt' in proc.stderr
+
+
+def test_arg_file_in_shell_mode_is_safe_when_the_template_quotes_the_placeholder(tmp_path):
+	# shell-quoting the line only protects an unquoted {}; inside "..." or '...' it must still be data
+	marker = tmp_path / 'pwned'
+	values = tmp_path / 'values.txt'
+	values.write_text(f"$(touch {marker})\nx'; touch {marker}; '\n")
+	for template in ('echo "{}"', "echo '{}'", 'echo {}'):
+		proc = run_cli(['--shell', '-a', str(values), template])
+		assert proc.returncode == 0, template
+		assert not marker.exists(), template
+		assert f'$(touch {marker})' in proc.stdout, template
+		assert f"x'; touch {marker}; '" in proc.stdout, template
