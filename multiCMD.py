@@ -120,6 +120,27 @@ stop={self.stop!r})"""
 			return None
 		return self.end_time - self.start_time
 
+class CommandError(Exception):
+	'''
+	Raised by run_command / run_commands with raise_error=True when commands fail
+
+	The message starts with "Commands failed" and lists each failed command with its return code
+	and last error line.
+	@attributes:
+		tasks: The failed Task objects ( list[Task] )
+	'''
+	def __init__(self, tasks, total=None):
+		self.tasks = list(tasks)
+		total = len(self.tasks) if total is None else total
+		lines = [f'Commands failed ({len(self.tasks)} of {total}):']
+		for task in self.tasks:
+			line = f'  [rc {task.returncode}] {_quote_command(task.command)}'
+			last = _last_output_line(task)
+			if last:
+				line += ': ' + last
+			lines.append(line)
+		super().__init__('\n'.join(lines))
+
 class _HeldPermit:
 	'''
 	Semaphore stand-in for a command whose permit the dispatcher already holds ( internal )
@@ -807,6 +828,22 @@ def _quote_command(command):
 		return command
 	return ' '.join(shlex.quote(str(arg)) for arg in command)
 
+def _last_output_line(task, limit=200):
+	'''
+	The last non-empty error line of a task, for messages ( internal )
+	In pty mode stderr is merged into stdout, so stdout is used instead.
+	@params:
+		task: The Task
+		limit: The longest line to return; longer ones are cut and end with '...'
+	@returns:
+		str: The line, or '' without one
+	'''
+	for line in reversed(task.stdout if task._pty else task.stderr):
+		line = line.strip()
+		if line:
+			return line if len(line) <= limit else line[:limit - 3] + '...'
+	return ''
+
 def _decor(index, width, prefix, color):
 	'''
 	The ( prefix, color start, color end ) a command's displayed lines get ( internal )
@@ -1486,11 +1523,16 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	use_pty = _resolve_pty(pty)
 	if not sem:
 		sem = threading.Semaphore(max_threads)  # Limit concurrent sessions
-	if use_sudo:
+	if use_sudo and not dry_run:
 		_validate_sudo()
-	if not wait_for_return:
+	if dry_run:
+		# nothing runs: show each command once, quoted so it can be pasted into a shell
+		if not quiet:
+			for task in tasks:
+				_display.message(_quote_command(task.command))
+	elif not wait_for_return:
 		__reap_finished_threads()
-		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,dry_run,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]
+		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,False,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]
 		# tracked before they start, so a thread is always registered before it reports itself finished
 		with __running_threads_lock:
 			__running_threads.update(threads)
@@ -1498,19 +1540,20 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task.thread = thread
 			thread.start()
 	elif max_threads > 1:
-		_run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty)
+		_run_pool(tasks, decors, sem, timeout, quiet, False, max_threads, use_pty)
 	else:
 		try:
 			for task, decor in zip(tasks, decors):
-				__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
+				__run_command(task, sem, timeout, quiet, False, decor=decor, use_pty=use_pty)
 		except KeyboardInterrupt:
 			_stop_tasks(tasks)
 			raise
 	# return the only the output for the tasks
 	if raise_error:
-		errors = [task for task in tasks if task.returncode != 0]
-		if errors:
-			raise Exception(f"Commands failed: {pformat(errors)}")
+		# dry-run and still-running commands have no return code yet: they did not fail
+		failed = [task for task in tasks if task.returncode not in (0, None)]
+		if failed:
+			raise CommandError(failed, total=len(tasks))
 	if return_code_only:
 		return [task.returncode for task in tasks]
 	elif return_object:
