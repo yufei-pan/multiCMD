@@ -15,13 +15,14 @@ SUDO_PATH=shutil.which('sudo')
 USE_SUDO=False
 _IS_POSIX=os.name=='posix'
 _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
-_PGROUP_EXEC="import os,sys\nos.setpgid(0,0)\ntry:\n\tos.execvp(sys.argv[1],sys.argv[1:])\nexcept FileNotFoundError as e:\n\tsys.stderr.write(str(e)+'\\n');sys.exit(127)\nexcept OSError as e:\n\tsys.stderr.write(str(e)+'\\n');sys.exit(126)\n"
+_PGROUP_EXEC="import os,signal,sys\nfor n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\nos.setpgid(0,0)\ntry:\n\tos.execvp(sys.argv[1],sys.argv[1:])\nexcept FileNotFoundError as e:\n\tsys.stderr.write(str(e)+'\\n');sys.exit(127)\nexcept OSError as e:\n\tsys.stderr.write(str(e)+'\\n');sys.exit(126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
 _live_procs={}
+_draining={}
 _live_procs_lock=threading.Lock()
 _PTY_WARNED=False
 class Task:
-	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False
+	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False;self._error=False
 	def __iter__(self):yield from(('command',self.command),('returncode',self.returncode),('stdout',self.stdout),('stderr',self.stderr))
 	def __repr__(self):return f"""Task(command={pformat(self.command)},
 returncode={self.returncode!r},
@@ -274,7 +275,7 @@ def _spawn(argv,stdout,stderr,env=None):
 	if not _IS_POSIX:return subprocess.Popen(argv,**kwargs),None
 	grouped=True
 	if _HAS_PROCESS_GROUP:kwargs['process_group']=0
-	elif sys.executable:
+	elif sys.executable and not getattr(sys,'frozen',False):
 		search_path=(env if env is not None else os.environ).get('PATH')
 		if os.sep not in argv[0]and shutil.which(argv[0],path=search_path)is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),argv[0])
 		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC]+list(argv)
@@ -344,9 +345,12 @@ def _kill_commands(commands,first_signal):
 	for(proc,pgid)in leftovers:_send(proc,pgid,signal.SIGKILL)
 	_wait_all(leftovers,1)
 def kill_all(sig=None):
-	with _live_procs_lock:commands=list(_live_procs.items())
+	with _live_procs_lock:commands=list(_live_procs.items())+list(_draining.items())
 	_kill_commands(commands,signal.SIGTERM if sig is None else sig)
-atexit.register(kill_all)
+def _kill_running_at_exit():
+	with _live_procs_lock:commands=list(_live_procs.items())
+	_kill_commands(commands,signal.SIGTERM)
+atexit.register(_kill_running_at_exit)
 def _resolve_pty(pty):
 	global _PTY_WARNED
 	if not pty:return False
@@ -375,6 +379,11 @@ def _join(thread,timeout=None):
 		step=.1 if deadline is None else min(.1,deadline-time.monotonic())
 		if step<=0:return
 		thread.join(step)
+def _drain(task,readers,timeout):
+	while any(reader.is_alive()for reader in readers):
+		if task.stop:return'stop'
+		if timeout>0 and time.monotonic()-task._last_output>timeout:return'timeout'
+		for reader in readers:reader.join(.05)
 def _join_readers(readers,limit):
 	deadline=None if limit is None else time.monotonic()+limit
 	for reader in readers:_join(reader,None if deadline is None else max(0,deadline-time.monotonic()))
@@ -395,12 +404,19 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	if reason=='timeout':task.stderr.append('Timeout!')
 	if reason is not None:_kill_commands([(proc,pgid)],signal.SIGINT)
 	_unregister(proc);task.returncode=proc.poll()
-	try:_join_readers(readers,None if reason is None else 1)
-	except KeyboardInterrupt:interrupted=True;_kill_commands([(proc,pgid)],signal.SIGINT);_join_readers(readers,1)
+	if reason is None:
+		with _live_procs_lock:_draining[proc]=pgid
+		try:reason=_drain(task,readers,timeout)
+		except KeyboardInterrupt:reason,interrupted='stop',True
+		finally:
+			with _live_procs_lock:_draining.pop(proc,None)
+		if reason=='timeout':task.stderr.append('Timeout!')
+		if reason is not None:_kill_commands([(proc,pgid)],signal.SIGINT)
+	_join_readers(readers,None if reason is None else 1)
 	if reason=='timeout':task.returncode=124
 	elif task.returncode is None:
 		if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
-		else:task.returncode=-1
+		else:task.returncode=-1;task._error=True
 	task.end_time=time.time();task._finalized=True
 	if interrupted:raise KeyboardInterrupt
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,decor=('','',''),use_pty=False):
@@ -414,7 +430,7 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 			_execute(task,timeout,quiet,decor,use_pty)
 		except FileNotFoundError as e:print(f"Command path not found: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=127
 		except PermissionError as e:print(f"Command cannot be executed: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=126
-		except Exception as e:import traceback;print(f"Error running command: {task.command}",file=sys.stderr,flush=True);print(str(e).split('\n'));task.stderr.extend(str(e).split('\n'));task.stderr.extend(traceback.format_exc().split('\n'));task.returncode=-1
+		except Exception as e:import traceback;print(f"Error running command: {task.command}",file=sys.stderr,flush=True);print(str(e).split('\n'));task.stderr.extend(str(e).split('\n'));task.stderr.extend(traceback.format_exc().split('\n'));task.returncode=-1;task._error=True
 		finally:task._finalized=True
 		if not quiet:_display.message('-'*100,decor);_display.message(f"Process exited with return code {task.returncode}",decor)
 		if with_stdErr:return task.stdout+task.stderr
@@ -505,8 +521,8 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 	try:
 		for thread in workers:_join(thread)
 	except KeyboardInterrupt:
-		_stop_tasks(tasks)
-		for thread in workers:_join(thread,5)
+		_stop_tasks(tasks);deadline=time.monotonic()+5
+		for thread in workers:_join(thread,max(0,deadline-time.monotonic()))
 		raise
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error,prefix=prefix,color=color,pty=pty,shell=shell)[0]
 def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False):
@@ -543,7 +559,7 @@ _EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\
 def _exit_status(tasks):
 	if len(tasks)==1:
 		returncode=tasks[0].returncode
-		if returncode is None:return 1
+		if returncode is None or tasks[0]._error:return 1
 		return 128-returncode if returncode<0 else returncode
 	return min(sum(1 for task in tasks if task.returncode not in(0,None)),101)
 def _install_cli_signal_handlers():
@@ -553,8 +569,10 @@ def _install_cli_signal_handlers():
 		if signum is not None and signal.getsignal(signum)!=signal.SIG_IGN:signal.signal(signum,handler)
 	for signum in _TTY_SIGNALS:signal.signal(signum,signal.SIG_IGN)
 _RETURNCODE_LABELS={124:'timeout',126:'cannot execute',127:'not found'}
-def _format_returncode(returncode):
+def _format_returncode(task):
+	returncode=task.returncode
 	if returncode is None:return'not run'
+	if task._error:return f"{returncode} (error)"
 	if returncode<0:
 		try:name=signal.Signals(-returncode).name
 		except ValueError:name=f"signal {-returncode}"
@@ -565,7 +583,7 @@ def _summary(tasks,show_all=False):
 	failed=[index for(index,task)in enumerate(tasks,1)if task.returncode not in(0,None)];rows=range(1,len(tasks)+1)if show_all else failed;table=''
 	if rows:
 		data=[['#','Command','Return code','Time']]
-		for index in rows:task=tasks[index-1];duration=task.duration;data.append([str(index),_quote_command(task.command),_format_returncode(task.returncode),'-'if duration is None else f"{duration:.2f}s"])
+		for index in rows:task=tasks[index-1];duration=task.duration;data.append([str(index),_quote_command(task.command),_format_returncode(task),'-'if duration is None else f"{duration:.2f}s"])
 		table=pretty_format_table(data)
 	if failed:tally=f"{len(tasks)} commands: {len(tasks)-len(failed)} succeeded, {len(failed)} failed"
 	else:tally=f"{len(tasks)} commands: all succeeded"
@@ -594,6 +612,8 @@ def _cli_commands(args):
 	for path in args.file or[]:
 		for line in _read_input(path):
 			if line.strip()and not line.lstrip().startswith('#'):commands.extend(expand(line))
+	for command in commands:
+		if isinstance(command,str)and not command.strip():raise ValueError('empty command')
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
@@ -605,7 +625,7 @@ def main():
 	try:
 		commands=_cli_commands(args)
 		if not commands:print('mcmd: no commands to run',file=sys.stderr);return 2
-		use_pty=args.pty if args.pty is not None else _stdout_isatty()and not args.quiet and not args.dry_run;tasks=run_commands(commands,timeout=args.timeout,max_threads=args.max_threads,quiet=args.quiet and not args.dry_run,dry_run=args.dry_run,with_stdErr=True,return_object=True,prefix=not args.no_prefix,color=False if args.no_color else None,pty=use_pty)
+		use_pty=args.pty if args.pty is not None else _IS_POSIX and _stdout_isatty()and not args.quiet and not args.dry_run;tasks=run_commands(commands,timeout=args.timeout,max_threads=args.max_threads,quiet=args.quiet and not args.dry_run,dry_run=args.dry_run,with_stdErr=True,return_object=True,prefix=not args.no_prefix,color=False if args.no_color else None,pty=use_pty)
 	except(OSError,ValueError)as e:print(f"mcmd: {e}",file=sys.stderr);return 2
 	except KeyboardInterrupt:print('\nInterrupted',file=sys.stderr);return 130
 	if args.dry_run:return 0
