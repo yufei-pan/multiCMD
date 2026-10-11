@@ -74,6 +74,12 @@ class Task:
 		self.stderr = []
 		self.thread = None
 		self.stop = False
+		# monotonic time of the latest output; drives the inactivity timeout
+		self._last_output = None
+		# set once the command is done with; readers still draining after a kill stop recording
+		self._finalized = False
+		# whether stdout and stderr were merged into one pty
+		self._pty = False
 
 	def __iter__(self):
 		yield from (
@@ -585,6 +591,102 @@ def __handle_stream(stream,target,pre='',post='',quiet=False):
 			current_line.extend(char)
 	if current_line:
 		add_line(current_line,target, keepLastLine=lastLineCommited)
+
+def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
+	'''
+	Read one output stream of a command into target, showing complete lines live ( internal )
+
+	A '\n' ends a line. A '\r' ends a line that the next line replaces, like a terminal does, both
+	in target and on screen. Chunks without '\r' are split in one pass; chunks with '\r' are
+	handled separator by separator. Every chunk refreshes task._last_output, which drives the
+	inactivity timeout. Once the task is finalized the reader keeps draining but records nothing.
+	The reader closes its stream when done.
+
+	@params:
+		stream: The binary stream to read ( a pipe, or a pty master )
+		target: The list the lines go into ( task.stdout or task.stderr )
+		task: The Task the stream belongs to
+		decor: ( prefix, color start, color end ) for displayed lines
+		quiet: Whether to skip showing the lines
+	'''
+	def emit(lines, replace_first, ends_with_cr):
+		if task._finalized:
+			return
+		texts = [line.decode('utf-8', errors='backslashreplace') for line in lines]
+		if replace_first:
+			target.pop()
+		target.extend(texts)
+		if not quiet:
+			_display.lines(texts, decor, replace_first, ends_with_cr)
+	def settle():
+		# a '\n' right after '\r' ( a CRLF ending ): the redrawn line is complete, nothing may overwrite it now
+		if not quiet and not task._finalized:
+			_display.settle()
+	# bytearray: a long line arriving in many small chunks grows in linear time
+	current = bytearray()
+	committed = True
+	try:
+		while True:
+			try:
+				chunk = stream.read1(65536)
+			except OSError as e:
+				# a pty master reports EIO once the command's side is closed
+				if e.errno == errno.EIO:
+					break
+				raise
+			if not chunk:
+				break
+			task._last_output = time.monotonic()
+			if b'\r' not in chunk:
+				# fast path: split the whole chunk in one pass
+				parts = chunk.split(b'\n')
+				if len(parts) == 1:
+					current += chunk
+					continue
+				parts[0] = bytes(current) + parts[0]
+				current = bytearray(parts.pop())
+				if committed:
+					emit(parts, False, False)
+				elif parts[0]:
+					# completes the line that '\r' updates were redrawing
+					emit(parts, True, False)
+				else:
+					settle()
+					if len(parts) > 1:
+						emit(parts[1:], False, False)
+				committed = True
+				continue
+			# a chunk with '\r': handle it separator by separator
+			pos = 0
+			size = len(chunk)
+			while pos < size:
+				newline = chunk.find(b'\n', pos)
+				carriage = chunk.find(b'\r', pos)
+				end = newline if carriage < 0 or 0 <= newline < carriage else carriage
+				if end < 0:
+					current += chunk[pos:]
+					break
+				current += chunk[pos:end]
+				if chunk[end] == 10:  # '\n'
+					if not committed and current:
+						emit([bytes(current)], True, False)
+					elif committed:
+						emit([bytes(current)], False, False)
+					else:
+						settle()
+					committed = True
+				else:  # '\r'
+					emit([bytes(current)], not committed, True)
+					committed = False
+				current = bytearray()
+				pos = end + 1
+		if current:
+			emit([bytes(current)], not committed, False)
+	finally:
+		try:
+			stream.close()
+		except Exception:
+			pass
 
 def int_to_color(hash_value, min_brightness=100,max_brightness=220):
 	'''
