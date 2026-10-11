@@ -217,7 +217,7 @@ class _Display:
 _display = _Display()
 
 class AsyncExecutor:
-	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False):
+	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False):
 		'''
 		AsyncExecutor class to run commands in parallel asynchronously
 
@@ -229,10 +229,14 @@ class AsyncExecutor:
 		@params:
 			max_threads: The maximum number of threads to use ( int ) ( Note: if passing semaphore, this likely will be ignored )
 			semaphore: The semaphore to use for threading ( threading.Semaphore )
-			timeout: The timeout for each command ( int )
+			timeout: The inactivity timeout for each command, in seconds ( 0: none ). Not a limit for wait() / join()
 			quiet: Whether to suppress output ( bool )
 			dry_run: Whether to simulate running the commands ( bool )
 			parse: Whether to parse ranged input ( bool )
+			shell: Whether to run commands through the system shell ( bool )
+			prefix: Whether to prefix output lines with [#] when commands can run at once ( bool )
+			color: Whether to color output lines per command ( None: only on a terminal without NO_COLOR )
+			pty: Whether commands write to a pseudo-terminal ( bool, POSIX only )
 		'''
 		self.max_threads = max_threads
 		if semaphore is ...:
@@ -243,8 +247,12 @@ class AsyncExecutor:
 		self.quiet = quiet
 		self.dry_run = dry_run
 		self.parse = parse
+		self.shell = shell
+		self.prefix = prefix
+		self.color = color
+		self.pty = pty
 		self._lock = threading.Lock()
-		# (task, sem, timeout, quiet, dry_run) waiting for a permit
+		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
 		self._dispatching = False
 		# started threads not yet joined, in start order ( dict used as an ordered set )
@@ -324,7 +332,7 @@ class AsyncExecutor:
 					if not self._queue:
 						self._dispatching = False
 						break
-					task, sem, timeout, quiet, dry_run = self._queue.popleft()
+					task, sem, timeout, quiet, dry_run, decor, use_pty = self._queue.popleft()
 				# wait for a permit, but give up on a command that gets stopped meanwhile
 				acquired = False
 				while not task.stop and not acquired:
@@ -335,7 +343,7 @@ class AsyncExecutor:
 					continue
 				self._reap()
 				try:
-					self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished), task)
+					self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished, decor, use_pty), task)
 				except BaseException:
 					sem.release()
 					raise
@@ -347,17 +355,21 @@ class AsyncExecutor:
 		finally:
 			self._finished.append((threading.current_thread(), None))
 
-	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
+	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...):
 		'''
 		Run multiple commands in parallel asynchronously. Returns right away, the commands are queued
 		@params:
 			commands: A list of commands to run ( list[str] | list[list[str]] )
-			timeout: The timeout for each command to override the object default
+			timeout: The inactivity timeout for each command to override the object default
 			max_threads: The maximum number of threads to use to override the object default
 			quiet: Whether to suppress output to override the object default
 			dry_run: Whether to simulate running the commands to override the object default
 			parse: Whether to parse ranged input to override the object default
 			sem: The semaphore to use for threading to override the object default
+			shell: Whether to run commands through the system shell to override the object default
+			prefix: Whether to prefix output lines with [#] to override the object default
+			color: Whether to color output lines to override the object default
+			pty: Whether commands write to a pseudo-terminal to override the object default
 		@returns:
 			list: The Task Object of the commands ( list[Task] )
 		'''
@@ -373,15 +385,30 @@ class AsyncExecutor:
 			parse = self.parse
 		if sem is ...:
 			sem = self.semaphore
-		taskObjects, use_sudo = _build_tasks(commands, parse=parse)
+		if shell is ...:
+			shell = self.shell
+		if prefix is ...:
+			prefix = self.prefix
+		if color is ...:
+			color = self.color
+		if pty is ...:
+			pty = self.pty
+		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell)
 		if not sem:
 			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
-		if use_sudo:
+		if use_sudo and not dry_run:
 			_validate_sudo()
+		# the executor's task list keeps growing, so commands count as concurrent whenever max_threads allows it
+		concurrent = max_threads != 1
+		use_color = _resolve_color(color, concurrent)
+		use_pty = _resolve_pty(pty)
 		self._reap()
 		with self._lock:
+			first = len(self.tasks) + 1
+			queued = [(task, sem, timeout, quiet, dry_run, _decor(first + i, 0, prefix and concurrent, use_color), use_pty)
+				for i, task in enumerate(taskObjects)]
 			self.tasks.extend(taskObjects)
-			self._queue.extend((task, sem, timeout, quiet, dry_run) for task in taskObjects)
+			self._queue.extend(queued)
 			start_dispatcher = not self._dispatching and bool(self._queue)
 			if start_dispatcher:
 				# only the dispatcher clears this, under the lock, once it sees the queue empty
@@ -395,52 +422,50 @@ class AsyncExecutor:
 				raise
 		return taskObjects
 	
-	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...):
+	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...):
 		'''
 		Run a command in parallel asynchronously
 		@params:
 			command: The command to run ( str | list[str] )
-			timeout: The timeout for each command to override the object default
-			max_threads: The maximum number of threads to use to override the object default
-			quiet: Whether to suppress output to override the object default
-			dry_run: Whether to simulate running the commands to override the object default
-			parse: Whether to parse ranged input to override the object default
-			sem: The semaphore to use for threading to override the object default
+			( the other parameters override the object defaults, as in run_commands )
 		@returns:
 			Task: The Task Object of the command
 		'''
-		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem)[0]
+		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem,shell=shell,prefix=prefix,color=color,pty=pty)[0]
 	
-	def wait(self, timeout=..., threads = ...):
+	def wait(self, timeout=None, threads = ...):
 		'''
-		Wait for the threads to finish
+		Wait for the commands to finish
 		@params:
-			timeout: The timeout for each thread to override the object default ( negative waits forever )
+			timeout: The longest to wait in total, in seconds ( None or negative: until everything is done )
 			threads: The threads to join, default to all running threads managed by this object,
 				including the ones the dispatcher starts while waiting
 		@returns:
-			list[threading.Thread]: The list of running threads that are still running
+			list[threading.Thread]: The threads that are still running
 		'''
-		if timeout is ...:
-			timeout = self.timeout
-		while True:
-			pending = self.runningThreads if threads is ... else list(threads)
-			for thread in pending:
-				if timeout >= 0:
-					thread.join(timeout=timeout)
-				else:
-					thread.join()
-			# once a pass finishes every thread, look again for commands the dispatcher started meanwhile
-			if threads is not ... or not pending or any(thread.is_alive() for thread in pending):
-				break
+		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+		try:
+			while True:
+				pending = self.runningThreads if threads is ... else list(threads)
+				for thread in pending:
+					_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
+				# once a pass finishes every thread, look again for commands the dispatcher started meanwhile
+				if threads is not ... or not pending or any(thread.is_alive() for thread in pending):
+					break
+		except KeyboardInterrupt:
+			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
+			for task in self.tasks:
+				task.stop = True
+			self.wait(timeout=5)
+			raise
 		return self.runningThreads
 	
-	def stop(self,timeout=...):
+	def stop(self,timeout=None):
 		'''
-		Stop all running threads. This signals all threads to stop and joins them.
-		Commands still queued are skipped: they keep task.thread None and returncode None
+		Stop all commands: running ones are killed with everything they started, queued ones are
+		skipped ( they keep task.thread None and returncode None ). Then wait for them.
 		@params:
-			None
+			timeout: The longest to wait in total, in seconds ( None or negative: until everything is done )
 		@returns:
 			list[Task]: The list of tasks that are managed by this object
 		'''
@@ -449,11 +474,11 @@ class AsyncExecutor:
 		self.wait(timeout)
 		return self.tasks
 	
-	def cleanup(self,timeout=...):
+	def cleanup(self,timeout=None):
 		'''
 		Cleanup the tasks and threads. This calls stop() and clears the tasks and threads
 		@params:
-			None
+			timeout: The longest to wait in total, in seconds ( None or negative: until everything is done )
 		@returns:
 			list[Task]: The list of tasks that are managed by this object
 		'''
@@ -464,23 +489,30 @@ class AsyncExecutor:
 			self._threads.clear()
 		return self.tasks
 	
-	def join(self, timeout=..., threads = ..., print_error=True):
+	def join(self, timeout=None, threads = ..., print_error=True):
 		'''
-		Wait for the threads to finish and print error if there is any
+		Wait for the commands to finish and report the ones that did not succeed
 		@params:
-			timeout: The timeout for each command to override the object default
+			timeout: The longest to wait in total, in seconds ( None or negative: until everything is done )
 			threads: The threads to wait for, default to all running threads managed by this object
+			print_error: Whether to print failed, skipped and still running commands
 		@returns:
 			list[Task]: The list of tasks that are managed by this object
 		'''
 		self.wait(timeout=timeout, threads=threads)
-		for task in self.tasks:
-			if task.returncode != 0 and print_error:
-				print(f'Command: {task.command} failed with return code: {task.returncode}')
-				print('Stdout:')
-				print('\n  '.join(task.stdout))
-				print('Stderr:')
-				print('\n  '.join(task.stderr))
+		if print_error:
+			for task in self.tasks:
+				if not task._finalized:
+					if task.stop and task.thread is None:
+						print(f'Command: {task.command} skipped: stopped before it started')
+					else:
+						print(f'Command: {task.command} still running')
+				elif task.returncode not in (0, None):
+					print(f'Command: {task.command} failed with return code: {task.returncode}')
+					print('Stdout:')
+					print('\n  '.join(task.stdout))
+					print('Stderr:')
+					print('\n  '.join(task.stderr))
 		return self.tasks
 	
 	def get_results(self, with_stdErr=False):

@@ -1,3 +1,4 @@
+import _thread
 import os
 import threading
 import time
@@ -182,3 +183,69 @@ def test_failed_thread_start_keeps_executor_usable(monkeypatch):
 	tasks = ex.run_commands([['true'], ['true']])
 	ex.wait(timeout=-1)
 	assert [task.returncode for task in tasks] == [0, 0]
+
+
+@pytest.mark.slow
+def test_join_waits_by_default(capsys):
+	ex = AsyncExecutor(max_threads=2)
+	ex.run_commands([['sleep', '0.5'], ['true']])
+	start = time.monotonic()
+	tasks = ex.join()
+	assert time.monotonic() - start >= 0.4
+	assert [task.returncode for task in tasks] == [0, 0]
+	assert 'failed' not in capsys.readouterr().out
+
+
+@pytest.mark.slow
+def test_wait_timeout_is_one_overall_limit():
+	ex = AsyncExecutor(max_threads=3)
+	ex.run_commands([['sleep', '3']] * 3)
+	start = time.monotonic()
+	still_running = ex.wait(timeout=0.5)
+	assert time.monotonic() - start < 1.2
+	assert still_running
+	ex.stop()
+
+
+@pytest.mark.slow
+def test_join_reports_failed_skipped_and_still_running(capsys):
+	ex = AsyncExecutor(max_threads=1)
+	ex.run_commands([['false']])
+	ex.wait()
+	running, queued = ex.run_commands([['sleep', '5'], ['true']])
+	queued.stop = True
+	ex.join(timeout=0.3)
+	out = capsys.readouterr().out
+	assert "Command: ['false'] failed with return code: 1" in out
+	assert "Command: ['sleep', '5'] still running" in out
+	assert "Command: ['true'] skipped: stopped before it started" in out
+	ex.stop()
+
+
+@pytest.mark.slow
+def test_ctrl_c_during_wait_stops_the_executors_commands():
+	ex = AsyncExecutor(max_threads=1)
+	task = ex.run_command(['sleep', '30'])
+	timer = threading.Timer(0.5, _thread.interrupt_main)
+	timer.start()
+	start = time.monotonic()
+	with pytest.raises(KeyboardInterrupt):
+		ex.wait()
+	assert time.monotonic() - start < 4
+	assert task.returncode is not None
+
+
+def test_executor_shell_prefix_and_color(capsys):
+	ex = AsyncExecutor(max_threads=2, quiet=False, shell=True, prefix=True, color=True)
+	ex.run_commands(['echo abc | tr a x', 'echo two'])
+	ex.wait()
+	out = capsys.readouterr().out
+	assert '[1] ' in out and '[2] ' in out and 'xbc' in out
+	assert '\x1b[38;2;' in out
+
+
+def test_executor_dry_run_prints_the_quoted_command(capsys):
+	ex = AsyncExecutor(quiet=False, dry_run=True)
+	ex.run_command(['echo', 'a b'])
+	ex.wait()
+	assert capsys.readouterr().out == "echo 'a b'\n"
