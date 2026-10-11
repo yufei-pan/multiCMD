@@ -1456,12 +1456,14 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 	@returns:
 		None | int | list[str] | Task: The output of the command
 	'''
+	# Windows ping counts with -n
+	count = '-c' if _IS_POSIX else '-n'
 	single_host = False
 	if isinstance(hosts,str):
-		commands = [f'ping -c 1 {hosts}']
+		commands = [f'ping {count} 1 {hosts}']
 		single_host = True
 	else:
-		commands = [f'ping -c 1 {host}' for host in hosts]
+		commands = [f'ping {count} 1 {host}' for host in hosts]
 	if return_true_false:
 		return_code_only = True
 	results = run_commands(commands, timeout=timeout, max_threads=max_threads, quiet=quiet,
@@ -1872,10 +1874,18 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	"""
 	# Print the initial prompt with the countdown
 	print(f"{prompt} [{timeout}s]: ", end='', flush=True)
+	# select() cannot watch stdin on Windows; msvcrt can tell whether a key is waiting
+	try:
+		import msvcrt
+	except ImportError:
+		msvcrt = None
 	# Loop until the timeout
 	for remaining in range(timeout, 0, -1):
 		# If there is an input, return it
-		if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+		if msvcrt is not None:
+			if msvcrt.kbhit():
+				return input().strip()
+		elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
 			return input().strip()
 		# Print the remaining time
 		print(f"\r{prompt} [{remaining}s]: ", end='', flush=True)
