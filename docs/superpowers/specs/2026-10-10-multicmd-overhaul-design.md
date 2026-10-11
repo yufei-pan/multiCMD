@@ -120,6 +120,7 @@ On Windows: `proc.terminate()`, wait 1s, then `proc.kill()`.
 - **CLI:**
   - On `KeyboardInterrupt`, the commands are already killed by the rule above; print `Interrupted` to stderr and exit 130.
   - The CLI also installs handlers for **SIGTERM** and **SIGHUP** that call `kill_all()` and exit 128+N. Without them, `timeout 10 mcmd …` or a closed SSH session would leave the commands running, since they are no longer in mcmd's process group. This extends #3 beyond what was discussed item by item, and is flagged for review.
+  - A signal mcmd was started with *ignored* keeps being ignored: no handler is installed for it. `nohup mcmd … &` leaves SIGHUP ignored, and its commands must keep running when the session drops, as they do in 1.51.
 - The library never installs signal handlers.
 
 ### `--sudo` validation
