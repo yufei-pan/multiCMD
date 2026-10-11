@@ -86,7 +86,7 @@ One internal function, `_spawn(argv, *, stdout, stderr, env=None)`, creates ever
 | POSIX, Python < 3.11 | `Popen([sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, *argv], ...)`: the wrapper calls `os.setpgid(0, 0)`, then `os.execvp(argv[0], argv)`. `FileNotFoundError` → message on stderr, exit 127. Other `OSError` → message, exit 126. Measured cost: about 5 ms per spawn on 3.9. If `sys.executable` is empty, fall back to a plain `Popen` with no group (today's behaviour). |
 | Windows | Plain `Popen`, no group |
 
-**TTY protection (POSIX).** Around the `Popen` call, the spawning thread blocks `SIGTTIN` and `SIGTTOU` with `signal.pthread_sigmask` and restores its mask afterwards. Children inherit the blocked mask, so a background-group read of `/dev/tty` fails with `EIO` instead of stopping the process. Verified on 3.9 (wrapper) and 3.13 (`process_group`). This covers grandchildren too, because the mask is inherited across `fork`/`exec`.
+**TTY protection (POSIX).** Around the `Popen` call, the spawning thread blocks `SIGTTIN` and `SIGTTOU` with `signal.pthread_sigmask` and restores its mask afterwards. Children inherit the blocked mask, so a background-group read of `/dev/tty` fails with `EIO` instead of stopping the process. Verified on 3.9 (wrapper) and 3.13 (`process_group`). This covers grandchildren too, because the mask is inherited across `fork`/`exec`. *Amended during implementation:* `dash` clears the signal mask before it execs a command, so the mask alone doesn't protect a child started by `sh -c` on Debian/Ubuntu. The CLI therefore also sets SIGTTIN/SIGTTOU to *ignored* in its own process, which survives exec and every shell. The library keeps the mask only, since it may not change a host program's signal dispositions.
 
 All commands keep `stdin=DEVNULL`, as today.
 
@@ -299,7 +299,7 @@ mcmd [-h] [-p] [-t SECONDS] [-m N] [--sudo] [-q] [-n] [--shell]
 - **Validation:** `-f -` and `-a -` together is a usage error (exit 2). No commands at all is a usage error (exit 2). The positional `nargs` changes from `+` to `*`.
 - **`{}` substitution:**
   - Happens *after* splitting, per argument (`arg.replace('{}', line)`), so an input line is always exactly one argument, even with spaces. `--file={}` works.
-  - In `--shell` mode, `shlex.quote(line)` is substituted into the template string.
+  - In `--shell` mode the line is never put into the shell code. It's passed as `"$1"` to `/bin/sh -c`, and each `{}` is rewritten to fit its quoting context (unquoted `"$1"`, `$1` inside double quotes, `'"$1"'` inside single quotes). *Amended during implementation:* splicing `shlex.quote(line)` into the template was injectable whenever the template quoted `{}`. On Windows, shell mode needs a command string, and `-a` with `--shell` is refused.
   - A template without `{}` gets the line appended as a final argument (GNU parallel style).
 - **With `-p`:** the template is range-expanded first. Input lines are data and are never range-expanded.
 - **Input lines:** only the trailing newline is stripped, and blank lines are skipped. `#` isn't special in `-a` input.
