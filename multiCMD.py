@@ -27,7 +27,7 @@ import time
 from pprint import pformat
 
 #%% global vars
-version = '1.51'
+version = '1.52'
 __version__ = version
 COMMIT_DATE = '2026-10-10'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on
