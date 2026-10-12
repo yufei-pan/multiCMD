@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse,atexit,collections,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time
 from pprint import pformat
-version='1.52'
+version='1.53'
 __version__=version
-COMMIT_DATE='2026-10-10'
+COMMIT_DATE='2026-10-11'
 __running_threads=set()
 __running_threads_lock=threading.Lock()
 __finished_threads=collections.deque()
@@ -641,7 +641,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 		elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
 		print(f"\r{prompt} [{remaining}s]: ",end='',flush=True);time.sleep(1)
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
-	import re;version=1.2;_=version
+	import re,unicodedata;version=1.21;_=version
 	if not data:return''
 	if isinstance(data,str):data=data.strip('\n').split('\n');data=[line.split(delimiter)for line in data]
 	elif isinstance(data,dict):
@@ -657,26 +657,39 @@ def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_
 	data=[[str(item)for item in row]for row in data]
 	if isinstance(header,str):header=header.split(delimiter)
 	if not header or not any(header):header=data[0];data=data[1:]
-	num_cols=len(header)
-	def visible_len(s):return len(re.sub('\\x1b\\[[0-?]*[ -/]*[@-~]','',s))
-	col_widths=[0]*num_cols;data_invisible_length=[]
+	num_cols=len(header);ansi=re.compile('(\\x1b\\[[0-?]*[ -/]*[@-~])')
+	def char_width(ch):
+		if ch<'̀':return 1
+		if unicodedata.combining(ch)or unicodedata.category(ch)in('Mn','Me','Cf')or'ᅠ'<=ch<='ᇿ':return 0
+		return 2 if unicodedata.east_asian_width(ch)in('W','F')else 1
+	def visible_len(s):
+		if'\x1b'in s:s=ansi.sub('',s)
+		if not s or max(s)<'̀':return len(s)
+		return sum(char_width(ch)for ch in s)
+	def pad(s,width):return s+' '*(width-visible_len(s))
+	def cut(s,width):
+		used,out=0,[]
+		for(i,piece)in enumerate(ansi.split(s)):
+			if i%2:out.append(piece);continue
+			for ch in piece:
+				w=char_width(ch)
+				if used+w>width:width=-1;break
+				out.append(ch);used+=w
+		return''.join(out)
+	col_widths=[0]*num_cols
 	for row in data:
-		dil=[]
-		for(item,col_width,cwi)in zip(row,col_widths,range(num_cols)):
+		for(cwi,item)in enumerate(row[:num_cols]):
 			vl=visible_len(item)
-			if vl>col_width:col_widths[cwi]=vl
-			dil.append(len(item)-vl)
-		data_invisible_length.append(dil)
+			if vl>col_widths[cwi]:col_widths[cwi]=vl
 	cols_to_remove=[]
 	if remove_empty_columns and not full:cols_to_remove=[i for(i,col_width)in enumerate(col_widths)if col_width==0];header=[item for(i,item)in enumerate(header)if i not in cols_to_remove];col_widths=[w for(i,w)in enumerate(col_widths)if i not in cols_to_remove];num_cols=len(header)
-	header_widths=[visible_len(h)for h in header];col_widths=[max(w,hw)for(w,hw)in zip(col_widths,header_widths)];header=[item.ljust(col_width+len(item)-visible_len(item))for(item,col_width)in zip(header,col_widths)];normalized_padded_data=[];new_data_invisible_length=[]
-	for(row,invisible_lengths)in zip(data,data_invisible_length):
-		if cols_to_remove:row=[item for(i,item)in enumerate(row)if i not in cols_to_remove];invisible_lengths=[il for(i,il)in enumerate(invisible_lengths)if i not in cols_to_remove]
+	header_widths=[visible_len(h)for h in header];col_widths=[max(w,hw)for(w,hw)in zip(col_widths,header_widths)];header=[pad(item,col_width)for(item,col_width)in zip(header,col_widths)];normalized_padded_data=[]
+	for row in data:
+		if cols_to_remove:row=[item for(i,item)in enumerate(row)if i not in cols_to_remove]
 		if not any(row):row=['-'*col_width for col_width in col_widths]
-		elif len(row)<num_cols:row=[row[i].ljust(col_widths[i]+invisible_lengths[i])if i<len(row)else''.ljust(col_widths[i])for i in range(num_cols)]
-		elif len(row)>=num_cols:row=[item.ljust(col_width+invisible_length)for(item,col_width,invisible_length)in zip(row,col_widths,invisible_lengths)]
-		normalized_padded_data.append(row);new_data_invisible_length.append(invisible_lengths)
-	data=normalized_padded_data;data_invisible_length=new_data_invisible_length;column_separator=' | ';horizontal_separator='-+-';terminal_width=get_terminal_size()[0]
+		else:row=[pad(row[i]if i<len(row)else'',col_widths[i])for i in range(num_cols)]
+		normalized_padded_data.append(row)
+	data=normalized_padded_data;column_separator=' | ';horizontal_separator='-+-';terminal_width=get_terminal_size()[0]
 	def table_width(col_widths,sep_len):return sum(col_widths)+sep_len*(len(col_widths)-1)
 	def render(header,rows,column_widths,column_separator,horizontal_separator):return'\n'.join([column_separator.join(header),horizontal_separator.join('-'*width for width in column_widths),*(column_separator.join(row)for row in rows)])+'\n'
 	if full or table_width(col_widths,len(column_separator))<=terminal_width:return render(header,data,col_widths,column_separator,horizontal_separator)
@@ -687,16 +700,13 @@ def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_
 		if total_overflow_width<=0:break
 		if diff<=0:continue
 		reduce_by=min(diff,total_overflow_width);col_widths[i]-=reduce_by;total_overflow_width-=reduce_by
-	def truncate_to_width(string,width,invisible_length):
-		s_len=len(string)-invisible_length
-		if s_len<=width:return string
-		rstripedSize=len(string.rstrip())-invisible_length
-		if rstripedSize<=width:return string[:width+invisible_length]
-		if width<2:
-			if width<1:return''
-			else:return'.'
-		return string[:width+invisible_length-2]+'..'
-	data=[[truncate_to_width(item,col_width,invisible_length)for(item,col_width,invisible_length)in zip(row,col_widths,dil)]for(row,dil)in zip(data,data_invisible_length)];header=[item[:col_width]for(item,col_width)in zip(header,col_widths)];return render(header,data,col_widths,column_separator,horizontal_separator)
+	def truncate_to_width(string,width):
+		if visible_len(string)<=width:return string
+		stripped=string.rstrip()
+		if visible_len(stripped)<=width:return pad(stripped,width)
+		if width<2:return'.'[:width]
+		return pad(cut(string,width-2)+'..',width)
+	data=[[truncate_to_width(item,col_width)for(item,col_width)in zip(row,col_widths)]for row in data];header=[truncate_to_width(item,col_width)for(item,col_width)in zip(header,col_widths)];return render(header,data,col_widths,column_separator,horizontal_separator)
 def parseTable(data,sort=False,min_space=2):
 	if isinstance(data,str):data=data.strip('\n').split('\n')
 	header_line=data[0];pattern='(\\S(?:.*?\\S)?)(?=\\s{'+str(min_space)+',}|\\s*$)';matches=list(re.finditer(pattern,header_line));data_list=[[]];columns=[]
