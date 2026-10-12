@@ -1954,7 +1954,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 
 def pretty_format_table(data, delimiter=None, header=None, full=False, remove_empty_columns=False):
 	import re
-	version = 1.20
+	import unicodedata
+	version = 1.21
 	_ = version
 	if not data:
 		return ""
@@ -1984,19 +1985,44 @@ def pretty_format_table(data, delimiter=None, header=None, full=False, remove_em
 		header = data[0]
 		data = data[1:]
 	num_cols = len(header)
+	# Widths count terminal columns: an East Asian wide character takes two,
+	# a combining mark and an ANSI color code none.
+	ansi = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
+	def char_width(ch):
+		if ch < "\u0300":  # ASCII and Latin-1
+			return 1
+		if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf") or "\u1160" <= ch <= "\u11ff":
+			return 0
+		return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 	def visible_len(s):
-		return len(re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", s))
-	# Ensure all rows have the same number of columns
+		if "\x1b" in s:
+			s = ansi.sub("", s)
+		if not s or max(s) < "\u0300":
+			return len(s)
+		return sum(char_width(ch) for ch in s)
+	def pad(s, width):
+		return s + " " * (width - visible_len(s))
+	def cut(s, width):
+		# The characters that fit in ``width`` columns, and every color code.
+		used, out = 0, []
+		for i, piece in enumerate(ansi.split(s)):
+			if i % 2:
+				out.append(piece)
+				continue
+			for ch in piece:
+				w = char_width(ch)
+				if used + w > width:
+					width = -1  # full: no further characters
+					break
+				out.append(ch)
+				used += w
+		return "".join(out)
 	col_widths = [0] * num_cols
-	data_invisible_length = []
 	for row in data:
-		dil = []
-		for item, col_width, cwi in zip(row, col_widths, range(num_cols)):
+		for cwi, item in enumerate(row[:num_cols]):
 			vl = visible_len(item)
-			if vl > col_width:
+			if vl > col_widths[cwi]:
 				col_widths[cwi] = vl
-			dil.append(len(item) - vl)
-		data_invisible_length.append(dil)
 	cols_to_remove = []
 	if remove_empty_columns and not full:
 		cols_to_remove = [i for i, col_width in enumerate(col_widths) if col_width == 0]
@@ -2005,24 +2031,17 @@ def pretty_format_table(data, delimiter=None, header=None, full=False, remove_em
 		num_cols = len(header)
 	header_widths = [visible_len(h) for h in header]
 	col_widths = [max(w, hw) for w, hw in zip(col_widths, header_widths)]
-	header = [item.ljust(col_width + len(item) - visible_len(item)) for item, col_width in zip(header, col_widths)]
+	header = [pad(item, col_width) for item, col_width in zip(header, col_widths)]
 	normalized_padded_data = []
-	new_data_invisible_length = []
-	for row, invisible_lengths in zip(data, data_invisible_length):
+	for row in data:
 		if cols_to_remove:
 			row = [item for i, item in enumerate(row) if i not in cols_to_remove]
-			invisible_lengths = [il for i, il in enumerate(invisible_lengths) if i not in cols_to_remove]
 		if not any(row):
 			row = ['-' * col_width for col_width in col_widths]
-		elif len(row) < num_cols:
-			row = [row[i].ljust(col_widths[i] + invisible_lengths[i]) if i < len(row) else "".ljust(col_widths[i]) for i in range(num_cols)]
-		elif len(row) >= num_cols:
-			#row = row[:num_cols]
-			row = [item.ljust(col_width + invisible_length) for item, col_width, invisible_length in zip(row, col_widths, invisible_lengths)]
+		else:
+			row = [pad(row[i] if i < len(row) else "", col_widths[i]) for i in range(num_cols)]
 		normalized_padded_data.append(row)
-		new_data_invisible_length.append(invisible_lengths)
 	data = normalized_padded_data
-	data_invisible_length = new_data_invisible_length
 	column_separator = " | "
 	horizontal_separator = "-+-"
 	terminal_width = get_terminal_size()[0]
@@ -2053,24 +2072,17 @@ def pretty_format_table(data, delimiter=None, header=None, full=False, remove_em
 		reduce_by = min(diff, total_overflow_width)
 		col_widths[i] -= reduce_by
 		total_overflow_width -= reduce_by
-	def truncate_to_width(string, width,invisible_length):
-		s_len = len(string) - invisible_length
-		if s_len <= width:
+	def truncate_to_width(string, width):
+		if visible_len(string) <= width:
 			return string
-		rstripedSize = len(string.rstrip()) - invisible_length
-		if rstripedSize <= width:
-			return string[:width + invisible_length]
+		stripped = string.rstrip()
+		if visible_len(stripped) <= width:
+			return pad(stripped, width)
 		if width < 2:
-			if width < 1:
-				return ""
-			else:
-				return '.'
-		return string[: width + invisible_length - 2] + ".."
-	data = [
-		[truncate_to_width(item, col_width, invisible_length) for item, col_width, invisible_length in zip(row, col_widths, dil)]
-		for row, dil in zip(data, data_invisible_length)
-	]
-	header = [item[:col_width] for item, col_width in zip(header, col_widths)]
+			return "."[:width]
+		return pad(cut(string, width - 2) + "..", width)
+	data = [[truncate_to_width(item, col_width) for item, col_width in zip(row, col_widths)] for row in data]
+	header = [truncate_to_width(item, col_width) for item, col_width in zip(header, col_widths)]
 	return render(header, data, col_widths, column_separator, horizontal_separator)
 
 def parseTable(data,sort=False,min_space=2):
