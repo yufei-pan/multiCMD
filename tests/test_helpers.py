@@ -1,6 +1,11 @@
 import builtins
+import os
 import select
+import subprocess
 import sys
+from pathlib import Path
+
+import pytest
 
 import multiCMD
 from multiCMD import (
@@ -83,6 +88,28 @@ def test_progress_bar_helpers(capsys, monkeypatch):
 def test_get_terminal_size_tuple():
 	cols, rows = get_terminal_size()
 	assert cols > 0 and rows > 0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs a pseudo-terminal")
+def test_get_terminal_size_reads_columns_from_stdin_when_stdout_is_piped():
+	# `cmd | less` on a 200x40 terminal: os.get_terminal_size() fails on the pipe, so the
+	# TIOCGWINSZ fallback reads stdin, whose winsize struct holds the rows before the columns.
+	import fcntl
+	import pty
+	import struct
+	import termios
+	master, slave = pty.openpty()
+	try:
+		fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 200, 0, 0))
+		out = subprocess.run(
+			[sys.executable, "-c", "import multiCMD; print(*multiCMD.get_terminal_size()[:2])"],
+			stdin=slave, stdout=subprocess.PIPE, cwd=str(Path(__file__).resolve().parents[1]),
+			universal_newlines=True, check=True,
+		).stdout
+	finally:
+		os.close(slave)
+		os.close(master)
+	assert out.split() == ["200", "40"]
 
 
 def test_input_with_timeout_and_countdown(monkeypatch):
