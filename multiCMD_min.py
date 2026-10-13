@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse,atexit,collections,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time
 from pprint import pformat
-version='1.53'
+version='1.54'
 __version__=version
-COMMIT_DATE='2026-10-11'
+COMMIT_DATE='2026-10-12'
 __running_threads=set()
 __running_threads_lock=threading.Lock()
 __finished_threads=collections.deque()
@@ -733,7 +733,7 @@ def slugify(value,allow_unicode=False):
 def get_terminal_size():
 	try:import os;_tsize=os.get_terminal_size()
 	except Exception:
-		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));_tsize=struct.unpack('HHHH',packed)[:2]
+		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));rows,columns=struct.unpack('HHHH',packed)[:2];_tsize=columns,rows
 		except Exception:import shutil;_tsize=shutil.get_terminal_size(fallback=(240,50))
 	return _tsize
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
