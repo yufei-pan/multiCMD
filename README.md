@@ -70,6 +70,8 @@ options:
   -n, --dry-run         print each command, quoted, instead of running it
   --shell               run each command through /bin/sh -c ( pipes, ;, > and
                         globs work )
+  -e, --env NAME=VALUE  set NAME to VALUE in the environment of every command
+                        ( repeatable ); NAME alone removes it
   -f, --file FILE       read commands from FILE, one per line ( - for stdin;
                         blank lines and # comments are skipped )
   -a, --arg-file FILE   run each command template once per line of FILE, with
@@ -266,6 +268,20 @@ multiCMD.run_commands(cmds, max_threads=8, prefix=True)           # [#] on each 
 multiCMD.run_commands(cmds, max_threads=8, color=False)           # never color
 multiCMD.run_command(["python3", "train.py"], pty=True)           # live output, stderr merged
 ```
+
+### Environment per call
+
+```python
+multiCMD.run_command(["xfs_info", "/data"], extra_env={"LC_ALL": "C"})      # add / override variables
+multiCMD.run_command(["env"], extra_env={"HTTP_PROXY": None})               # None removes one
+multiCMD.run_command(["env"], env={"PATH": "/usr/bin", "HOME": "/tmp"})     # the whole environment, as subprocess's env
+```
+
+`extra_env` is applied on top of the inherited environment ( and on top of `env` when both are
+given ). Both are per command: they never change `os.environ` and never reach another command,
+so concurrent commands each see their own. `AsyncExecutor` takes them too, as defaults it
+overrides per call. `sudo` resets the environment by default, so with `use_sudo` they may not
+reach the command. On the command line: `mcmd -e LC_ALL=C -e UNSET_ME "cmd"`.
 
 `raise_error=True` raises `multiCMD.CommandError`; its `.tasks` holds the failed `Task`
 objects and its message lists each one with its return code and last error line.

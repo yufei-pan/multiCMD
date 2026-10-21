@@ -93,6 +93,9 @@ class Task:
 		self._pty = False
 		# whether multiCMD itself failed to run or reap the command ( returncode -1 is then not a SIGHUP death )
 		self._error = False
+		# this command's own environment ( see _check_env ): env replaces the inherited one, extra_env is applied on top
+		self._env = None
+		self._extra_env = None
 
 	def __iter__(self):
 		yield from (
@@ -223,7 +226,7 @@ class _Display:
 _display = _Display()
 
 class AsyncExecutor:
-	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False):
+	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None):
 		'''
 		AsyncExecutor class to run commands in parallel asynchronously
 
@@ -243,6 +246,8 @@ class AsyncExecutor:
 			prefix: Whether to prefix output lines with [#] when commands can run at once ( bool )
 			color: Whether to color output lines per command ( None: only on a terminal without NO_COLOR )
 			pty: Whether commands write to a pseudo-terminal ( bool, POSIX only )
+			env: The whole environment of each command, replacing the inherited one ( Mapping[str, str] | None: inherit ), as subprocess's env
+			extra_env: Variables added to the inherited environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable
 		'''
 		self.max_threads = max_threads
 		if semaphore is ...:
@@ -257,6 +262,8 @@ class AsyncExecutor:
 		self.prefix = prefix
 		self.color = color
 		self.pty = pty
+		self.env = _check_env(env, 'env')
+		self.extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
@@ -361,7 +368,7 @@ class AsyncExecutor:
 		finally:
 			self._finished.append((threading.current_thread(), None))
 
-	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...):
+	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...):
 		'''
 		Run multiple commands in parallel asynchronously. Returns right away, the commands are queued
 		@params:
@@ -376,6 +383,8 @@ class AsyncExecutor:
 			prefix: Whether to prefix output lines with [#] to override the object default
 			color: Whether to color output lines to override the object default
 			pty: Whether commands write to a pseudo-terminal to override the object default
+			env: The whole environment of the commands to override the object default ( None: inherit )
+			extra_env: Variables added to / overriding the environment, to override the object default ( None: none )
 		@returns:
 			list: The Task Object of the commands ( list[Task] )
 		'''
@@ -399,7 +408,11 @@ class AsyncExecutor:
 			color = self.color
 		if pty is ...:
 			pty = self.pty
-		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell)
+		if env is ...:
+			env = self.env
+		if extra_env is ...:
+			extra_env = self.extra_env
+		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell, env=env, extra_env=extra_env)
 		if not sem:
 			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
 		if use_sudo and not dry_run:
@@ -428,7 +441,7 @@ class AsyncExecutor:
 				raise
 		return taskObjects
 	
-	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...):
+	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...):
 		'''
 		Run a command in parallel asynchronously
 		@params:
@@ -437,7 +450,7 @@ class AsyncExecutor:
 		@returns:
 			Task: The Task Object of the command
 		'''
-		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem,shell=shell,prefix=prefix,color=color,pty=pty)[0]
+		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem,shell=shell,prefix=prefix,color=color,pty=pty,env=env,extra_env=extra_env)[0]
 	
 	def wait(self, timeout=None, threads = ...):
 		'''
@@ -1163,6 +1176,58 @@ def _join_readers(readers, limit):
 	for reader in readers:
 		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
 
+def _check_env(mapping, name, allow_none=False):
+	'''
+	Validate an environment mapping and take a snapshot of it, so the caller changing it later does not reach the command ( internal )
+
+	@returns:
+		dict | None: The copy ( None when mapping is None )
+	'''
+	if mapping is None:
+		return None
+	try:
+		items = list(dict(mapping).items())
+	except (TypeError, ValueError):
+		raise TypeError(f'{name} must be a mapping of variable names to values, not {type(mapping).__name__}') from None
+	for key, value in items:
+		if not isinstance(key, str) or not key or '=' in key or '\0' in key:
+			raise ValueError(f'{name}: invalid variable name {key!r}')
+		if value is None and allow_none:
+			continue
+		if not isinstance(value, str) or '\0' in value:
+			raise TypeError(f'{name}[{key!r}] must be a str{" or None" if allow_none else ""}, not {type(value).__name__}')
+	return dict(items)
+
+def _child_env(task, pager=False):
+	'''
+	The environment a task's command starts with ( internal )
+	Built per command and never written to os.environ, so concurrent commands cannot see each other's.
+
+	@params:
+		task: The Task
+		pager: Whether to default PAGER / GIT_PAGER to cat ( for a pty ); a variable the caller set stays as it is
+
+	@returns:
+		dict | None: The environment, None to inherit the parent's untouched
+	'''
+	if task._env is None and task._extra_env is None and not pager:
+		return None
+	if task._env is not None:
+		env = dict(task._env)
+		if pager:
+			env.setdefault('PAGER', 'cat')
+			env.setdefault('GIT_PAGER', 'cat')
+	elif pager:
+		env = dict(os.environ, PAGER='cat', GIT_PAGER='cat')
+	else:
+		env = dict(os.environ)
+	for key, value in (task._extra_env or {}).items():
+		if value is None:
+			env.pop(key, None)
+		else:
+			env[key] = value
+	return env
+
 def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
 	Run a task's command to the end: start it, stream its output, enforce the timeout and the stop flag, reap it ( internal )
@@ -1187,7 +1252,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		master, slave = _open_pty(len(decor[0]))
 	if master is not None:
 		try:
-			proc, pgid = _spawn(task.command, slave, slave, dict(os.environ, PAGER='cat', GIT_PAGER='cat'))
+			proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True))
 		except BaseException:
 			os.close(master)
 			raise
@@ -1197,7 +1262,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._pty = True
 		streams = [(io.open(master, 'rb'), task.stdout)]
 	else:
-		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE)
+		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task))
 		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
 	task.start_time = time.time()
 	task._last_output = time.monotonic()
@@ -1404,9 +1469,10 @@ def _shell_template(template):
 		i += 1
 	return ''.join(out)
 
-def _build_tasks(commands, parse=False, use_sudo=..., shell=False):
+def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, extra_env=None):
 	'''
 	Format commands into Tasks, prefixing sudo when requested and available ( internal )
+	env / extra_env ( validated here, before anything runs ) are copied onto every Task
 
 	@returns:
 		tuple[list[Task], bool]: The tasks and whether sudo is used
@@ -1428,7 +1494,13 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False):
 		formatedCommands.extend(__format_command(command,expand=parse,shell=shell,variables=variables))
 	if use_sudo:
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
-	return [Task(command) for command in formatedCommands], bool(use_sudo)
+	env = _check_env(env, 'env')
+	extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
+	tasks = [Task(command) for command in formatedCommands]
+	for task in tasks:
+		task._env = env
+		task._extra_env = extra_env
+	return tasks, bool(use_sudo)
 
 def _validate_sudo():
 	'''
@@ -1571,7 +1643,8 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
-				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False, shell = False):
+				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False, shell = False,
+				env = None, extra_env = None):
 	'''
 	Run a command
 
@@ -1594,6 +1667,10 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		color: Whether to color output lines ( None: when commands run at once on a terminal without NO_COLOR )
 		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
 		shell: Whether to run the command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
+		env: The whole environment of the command ( the commands ), replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
+		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
+			Applied on top of env when both are given. Per call and per command: it never changes os.environ nor reaches other commands.
+			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
@@ -1601,11 +1678,12 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
-					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty, shell=shell)[0]
+					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty, shell=shell, env=env, extra_env=extra_env)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
-				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False, shell = False):
+				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False, shell = False,
+				 env = None, extra_env = None):
 	'''
 	Run multiple commands in parallel
 
@@ -1629,12 +1707,16 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		color: Whether to color output lines per command ( None: when commands run at once on a terminal without NO_COLOR )
 		pty: Whether the command writes to a pseudo-terminal, so it prints live ( POSIX only; stderr is merged into stdout )
 		shell: Whether to run each command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
+		env: The whole environment of each command, replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
+		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
+			Applied on top of env when both are given. Per call and per command: it never changes os.environ nor reaches other commands.
+			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
 	# initialize the tasks
-	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell)
+	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell, env=env, extra_env=extra_env)
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(tasks)
@@ -1872,6 +1954,7 @@ def main():
 	parser.add_argument('-q','--quiet', action='store_true',help='quiet mode: hide command output ( the summary still shows )')
 	parser.add_argument('-n','--dry-run', action='store_true',help='print each command, quoted, instead of running it')
 	parser.add_argument('--shell', action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )')
+	parser.add_argument('-e','--env', metavar='NAME=VALUE', action='append',help='set NAME to VALUE in the environment of every command ( repeatable ); NAME alone removes it')
 	parser.add_argument('-f','--file', metavar='FILE', action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )')
 	parser.add_argument('-a','--arg-file', metavar='FILE', action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )')
 	summary = parser.add_mutually_exclusive_group()
@@ -1894,6 +1977,12 @@ def main():
 	# set_sudo() validates that sudo exists and that we are not already root
 	# before enabling it, and updates the USE_SUDO global accordingly.
 	set_sudo(args.sudo)
+	extra_env = {}
+	for assignment in args.env or []:
+		name, equals, value = assignment.partition('=')
+		if not name:
+			parser.error(f'-e/--env: invalid assignment {assignment!r}')
+		extra_env[name] = value if equals else None
 	_install_cli_signal_handlers()
 	try:
 		commands = _cli_commands(args)
@@ -1904,7 +1993,8 @@ def main():
 		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
 			quiet=args.quiet and not args.dry_run, dry_run=args.dry_run,
 			with_stdErr=True, return_object=True,
-			prefix=not args.no_prefix, color=False if args.no_color else None, pty=use_pty)
+			prefix=not args.no_prefix, color=False if args.no_color else None, pty=use_pty,
+			extra_env=extra_env or None)
 	except (OSError, ValueError) as e:
 		print(f'mcmd: {e}', file=sys.stderr)
 		return 2
