@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 
 import pytest
@@ -210,3 +211,23 @@ def test_a_poll_cut_short_holding_popens_lock_does_not_keep_the_command_from_bei
 		assert proc not in multiCMD._live_procs
 	finally:
 		multiCMD._live_procs.pop(proc, None)
+
+
+def test_the_registry_takes_no_lock_a_ctrl_c_could_leave_held():
+	# ( found with the free-threaded stress loops ) a Ctrl-C right after a `with lock:` acquire on the main thread
+	# leaves the lock held on Python 3.6 - 3.9 and 3.14 ( r10/withlock.py: about a third of such Ctrl-Cs ); held,
+	# _live_procs_lock hung every registration, kill_all() and the exit hook
+	assert multiCMD._live_procs_lock.acquire(False)
+	try:
+		done = []
+		def run():
+			done.append(multiCMD.run_command(['true'], quiet=True, return_code_only=True))
+			multiCMD.kill_all()
+			done.append('killed')
+		worker = threading.Thread(target=run, daemon=True)
+		worker.start()
+		worker.join(10)
+		# before: blocked for good on the lock
+		assert done == [0, 'killed']
+	finally:
+		multiCMD._live_procs_lock.release()

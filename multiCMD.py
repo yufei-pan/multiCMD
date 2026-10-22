@@ -106,6 +106,10 @@ _live_procs = {}
 # commands that exited while something they started still holds their output open, and a waiting
 # call is still reading it: Popen -> process group id. kill_all() reaches these, the exit hook does not
 _draining = {}
+# multiCMD takes no lock for these: each update is one dict operation and each snapshot one dict.copy(), atomic
+# with the GIL and under the dict's own lock without it. A `with lock:` on the main thread can be left holding the
+# lock by a Ctrl-C landing right after the acquire ( Python 3.6 - 3.9 and 3.14 ), which would hang kill_all() and
+# the exit hook. ( Kept for code that took it to read them. )
 _live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
@@ -1433,8 +1437,7 @@ def _register(proc, pgid):
 	'''
 	Track a running command so kill_all() can reach it ( internal )
 	'''
-	with _live_procs_lock:
-		_live_procs[proc] = pgid
+	_live_procs[proc] = pgid
 
 def _unregister(proc):
 	'''
@@ -1442,8 +1445,7 @@ def _unregister(proc):
 	'''
 	if proc.poll() is None:
 		return
-	with _live_procs_lock:
-		_live_procs.pop(proc, None)
+	_live_procs.pop(proc, None)
 
 def _send(proc, pgid, sig):
 	'''
@@ -1556,8 +1558,7 @@ def kill_all(sig=None):
 	@returns:
 		None
 	'''
-	with _live_procs_lock:
-		commands = list(_live_procs.items()) + list(_draining.items())
+	commands = list(_live_procs.copy().items()) + list(_draining.copy().items())
 	_kill_commands(commands, signal.SIGTERM if sig is None else sig)
 
 def _kill_running_at_exit():
@@ -1566,9 +1567,7 @@ def _kill_running_at_exit():
 	What a finished command left running in the background is left alone: a fire-and-forget
 	command may start a long job on purpose ( `btrfs scrub start`, `nohup ...` ).
 	'''
-	with _live_procs_lock:
-		commands = list(_live_procs.items())
-	_kill_commands(commands, signal.SIGTERM)
+	_kill_commands(list(_live_procs.copy().items()), signal.SIGTERM)
 
 atexit.register(_kill_running_at_exit)
 
@@ -2020,8 +2019,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			proc, pgid, streams = started
 			# registered here too ( the start registers it, unless that was cut short ), so kill_all() and the exit
 			# hook reach it whatever cuts the kill short
-			with _live_procs_lock:
-				_live_procs[proc] = pgid
+			_live_procs[proc] = pgid
 			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
 			for i, (stream, _) in enumerate(streams):
 				if i >= len(readers) or readers[i]._abandon():
@@ -2070,15 +2068,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	if reason is None:
 		# the command exited, but something it started may still hold its output open: keep reading,
 		# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
-		with _live_procs_lock:
-			_draining[proc] = pgid
+		_draining[proc] = pgid
 		try:
 			reason = _drain(task, readers, timeout)
 		except KeyboardInterrupt:
 			reason, interrupted = 'stop', True
 		finally:
-			with _live_procs_lock:
-				_draining.pop(proc, None)
+			_draining.pop(proc, None)
 		if reason == 'timeout':
 			task.stderr.append('Timeout!')
 		if reason is not None:
