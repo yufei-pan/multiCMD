@@ -887,13 +887,12 @@ def test_cleanup_drops_the_snapshots_of_what_is_still_queued():
 	multiCMD.kill_all()
 
 
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_a_task_whose_thread_cannot_start_drops_its_snapshot(monkeypatch):
 	ex = AsyncExecutor(max_threads=1, quiet=True)
 	real = ex._start_thread
-	def broken(target, args, task=None):
-		if task is None:
-			return real(target, args)
+	def broken(thread):
+		if thread.task is None:
+			return real(thread)
 		raise RuntimeError("can't start new thread")
 	monkeypatch.setattr(ex, '_start_thread', broken)
 	task = ex.run_commands([['true']], extra_env={'MCMD_SECRET': 'x'})[0]

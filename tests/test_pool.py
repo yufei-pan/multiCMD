@@ -134,3 +134,52 @@ def test_finished_threads_release_their_stacks(how):
 			multiCMD.join_threads()
 	# each unjoined thread stack is a mapping and its guard page another: 30 x 4 commands would add hundreds
 	assert _maps() - before < 40, (before, _maps())
+
+
+def _fail_worker_start(monkeypatch, which, exc):
+	real_start = multiCMD._Thread.start
+	count = [0]
+	def start(self):
+		if getattr(self, '_target', None) is not None and self._target.__name__ == 'worker':
+			count[0] += 1
+			if count[0] in which:
+				raise exc
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+
+
+def _record_tasks(monkeypatch):
+	tasks = []
+	real = multiCMD._build_tasks
+	def build(*args, **kwargs):
+		built = real(*args, **kwargs)
+		tasks.extend(built[0])
+		return built
+	monkeypatch.setattr(multiCMD, '_build_tasks', build)
+	return tasks
+
+
+def test_ctrl_c_while_pool_workers_start_stops_the_commands(monkeypatch):
+	tasks = _record_tasks(monkeypatch)
+	_fail_worker_start(monkeypatch, {2}, KeyboardInterrupt())
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '0.3']] * 12, max_threads=4, quiet=True)
+	# before the fix the first worker went on to run all 12, unsupervised
+	assert all(task.stop for task in tasks)
+	assert not multiCMD._live_procs
+	# the one command that started was stopped and reaped before the call re-raised, the rest never start
+	assert sum(task.returncode is not None for task in tasks) <= 1
+	assert all(task.returncode is None and not task._finalized for task in tasks[1:])
+
+
+def test_a_pool_worker_that_cannot_start_leaves_the_commands_to_the_others(monkeypatch, capfd):
+	_fail_worker_start(monkeypatch, {2, 3}, RuntimeError("can't start new thread"))
+	assert run_commands([['true']] * 6, max_threads=4, quiet=True, return_code_only=True) == [0] * 6
+	assert capfd.readouterr().err == ''
+
+
+def test_a_pool_without_any_worker_fails_every_command(monkeypatch):
+	_fail_worker_start(monkeypatch, {1, 2}, RuntimeError("can't start new thread"))
+	tasks = run_commands([['true']] * 3, max_threads=2, quiet=True, return_object=True)
+	assert [task.returncode for task in tasks] == [-1] * 3
+	assert all("cannot start a thread to run it: can't start new thread" in task.stderr[0] and task._finalized for task in tasks)
