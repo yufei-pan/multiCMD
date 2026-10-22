@@ -15,7 +15,8 @@ SUDO_PATH=shutil.which('sudo')
 USE_SUDO=False
 _IS_POSIX=os.name=='posix'
 _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
-_PGROUP_EXEC="import os,signal,sys\nfor n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\nos.setpgid(0,0)\na=sys.argv\ntry:\n\tif a[1]=='-':os.execvp(a[2],a[2:])\n\td=[]\n\twhile 1:\n\t\tb=os.read(int(a[1]),65536)\n\t\tif not b:break\n\t\td.append(b)\n\tos.close(int(a[1]))\n\td=b''.join(d)\n\tos.execvpe(a[2],a[2:],dict(os.fsdecode(i).partition('=')[::2] for i in d.split(b'\\0')) if d else {})\nexcept FileNotFoundError as e:\n\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(127)\nexcept OSError as e:\n\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(126)\n"
+_ENV_VAR='_MULTICMD_ENV_'
+_PGROUP_EXEC="import os,signal,sys\nfor n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\nos.setpgid(0,0)\na=sys.argv\ntry:\n\tif a[1]=='-':os.execvp(a[2],a[2:])\n\ttry:\n\t\te=dict(os.environb.pop(b'_MULTICMD_ENV_%d'%i).split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%a[2]);sys.exit(126)\n\tif b'' not in e:os.execvpe(a[2],a[2:],e)\n\timport ctypes\n\tL=ctypes.CDLL(None,use_errno=True)\n\tA=(ctypes.c_char_p*(len(a)-1))(*map(os.fsencode,a[2:]),None)\n\tV=(ctypes.c_char_p*(len(e)+1))(*[k+b'='+v for k,v in e.items()],None)\n\tf=os.fsencode(a[2]);x=0\n\tfor p in [f] if b'/' in f else [os.path.join(os.fsencode(d),f) for d in os.get_exec_path(e)]:\n\t\tL.execve(p,A,V);r=ctypes.get_errno()\n\t\tif r not in(2,20):x=x or r\n\traise OSError(x or 2,os.strerror(x or 2))\nexcept FileNotFoundError as e:\n\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(127)\nexcept OSError as e:\n\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
 _live_procs={}
 _draining={}
@@ -69,7 +70,7 @@ class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None):
 		self.max_threads=max_threads
 		if semaphore is...:semaphore=threading.Semaphore(max_threads)
-		self.semaphore=semaphore;self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self.shell=shell;self.prefix=prefix;self.color=color;self.pty=pty;self.env=_check_env(env,'env');self.extra_env=_check_env(extra_env,'extra_env',allow_none=True);self._lock=threading.Lock();self._queue=collections.deque();self._dispatching=False;self._threads={};self._finished=collections.deque()
+		self.semaphore=semaphore;self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self.shell=shell;self.prefix=prefix;self.color=color;self.pty=pty;env,extra_env=_check_env(env,'env'),_check_env(extra_env,'extra_env',allow_none=True);self.env=None if env is None else env.copy();self.extra_env=None if extra_env is None else extra_env.copy();self._lock=threading.Lock();self._queue=collections.deque();self._dispatching=False;self._threads={};self._finished=collections.deque()
 	def __iter__(self):return iter(self.tasks)
 	def __repr__(self):return f"AsyncExecutor(max_threads={self.max_threads}, semaphore={self.semaphore}, runningThreads={self.runningThreads}, tasks={self.tasks}, timeout={self.timeout}, quiet={self.quiet}, dry_run={self.dry_run}, parse={self.parse})"
 	def __str__(self):return str(self.tasks)
@@ -272,32 +273,26 @@ def set_sudo(use_sudo):
 	if getattr(os,'geteuid',lambda:1)()==0:USE_SUDO=False
 	elif SUDO_PATH:USE_SUDO=True
 	else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);USE_SUDO=False
-def _spawn(argv,stdout,stderr,env=None):
+def _spawn(argv,stdout,stderr,env=None,explicit=False):
 	kwargs={'stdin':subprocess.DEVNULL,'stdout':stdout,'stderr':stderr,'env':env}
 	if not _IS_POSIX:return subprocess.Popen(argv,**kwargs),None
-	grouped=True;read_fd=write_fd=None
+	grouped=True;command=argv[0]
 	if _HAS_PROCESS_GROUP:kwargs['process_group']=0
 	elif sys.executable and not getattr(sys,'frozen',False):
-		if os.sep not in argv[0]and shutil.which(argv[0],path=os.pathsep.join(d or os.curdir for d in os.get_exec_path(env)))is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),argv[0])
-		kwargs['env']=None
-		if env is not None:read_fd,write_fd=os.pipe();kwargs['pass_fds']=read_fd,
-		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,'-'if env is None else str(read_fd)]+list(argv)
+		if os.sep not in command:
+			if explicit:search_path=os.pathsep.join(d or os.curdir for d in os.get_exec_path(env))
+			else:search_path=(env if env is not None else os.environ).get('PATH')
+			if shutil.which(command,path=search_path)is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
+		count='-'
+		if explicit:entries=[os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()];kwargs['env']=dict(_snapshot(os.environb));kwargs['env'].update((os.fsencode(_ENV_VAR+str(i)),entry)for(i,entry)in enumerate(entries));count=str(len(entries))
+		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count]+list(argv)
 	else:grouped=False
 	old_mask=signal.pthread_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS)
 	try:proc=subprocess.Popen(argv,**kwargs)
-	except BaseException:
-		if write_fd is not None:os.close(write_fd)
+	except OSError as e:
+		if e.errno==errno.E2BIG and argv[0]!=command:raise OSError(e.errno,e.strerror,command)
 		raise
-	finally:
-		signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
-		if read_fd is not None:os.close(read_fd)
-	if write_fd is not None:
-		try:
-			data=memoryview(b'\x00'.join(os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()))
-			while data:data=data[os.write(write_fd,data):]
-		except BrokenPipeError:pass
-		except BaseException:proc.kill();proc.wait();raise
-		finally:os.close(write_fd)
+	finally:signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
 	return proc,proc.pid if grouped else None
 def _stdout_isatty():
 	try:return sys.stdout.isatty()
@@ -408,7 +403,13 @@ def _drain(task,readers,timeout):
 def _join_readers(readers,limit):
 	deadline=None if limit is None else time.monotonic()+limit
 	for reader in readers:_join(reader,None if deadline is None else max(0,deadline-time.monotonic()))
-class _Env(dict):__slots__=()
+class _Env(collections.abc.Mapping):
+	__slots__='_data','none_allowed'
+	def __init__(self,data,none_allowed):self._data=data;self.none_allowed=none_allowed
+	def __getitem__(self,key):return self._data[key]
+	def __iter__(self):return iter(self._data)
+	def __len__(self):return len(self._data)
+	def copy(self):return dict(self._data)
 def _snapshot(mapping):
 	items=[]
 	for key in list(mapping):
@@ -422,9 +423,10 @@ def _env_text(value,what):
 		except TypeError:pass
 	raise TypeError(f"{what} must be a str{''if os.name=='nt'else', bytes or os.PathLike'}, not {type(value).__name__}")
 def _check_env(mapping,name,allow_none=False):
-	if mapping is None or type(mapping)is _Env:return mapping
+	if mapping is None:return
+	if type(mapping)is _Env and mapping.none_allowed==allow_none:return mapping
 	if not isinstance(mapping,collections.abc.Mapping):raise TypeError(f"{name} must be a mapping of variable names to values, not {type(mapping).__name__}")
-	env=_Env()
+	env={}
 	for(key,value)in _snapshot(mapping):
 		key=_env_text(key,f"{name}: variable name")
 		if not key or'\x00'in key or'='in key[os.name=='nt':]:raise ValueError(f"{name}: invalid variable name {key!r}")
@@ -432,7 +434,13 @@ def _check_env(mapping,name,allow_none=False):
 		value=_env_text(value,f"{name}[{key!r}]"+(' ( or None )'if allow_none else''))
 		if'\x00'in value:raise ValueError(f"{name}[{key!r}] holds a NUL character")
 		env[key]=value
-	return env if env or not allow_none else None
+	if os.name!='nt':
+		for(key,value)in env.items():
+			try:
+				os.fsencode(key)
+				if value is not None:os.fsencode(value)
+			except UnicodeEncodeError as e:raise ValueError(f"{name}[{key!r}] cannot be encoded: {e}")from None
+	return _Env(env,allow_none)if env or not allow_none else None
 def _apply_extra_env(env,extra_env):
 	names={key.upper():key for key in env}if os.name=='nt'else None
 	for(key,value)in extra_env.items():
@@ -448,21 +456,21 @@ def _child_env(task,pager=False):
 	if base is None:
 		env=dict(_snapshot(os.environ))
 		if pager:env.update(PAGER='cat',GIT_PAGER='cat')
-	elif extra is None and not pager:return base
+	elif extra is None and not pager:return base.copy()
 	else:
-		env=dict(base)
+		env=base.copy()
 		if pager:env.setdefault('PAGER','cat');env.setdefault('GIT_PAGER','cat')
 	if extra:_apply_extra_env(env,extra)
 	return env
 def _execute(task,timeout,quiet,decor,use_pty=False):
-	master=slave=None
+	master=slave=None;explicit=task._env is not None or task._extra_env is not None
 	if use_pty:master,slave=_open_pty(len(decor[0]))
 	if master is not None:
-		try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True))
+		try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True),explicit)
 		except BaseException:os.close(master);raise
 		finally:os.close(slave)
 		task._pty=True;streams=[(io.open(master,'rb'),task.stdout)]
-	else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task));streams=[(proc.stdout,task.stdout),(proc.stderr,task.stderr)]
+	else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit);streams=[(proc.stdout,task.stdout),(proc.stderr,task.stderr)]
 	task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();_register(proc,pgid);readers=[threading.Thread(target=_read_stream,args=(stream,target,task,decor,quiet),daemon=True)for(stream,target)in streams]
 	for reader in readers:reader.start()
 	interrupted=False
@@ -488,7 +496,7 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	if interrupted:raise KeyboardInterrupt
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,decor=('','',''),use_pty=False):
 	with sem:
-		if task.stop:return task.stdout+task.stderr if with_stdErr else task.stdout
+		if task.stop:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
 		try:
 			if dry_run:
 				if not quiet:_display.message(_dry_run_line(task))
@@ -497,8 +505,10 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 			_execute(task,timeout,quiet,decor,use_pty)
 		except FileNotFoundError as e:print(f"Command path not found: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=127
 		except PermissionError as e:print(f"Command cannot be executed: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=126
-		except Exception as e:import traceback;print(f"Error running command: {task.command}",file=sys.stderr,flush=True);print(str(e).split('\n'));task.stderr.extend(str(e).split('\n'));task.stderr.extend(traceback.format_exc().split('\n'));task.returncode=-1;task._error=True
-		finally:task._finalized=True
+		except Exception as e:
+			if isinstance(e,OSError)and e.filename is not None:print(f"Command cannot be executed: {task.command[0]}",file=sys.stderr,flush=True);task.stderr.append(str(e));task.returncode=126
+			else:import traceback;print(f"Error running command: {task.command}",file=sys.stderr,flush=True);print(str(e).split('\n'));task.stderr.extend(str(e).split('\n'));task.stderr.extend(traceback.format_exc().split('\n'));task.returncode=-1;task._error=True
+		finally:task._finalized=True;task._env=task._extra_env=None
 		if not quiet:_display.message('-'*100,decor);_display.message(f"Process exited with return code {task.returncode}",decor)
 		if with_stdErr:return task.stdout+task.stderr
 		else:return task.stdout
