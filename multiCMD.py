@@ -449,23 +449,32 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 	Start _Threads so that every one either runs or is abandoned, none left tracked that never runs ( internal )
 
 	Each thread in turn is registered ( register(thread) ) and started. One that cannot start ( an Exception ) is
-	abandoned, forgotten ( forget(thread) ) and failed ( fail(thread, error) ), and the next one starts; without
-	fail, the error ends the starts. When the starts end early ( that error, a Ctrl-C, register or fail
+	abandoned, forgotten ( forget(thread) ) and failed ( fail(thread, error) ), and the next one starts, unless fail
+	returned True: that ends the starts there, and the threads not started yet are abandoned and forgotten. Without
+	fail, the error ends the starts early. When the starts end early ( that error, a Ctrl-C, register or fail
 	raising ), every thread that does not run, registered yet or not, is abandoned and forgotten, a fail cut
-	short is run again, abort() is called and the exception is raised. That bookkeeping runs to its end
-	whatever Ctrl-C lands meanwhile ( see _settle ), so forget, fail and abort must be idempotent.
+	short is run again, abort() is called and the exception is raised. fail and that bookkeeping run to their
+	end whatever Ctrl-C lands meanwhile ( see _settle ), so forget, fail and abort must be idempotent.
 	@params:
 		threads: The _Threads to start ( list )
 		register: Called with each thread right before it starts ( None: nothing to do )
 		forget: Undoes register for a thread that never runs; called for every such thread, registered or not
-		fail: Called with a thread that cannot start and the error ( None: the error ends the starts )
+		fail: Called with a thread that cannot start and the error; True ends the starts ( None: the error ends them early )
 		abort: Called once the starts end early ( None: nothing to do )
 	@returns:
 		list: The threads that run ( or may yet get to their target )
 	'''
+	# a thread whose fail() has not completed yet -> its error ( None once it has )
 	failing = {}
+	# how many threads the starts got to, when a fail ended them
+	ended = [None]
+	def failed(thread, error, index):
+		failing[thread] = error
+		if fail(thread, error):
+			ended[0] = index + 1
+		failing[thread] = None
 	try:
-		for thread in threads:
+		for index, thread in enumerate(threads):
 			if register is not None:
 				register(thread)
 			try:
@@ -478,9 +487,11 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 					forget(thread)
 				if fail is None:
 					raise
-				failing[thread] = e
-				fail(thread, e)
-				failing[thread] = None
+				_settle(lambda: failed(thread, e, index))
+				if ended[0] is not None:
+					# the ones after it never start
+					_settle(lambda: [forget(thread) for thread in threads[ended[0]:] if thread._abandon() and forget is not None])
+					break
 	except BaseException:
 		def settle():
 			for thread in threads:
@@ -489,11 +500,12 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 			for thread, error in failing.items():
 				if error is not None:
 					fail(thread, error)
+					failing[thread] = None
 			if abort is not None:
 				abort()
 		_settle(settle)
 		raise
-	return [thread for thread in threads if thread not in failing]
+	return [thread for thread in threads[:ended[0]] if thread not in failing]
 
 class _Display:
 	'''
@@ -2049,7 +2061,7 @@ def _fail_task(task, message, error, quiet=False):
 	task._env = task._extra_env = None
 	task._finalized = True
 	if not quiet:
-		_show_error(f'Error running command: {task.command}\n' + '\n'.join(lines))
+		_show_error(f'Error running command: {task.command}\n' + '\n'.join(lines), task)
 
 def _run_executor_task(task, permit, timeout, quiet, dry_run, finished, decor=('', '', ''), use_pty=False):
 	'''
@@ -2338,10 +2350,10 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 		workers.extend(_Thread(worker) for _ in range(wanted))
 		# a worker that cannot start leaves the commands to the others ( only without any do they fail ); a Ctrl-C
 		# while they start stops every task, so the workers already started do not run them unsupervised
-		running = _start_threads(workers, fail=lambda thread, error: errors.append(error), abort=lambda: _stop_tasks(tasks))
+		# ( after the first failure the next starts would fail the same way: True ends them there )
+		running = _start_threads(workers, fail=lambda thread, error: errors.append(error) or True, abort=lambda: _stop_tasks(tasks))
 		if not running:
-			for task in tasks:
-				_fail_task(task, f'cannot start a thread to run it: {errors[0]}', errors[0], quiet)
+			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {errors[0]}', errors[0], quiet) for task in tasks])
 			return
 		if len(running) < wanted and not quiet:
 			# commands that must run at the same time may then wait on each other for good: say so

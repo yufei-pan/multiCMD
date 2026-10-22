@@ -197,6 +197,31 @@ def test_messages_shown_in_a_settled_step_appear_once_after_it(monkeypatch):
 	assert written[-1][0] == 'now'
 
 
+def test_a_fire_and_forget_start_failure_cut_short_shows_its_message_once(monkeypatch, capfd):
+	# the fail cut short once, then the starts' settling cut short too: before, each restart ran every fail again
+	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 2)
+	real_fail = multiCMD._fail_task
+	armed = {'fail': True}
+	def fail(*args, **kwargs):
+		real_fail(*args, **kwargs)
+		if armed['fail']:
+			armed['fail'] = False
+			raise KeyboardInterrupt
+	monkeypatch.setattr(multiCMD, '_fail_task', fail)
+	real_stop = multiCMD._stop_tasks
+	armed['stop'] = True
+	def stop(tasks):
+		real_stop(tasks)
+		if armed['stop']:
+			armed['stop'] = False
+			raise KeyboardInterrupt
+	monkeypatch.setattr(multiCMD, '_stop_tasks', stop)
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '30']] * 3, max_threads=0, wait_for_return=False)
+	assert _join_threads_returns_within(5)
+	assert capfd.readouterr().err.count('Error running command') == 1
+
+
 # ---- a Ctrl-C the bookkeeping of a failure held is not lost
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
@@ -272,3 +297,46 @@ def test_a_second_ctrl_c_while_join_threads_stops_its_commands_ends_the_wait():
 	finally:
 		release.set()
 	assert multiCMD._join(thread, 5)
+
+
+# ---- the pool: one failed start is enough, and failing every task is settled
+
+def test_the_pool_stops_starting_workers_after_the_first_that_cannot_start(monkeypatch, capfd):
+	calls = []
+	real_start = multiCMD._Thread.start
+	def start(self):
+		if getattr(self, '_target', None) is not None and self._target.__name__ == 'worker':
+			calls.append(self)
+			if len(calls) == 2:
+				raise RuntimeError("can't start new thread")
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	tasks = run_commands([['true']] * 6, max_threads=5, quiet=False, return_object=True)
+	# before: every one of the 5 workers was tried
+	assert len(calls) == 2
+	assert [task.returncode for task in tasks] == [0] * 6
+	assert "multiCMD: started 1 of 5 threads: can't start new thread" in capfd.readouterr().err
+
+
+def test_a_pool_whose_workers_cannot_start_fails_every_task_whatever_cuts_it_short(monkeypatch):
+	real_start = multiCMD._Thread.start
+	def start(self):
+		if getattr(self, '_target', None) is not None and self._target.__name__ == 'worker':
+			raise RuntimeError("can't start new thread")
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	real_fail = multiCMD._fail_task
+	count = [0]
+	def fail(*args, **kwargs):
+		real_fail(*args, **kwargs)
+		count[0] += 1
+		if count[0] == 2:
+			raise KeyboardInterrupt
+	monkeypatch.setattr(multiCMD, '_fail_task', fail)
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['true']] * 4, max_threads=2, quiet=True)
+	# before: the tasks after the interrupted one were left with return code None
+	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
