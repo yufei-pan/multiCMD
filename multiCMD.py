@@ -853,7 +853,26 @@ def set_sudo(use_sudo):
 		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
 		USE_SUDO = False
 
+class _ExecRefused(OSError):
+	'''The system refused to execute the command ( ENOEXEC, E2BIG, ELOOP, ... ), as opposed to not finding it or not being allowed to ( internal )'''
+
 def _spawn(argv, stdout, stderr, env=None, explicit=False):
+	'''
+	Start a command in a process group of its own ( internal )
+
+	An exec error that is neither FileNotFoundError nor PermissionError is raised as _ExecRefused: the
+	command's own failure to run, which a shell reports as 126. Failures of multiCMD's own ( fork, pipes ) stay what they are.
+	'''
+	try:
+		return _spawn_process(argv, stdout, stderr, env, explicit)
+	except (FileNotFoundError, PermissionError):
+		raise
+	except OSError as e:
+		if e.filename is None:
+			raise
+		raise _ExecRefused(e.errno, e.strerror, e.filename) from None
+
+def _spawn_process(argv, stdout, stderr, env=None, explicit=False):
 	'''
 	Start a command in a process group of its own ( internal )
 
@@ -1522,20 +1541,19 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
 			task.stderr.append(str(e))
 			task.returncode = 126
+		except _ExecRefused as e:
+			# the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
+			print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
+			task.stderr.append(str(e))
+			task.returncode = 126
 		except Exception as e:
-			if isinstance(e, OSError) and e.filename is not None:
-				# the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started
-				print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
-				task.stderr.append(str(e))
-				task.returncode = 126
-			else:
-				import traceback
-				print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
-				print(str(e).split('\n'))
-				task.stderr.extend(str(e).split('\n'))
-				task.stderr.extend(traceback.format_exc().split('\n'))
-				task.returncode = -1
-				task._error = True
+			import traceback
+			print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
+			print(str(e).split('\n'))
+			task.stderr.extend(str(e).split('\n'))
+			task.stderr.extend(traceback.format_exc().split('\n'))
+			task.returncode = -1
+			task._error = True
 		finally:
 			task._finalized = True
 			# whatever happened, a long-lived executor keeps its tasks, not the environments they were given

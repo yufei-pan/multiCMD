@@ -574,3 +574,23 @@ def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, 
 	script.chmod(0o755)
 	task = run_command([str(script)], quiet=True, extra_env={'A': '1'}, return_object=True)
 	assert task.returncode == 126 and not task._error
+
+@pytest.mark.parametrize('kwargs', [{}, {'extra_env': {'A': '1'}}], ids=['plain', 'extra_env'])
+def test_e2big_is_126(launcher, kwargs):
+	# one argument longer than the system takes in a string
+	task = run_command(['true', 'x' * (256 * 1024)], quiet=True, return_object=True, **kwargs)
+	assert task.returncode == 126 and not task._error
+	assert 'Argument list too long' in ' '.join(task.stderr)
+
+
+def test_an_internal_oserror_is_still_an_error_with_a_traceback(launcher, monkeypatch):
+	def broken(proc, pgid):
+		raise OSError(5, 'Input/output error', 'somefile')
+	monkeypatch.setattr(multiCMD, '_register', broken)
+	try:
+		task = run_command(['true'], quiet=True, return_object=True)
+		assert task.returncode == -1 and task._error
+		assert any('Traceback' in line for line in task.stderr)
+	finally:
+		multiCMD.kill_all()
+
