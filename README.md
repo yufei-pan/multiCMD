@@ -284,7 +284,15 @@ and an empty `extra_env` is the same as none. "Inherited" is `os.environ` as the
 it when the command starts: a variable set behind Python's back ( `os.putenv`, `os.unsetenv`, a
 C library's `setenv` ) reaches commands started without `env` / `extra_env`, not the ones
 given them. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
-there. A command is looked up in the `PATH` of the environment it gets, on every Python version.
+there. On POSIX a command is looked up in the `PATH` of the environment it gets, on every Python
+version; Windows searches the calling process's `PATH` whatever the command's environment says.
+Before Python 3.11 the launcher starts in this process's environment and is handed the command's on
+top of it, so the two together must fit the system's argument limit ( `getconf ARG_MAX`; 2 MiB on Linux
+with the default stack, 128 KiB for one `NAME=VALUE` entry ); one that does not fit fails with return
+code 126, `Argument list too long`, on every Python.
+On Python 3.7-3.10 a command started with
+neither `env` nor `extra_env` still gets the `LC_CTYPE=C.UTF-8` that interpreter's locale coercion
+sets in a C locale ( as before ); a command given one of them gets exactly the environment described.
 Both are per command: they never change `os.environ` and never reach another command, so
 concurrent commands each see their own. `AsyncExecutor` takes them too, as defaults a call
 overrides. `sudo` resets the environment by default, so with `use_sudo` they may not reach the
