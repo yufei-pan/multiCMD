@@ -7,7 +7,7 @@ COMMIT_DATE='2026-10-12'
 __running_threads=set()
 __running_threads_lock=threading.Lock()
 __finished_threads=collections.deque()
-_JOIN_MAY_HANG=sys.version_info<(3,9,8)
+_JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
 _BRACKET_RX=re.compile('\\[([^\\]]+)\\]')
 _ALPHANUM=string.digits+string.ascii_letters
 _ALPHA_IDX={c:i for(i,c)in enumerate(_ALPHANUM)}
@@ -59,7 +59,6 @@ class _Thread(threading.Thread):
 	def _abandon(self):
 		if self._claim.setdefault('by','abandon')!='abandon':return False
 		self.done.set();return True
-	def _runs(self):return self._claim.get('by')=='run'
 	def run(self):
 		try:
 			if self._claim.setdefault('by','run')=='run':super().run()
@@ -75,30 +74,95 @@ class _Thread(threading.Thread):
 			left=None if deadline is None else max(0,deadline-time.monotonic())
 			if _JOIN_MAY_HANG:left=1 if left is None else min(left,1)
 			super().join(left)
+class _HoldCtrlC:
+	previous=None;active=False;owner=None;held=None;early=None;absorbed=False;handling=False
+	def _running(self,frame):
+		while frame is not None:
+			if frame is self.owner:return True
+			frame=frame.f_back
+		return False
+	def __call__(self,signum,frame):
+		if self.active and(frame is None or self._running(frame)):self.held=signum,frame;return
+		self.active=False
+		try:signal.signal(signum,self.previous)
+		except Exception:pass
+		self.previous(signum,frame)
+	def __enter__(self):
+		try:self._hold()
+		except KeyboardInterrupt as e:
+			self.early=e
+			if not self.active:self._hold()
+		return self
+	def _hold(self):
+		if threading.current_thread()is not threading.main_thread():return
+		current=signal.getsignal(signal.SIGINT)
+		if isinstance(current,_HoldCtrlC):
+			if current.active and current._running(sys._getframe()):return
+			current=current.previous
+		if not callable(current):return
+		self.previous=current;self.owner=sys._getframe(2);self.active=True
+		try:signal.signal(signal.SIGINT,self)
+		except ValueError:self.active=False;self.previous=None
+		except BaseException:self._restore();raise
+	def _restore(self):
+		self.active=False
+		try:signal.signal(signal.SIGINT,self.previous)
+		except ValueError:pass
+	def __exit__(self,exc_type,exc,tb):
+		self.active=False;self.owner=None
+		if self.previous is not None:self._restore()
+		if self.held is None and self.early is None:return False
+		if self.handling or exc_type is not None and issubclass(exc_type,KeyboardInterrupt):self.absorbed=True;return False
+		early,self.early=self.early,None
+		if self.held is not None:signum,frame=self.held;self.held=None;self.previous(signum,frame)
+		if early is not None:raise early
+		return False
+_settling=threading.local()
 def _settle(step):
-	while True:
-		try:step();return
-		except KeyboardInterrupt:pass
-def _start_threads(threads,register=None,forget=None,fail=None,abort=None):
-	failing={}
+	hold=_HoldCtrlC();hold.handling=isinstance(sys.exc_info()[1],KeyboardInterrupt);cut=None;own=False
 	try:
-		for thread in threads:
+		if getattr(_settling,'messages',None)is None:own=True;_settling.messages={}
+		with hold:
+			while True:
+				try:
+					while True:
+						try:step();break
+						except KeyboardInterrupt as e:cut=e
+					break
+				except KeyboardInterrupt as e:cut=e
+	finally:
+		if own:
+			messages,_settling.messages=getattr(_settling,'messages',None),None
+			for text in(messages or{}).values():_write_error(text)
+	if cut is not None:
+		if not hold.handling:raise cut
+		return True
+	return hold.absorbed
+def _start_threads(threads,register=None,forget=None,fail=None,abort=None):
+	failing={};ended=[None]
+	def failed(thread,error,index):
+		failing[thread]=error
+		if fail(thread,error):ended[0]=index+1
+		failing[thread]=None
+	try:
+		for(index,thread)in enumerate(threads):
 			if register is not None:register(thread)
 			try:thread.start()
 			except Exception as e:
 				if not thread._abandon():continue
 				if forget is not None:forget(thread)
 				if fail is None:raise
-				failing[thread]=e;fail(thread,e);failing[thread]=None
+				_settle(lambda:failed(thread,e,index))
+				if ended[0]is not None:_settle(lambda:[forget(thread)for thread in threads[ended[0]:]if thread._abandon()and forget is not None]);break
 	except BaseException:
 		def settle():
 			for thread in threads:
 				if thread._abandon()and forget is not None:forget(thread)
 			for(thread,error)in failing.items():
-				if error is not None:fail(thread,error)
+				if error is not None:fail(thread,error);failing[thread]=None
 			if abort is not None:abort()
 		_settle(settle);raise
-	return[thread for thread in threads if thread not in failing]
+	return[thread for thread in threads[:ended[0]]if thread not in failing]
 class _Display:
 	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
@@ -199,7 +263,9 @@ class AsyncExecutor:
 	def wait(self,timeout=None,threads=...):
 		deadline=None if timeout is None or timeout<0 else time.monotonic()+timeout
 		try:self._wait_until(deadline,threads)
-		except KeyboardInterrupt:_stop_tasks(self.tasks);self._wait_until(time.monotonic()+5);raise
+		except KeyboardInterrupt:
+			if not _stop_tasks(self.tasks):self._wait_until(time.monotonic()+5)
+			raise
 		return[thread for thread in self.runningThreads if thread.is_alive()]
 	def _wait_until(self,deadline,threads=...):
 		joined=set()
@@ -545,25 +611,30 @@ def _child_env(task,pager=False):
 def _execute(task,timeout,quiet,decor,use_pty=False):
 	master=slave=None;explicit=task._env is not None or task._extra_env is not None
 	if use_pty:master,slave=_open_pty(len(decor[0]))
-	proc=None;streams=[];readers=[];interrupted=False
+	proc=pgid=None;streams=[];readers=[];interrupted=False
 	try:
-		if master is not None:
-			try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True),explicit)
-			finally:os.close(slave)
-			task._pty=True;streams.append((io.open(master,'rb'),task.stdout))
-		else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit);streams.extend(((proc.stdout,task.stdout),(proc.stderr,task.stderr)))
-		_register(proc,pgid);task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);reason=_watch(task,proc,timeout)
+		with _HoldCtrlC():
+			if master is not None:
+				try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True),explicit)
+				finally:os.close(slave)
+				task._pty=True;streams.append((io.open(master,'rb'),task.stdout))
+			else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit);streams.extend(((proc.stdout,task.stdout),(proc.stderr,task.stderr)))
+			_register(proc,pgid)
+		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);reason=_watch(task,proc,timeout)
 	except BaseException as e:
 		def settle():
+			if proc is not None:
+				with _live_procs_lock:_live_procs[proc]=pgid
 			pending=streams or([]if proc is None or master is not None else[(proc.stdout,None),(proc.stderr,None)])
 			for(i,(stream,_))in enumerate(pending):
 				if i>=len(readers)or readers[i]._abandon():stream.close()
-		_settle(settle)
+		try:_settle(settle)
+		except KeyboardInterrupt as ctrl_c:e=ctrl_c
 		if master is not None and not streams:
 			try:os.close(master)
 			except OSError:pass
-		if proc is None:raise
-		if not isinstance(e,KeyboardInterrupt):_kill_commands([(proc,pgid)],signal.SIGINT);_unregister(proc);_join_all(readers,1);raise
+		if proc is None:raise e
+		if not isinstance(e,KeyboardInterrupt):_kill_commands([(proc,pgid)],signal.SIGINT);_unregister(proc);_join_all(readers,1);raise e
 		reason,interrupted='stop',True
 	if reason=='timeout':task.stderr.append('Timeout!')
 	if reason is not None:_kill_commands([(proc,pgid)],signal.SIGINT)
@@ -592,24 +663,30 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 				return task.stdout+task.stderr if with_stdErr else task.stdout
 			if not quiet:_display.message('Running command: '+_quote_command(task.command),decor);_display.message('-'*100,decor)
 			_execute(task,timeout,quiet,decor,use_pty)
-		except FileNotFoundError as e:_cannot_run(task,127,'Command path not found',e,quiet)
-		except(PermissionError,_ExecRefused)as e:_cannot_run(task,126,'Command cannot be executed',e,quiet)
-		except Exception as e:_fail_task(task,str(e),e,quiet)
+		except FileNotFoundError as e:_settle(lambda:_cannot_run(task,127,'Command path not found',e,quiet))
+		except(PermissionError,_ExecRefused)as e:_settle(lambda:_cannot_run(task,126,'Command cannot be executed',e,quiet))
+		except Exception as e:_settle(lambda:_fail_task(task,str(e),e,quiet))
 		finally:task._finalized=True;task._env=task._extra_env=None
 		if not quiet:_display.message('-'*100,decor);_display.message(f"Process exited with return code {task.returncode}",decor)
 		if with_stdErr:return task.stdout+task.stderr
 		else:return task.stdout
-def _show_error(text):
+def _write_error(text):
 	try:print(text,file=sys.stderr,flush=True)
 	except Exception:pass
+def _show_error(text,key=None):
+	messages=getattr(_settling,'messages',None)
+	if messages is None:_write_error(text)
+	else:messages[text if key is None else key]=text
 def _cannot_run(task,returncode,what,error,quiet=False):
-	task.stderr.append(str(error));task.returncode=returncode
-	if not quiet:_show_error(f"{what}: {task.command[0]}")
+	line=str(error)
+	if task.stderr[-1:]!=[line]:task.stderr.append(line)
+	task.returncode=returncode
+	if not quiet:_show_error(f"{what}: {task.command[0]}",task)
 def _fail_task(task,message,error,quiet=False):
 	import traceback;lines=message.split('\n');record=lines+''.join(traceback.format_exception(type(error),error,error.__traceback__)).split('\n')
 	if task.stderr[-len(record):]!=record:task.stderr.extend(record)
 	task.returncode=-1;task._error=True;task.end_time=time.time();task._env=task._extra_env=None;task._finalized=True
-	if not quiet:_show_error(f"Error running command: {task.command}\n"+'\n'.join(lines))
+	if not quiet:_show_error(f"Error running command: {task.command}\n"+'\n'.join(lines),task)
 def _run_executor_task(task,permit,timeout,quiet,dry_run,finished,decor=('','',''),use_pty=False):
 	try:__run_command(task,permit,timeout,quiet,dry_run,decor=decor,use_pty=use_pty)
 	finally:finished.append((threading.current_thread(),task))
@@ -687,8 +764,13 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 def _stop_tasks(tasks):
 	def stop():
 		for task in tasks:task.stop=True
-	_settle(stop)
-def _stop_and_wait(tasks,threads,limit=5):_stop_tasks(tasks);_join_all(threads,limit)
+	return _settle(stop)
+def _stop_and_wait(tasks,threads,limit=5,forget=None):
+	def stop():
+		for thread in threads:
+			if thread._abandon()and forget is not None:forget(thread)
+		for task in tasks:task.stop=True
+	if not _settle(stop):_join_all(threads,limit)
 def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 	pending=iter(list(zip(tasks,decors)));lock=threading.Lock()
 	def worker():
@@ -701,13 +783,11 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 			finally:task.thread=None
 	wanted=min(max_threads,len(tasks));workers=[];errors=[]
 	try:
-		workers.extend(_Thread(worker)for _ in range(wanted));running=_start_threads(workers,fail=lambda thread,error:errors.append(error),abort=lambda:_stop_tasks(tasks))
-		if not running:
-			for task in tasks:_fail_task(task,f"cannot start a thread to run it: {errors[0]}",errors[0],quiet)
-			return
+		workers.extend(_Thread(worker)for _ in range(wanted));running=_start_threads(workers,fail=lambda thread,error:errors.append(error)or True,abort=lambda:_stop_tasks(tasks))
+		if not running:_settle(lambda:[_fail_task(task,f"cannot start a thread to run it: {errors[0]}",errors[0],quiet)for task in tasks]);return
 		if len(running)<wanted and not quiet:_show_error(f"multiCMD: started {len(running)} of {wanted} threads: {errors[0]}")
 		for thread in running:_join(thread)
-	except BaseException:_settle(lambda:[thread._abandon()for thread in workers]);_stop_and_wait(tasks,workers);raise
+	except BaseException:_stop_and_wait(tasks,workers);raise
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error,prefix=prefix,color=color,pty=pty,shell=shell,env=env,extra_env=extra_env)[0]
 def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None):
 	tasks,use_sudo=_build_tasks(commands,parse=parse,use_sudo=use_sudo,shell=shell,env=env,extra_env=extra_env)
@@ -720,16 +800,17 @@ def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with
 			if not quiet:_display.message(_dry_run_line(task))
 			task._env=task._extra_env=None
 	elif not wait_for_return:
-		__reap_finished_threads();threads=[_Thread(__run_tracked_command,(task,sem,timeout,quiet,False,decor,use_pty),task)for(task,decor)in zip(tasks,decors)]
-		def register(thread):
-			with __running_threads_lock:__running_threads.add(thread)
-			thread.task.thread=thread
+		__reap_finished_threads();threads=[]
 		def forget(thread):
 			with __running_threads_lock:__running_threads.discard(thread)
 			thread.task.thread=thread;thread.task._env=thread.task._extra_env=None
 		def fail(thread,error):_fail_task(thread.task,f"cannot start its thread: {error}",error,quiet)
-		try:_start_threads(threads,register,forget,fail,abort=lambda:_stop_tasks(tasks))
-		except BaseException:_stop_and_wait(tasks,threads);raise
+		try:
+			threads.extend(_Thread(__run_tracked_command,(task,sem,timeout,quiet,False,decor,use_pty),task)for(task,decor)in zip(tasks,decors))
+			for thread in threads:thread.task.thread=thread
+			with __running_threads_lock:__running_threads.update(threads)
+			_start_threads(threads,forget=forget,fail=fail,abort=lambda:_stop_tasks(tasks))
+		except BaseException:_stop_and_wait(tasks,threads,forget=forget);raise
 	elif max_threads>1:_run_pool(tasks,decors,sem,timeout,quiet,False,max_threads,use_pty)
 	else:
 		try:
@@ -751,7 +832,8 @@ def join_threads(threads=...,timeout=None):
 	except KeyboardInterrupt:
 		ours=[]
 		def stop():ours[:]=[thread for thread in threads if isinstance(thread,_Thread)and thread.task is not None];_stop_tasks([thread.task for thread in ours])
-		_settle(stop);_join_all(ours,5);raise
+		if not _settle(stop):_join_all(ours,5)
+		raise
 	__reap_finished_threads()
 _EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'
 def _exit_status(tasks):
