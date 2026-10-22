@@ -495,7 +495,7 @@ def test_an_abandoned_thread_never_runs_its_target_and_a_running_one_is_not_aban
 	thread = multiCMD._Thread(release.wait, (10,))
 	thread.start()
 	deadline = time.monotonic() + 5
-	while not thread._runs() and time.monotonic() < deadline:
+	while not _runs(thread) and time.monotonic() < deadline:
 		time.sleep(0.01)
 	assert not thread._abandon() and thread.is_alive()
 	release.set()
@@ -538,11 +538,16 @@ def test_join_threads_waits_for_a_registered_thread_that_has_not_started_yet(mon
 
 # ---- a thread that cannot start, or whose start a Ctrl-C interrupts, leaves nothing behind
 
+def _runs(thread):
+	'''Whether the thread has got to its target'''
+	return thread._claim.get('by') == 'run'
+
+
 def _wait_until_it_runs(thread):
 	deadline = time.monotonic() + 5
-	while not thread._runs() and time.monotonic() < deadline:
+	while not _runs(thread) and time.monotonic() < deadline:
 		time.sleep(0.001)
-	assert thread._runs()
+	assert _runs(thread)
 
 
 def _fail_nth_start(monkeypatch, target, n, exc=RuntimeError("can't start new thread"), after=False):
@@ -622,9 +627,9 @@ def test_ctrl_c_while_fire_and_forget_threads_start(monkeypatch, after):
 	assert time.monotonic() - start < 4
 	ran = 2 if after else 1
 	# the ones that run are stopped ( killed, or skipped if they had not spawned yet ) before the call re-raises
-	assert all(task.stop and task.thread._runs() and not task.is_alive() for task in tasks[:ran])
+	assert all(task.stop and _runs(task.thread) and not task.is_alive() for task in tasks[:ran])
 	# the others never start: skipped, each with its thread done, which a join returns from at once
-	assert all(task.stop and not task.thread._runs() and not task.thread.is_alive() and task.returncode is None
+	assert all(task.stop and not _runs(task.thread) and not task.thread.is_alive() and task.returncode is None
 		and task._extra_env is None for task in tasks[ran:])
 	assert not _global_threads() or all(not thread.is_alive() for thread in _global_threads())
 	assert not set(task.thread for task in tasks[ran:]) & _global_threads()
@@ -712,7 +717,7 @@ def test_abandon_gives_the_same_answer_after_a_ctrl_c_cut_it_short():
 	assert thread._abandon() and thread.done.is_set() and not thread.is_alive()
 	thread.start()
 	thread.join(1)
-	assert not thread._runs()
+	assert not _runs(thread)
 
 
 @pytest.mark.parametrize('version, may_hang', [((3, 9, 7), True), ((3, 9, 8), False), ((3, 10, 0), True), ((3, 10, 1), False), ((3, 13, 0), False)])
@@ -785,7 +790,7 @@ def test_start_threads_settles_every_thread_when_the_starts_end_early(monkeypatc
 			multiCMD._start_threads(threads, register, tracked.discard, fail, lambda: aborted.append(1))
 		assert aborted
 		# the two started run; the others, registered or not, are abandoned and forgotten
-		assert [thread._runs() for thread in threads] == [True, True, False, False]
+		assert [_runs(thread) for thread in threads] == [True, True, False, False]
 		assert all(thread.done.is_set() for thread in threads[2:])
 		assert tracked == set(threads[:2])
 		assert failed == ([threads[2]] * 2 if where == 'fail' else [])
@@ -824,7 +829,7 @@ def test_start_threads_without_fail_ends_the_starts_on_the_first_error(monkeypat
 	monkeypatch.setattr(multiCMD._Thread, 'start', start)
 	with pytest.raises(RuntimeError):
 		multiCMD._start_threads(threads)
-	assert [thread._runs() for thread in threads] == [True, False, False]
+	assert [_runs(thread) for thread in threads] == [True, False, False]
 	assert all(multiCMD._join(thread, 5) for thread in threads)
 
 

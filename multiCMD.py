@@ -252,10 +252,6 @@ class _Thread(threading.Thread):
 		self.done.set()
 		return True
 
-	def _runs(self):
-		'''Whether the thread has got to its target ( internal )'''
-		return self._claim.get('by') == 'run'
-
 	def run(self):
 		try:
 			if self._claim.setdefault('by', 'run') == 'run':
