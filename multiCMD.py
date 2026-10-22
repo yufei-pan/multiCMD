@@ -1995,13 +1995,14 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				_display.message('Running command: ' + _quote_command(task.command), decor)
 				_display.message('-' * 100, decor)
 			_execute(task, timeout, quiet, decor, use_pty)
+		# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
 		except FileNotFoundError as e:
-			_cannot_run(task, 127, 'Command path not found', e, quiet)
+			_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet))
 		except (PermissionError, _ExecRefused) as e:
 			# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-			_cannot_run(task, 126, 'Command cannot be executed', e, quiet)
+			_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet))
 		except Exception as e:
-			_fail_task(task, str(e), e, quiet)
+			_settle(lambda: _fail_task(task, str(e), e, quiet))
 		finally:
 			task._finalized = True
 			# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
@@ -2039,12 +2040,15 @@ def _show_error(text, key=None):
 def _cannot_run(task, returncode, what, error, quiet=False):
 	'''
 	Record that a command could not be run ( internal ): not found ( 127 ) or not executable ( 126 ), with the
-	error in stderr; what it is about is shown on stderr unless quiet, as every failure multiCMD reports
+	error in stderr; what it is about is shown on stderr unless quiet, as every failure multiCMD reports.
+	Run again for the same failure ( after a Ctrl-C cut it short ), it records the error once.
 	'''
-	task.stderr.append(str(error))
+	line = str(error)
+	if task.stderr[-1:] != [line]:
+		task.stderr.append(line)
 	task.returncode = returncode
 	if not quiet:
-		_show_error(f'{what}: {task.command[0]}')
+		_show_error(f'{what}: {task.command[0]}', task)
 
 def _fail_task(task, message, error, quiet=False):
 	'''

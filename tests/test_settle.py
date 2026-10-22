@@ -386,6 +386,31 @@ def test_a_ctrl_c_while_the_command_starts_still_stops_it(monkeypatch, tmp_path)
 	assert not multiCMD._live_procs
 
 
+# ---- a command that cannot be run is recorded whole, whatever cuts the recording short
+
+def test_a_missing_command_cut_short_while_it_is_recorded_still_gets_127(monkeypatch):
+	class Cut(list):
+		armed = True
+		def append(self, item):
+			super().append(item)
+			if Cut.armed:
+				Cut.armed = False
+				raise KeyboardInterrupt
+	tasks = []
+	real_build = multiCMD._build_tasks
+	def build(*args, **kwargs):
+		built = real_build(*args, **kwargs)
+		for task in built[0]:
+			task.stderr = Cut()
+		tasks.extend(built[0])
+		return built
+	monkeypatch.setattr(multiCMD, '_build_tasks', build)
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=True)
+	# before: the error text was recorded with return code None
+	assert tasks[0].returncode == 127 and len(tasks[0].stderr) == 1
+
+
 # ---- the pool: one failed start is enough, and failing every task is settled
 
 def test_the_pool_stops_starting_workers_after_the_first_that_cannot_start(monkeypatch, capfd):
