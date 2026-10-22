@@ -1,6 +1,6 @@
 '''
-A Ctrl-C while multiCMD settles its bookkeeping: held on the main thread and raised once the step is done,
-never cutting it short nor lost; the failure messages a step shows appear once, after it
+A Ctrl-C while multiCMD settles its bookkeeping: the step runs again to its end and the Ctrl-C is raised after it,
+never lost; the failure messages a step shows appear once, after it
 '''
 import os
 import signal
@@ -46,7 +46,7 @@ def _sigint_bits(pid):
 	return bits
 
 
-# ---- _settle(): a Ctrl-C is held while the step runs and raised right after it
+# ---- _settle(): a Ctrl-C that cuts the step short runs it again, and is raised right after it
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
 def test_a_ctrl_c_inside_a_settled_step_is_raised_right_after_it(another_thread):
@@ -58,8 +58,9 @@ def test_a_ctrl_c_inside_a_settled_step_is_raised_right_after_it(another_thread)
 		done.append(1)
 	with pytest.raises(KeyboardInterrupt):
 		multiCMD._settle(step)
-	# before: the Ctrl-C cut the step short, it ran again, and the Ctrl-C was lost
-	assert runs == [1] and done == [1]
+	# the Ctrl-C cut the step short and it ran again to its end ( nothing is held: see review of round 9, finding
+	# 5 ); before round 8 the Ctrl-C was then lost
+	assert runs == [1, 1] and done == [1]
 	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
@@ -77,7 +78,7 @@ def test_a_ctrl_c_inside_a_settled_step_is_raised_when_the_caller_handles_one_al
 			raise first
 		except KeyboardInterrupt:
 			multiCMD._settle(step)
-	assert runs == [1]
+	assert runs == [1, 1]
 	assert raised.value is not first and raised.value.__context__ is first
 	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
@@ -95,7 +96,7 @@ def test_a_keyboard_interrupt_that_cuts_a_step_short_runs_it_again_and_is_raised
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_settled_step_on_another_thread_holds_nothing_and_needs_not(another_thread):
+def test_a_settled_step_on_another_thread_sees_the_handler_as_it_is(another_thread):
 	# Python runs signal handlers on the main thread only: a Ctrl-C meanwhile is the main thread's
 	seen = []
 	def step():
@@ -107,7 +108,8 @@ def test_a_settled_step_on_another_thread_holds_nothing_and_needs_not(another_th
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_ctrl_c_goes_to_a_handler_of_the_program_once_the_step_is_done(another_thread):
+def test_a_ctrl_c_during_a_settled_step_goes_to_the_programs_handler(another_thread):
+	# as it lands: nothing is held, and a handler that does not raise does not cut the step short
 	calls = []
 	def handler(signum, frame):
 		calls.append(signum)
@@ -117,68 +119,30 @@ def test_a_ctrl_c_goes_to_a_handler_of_the_program_once_the_step_is_done(another
 			_ctrl_c()
 			calls.append('step')
 		multiCMD._settle(step)
-		assert calls == ['step', signal.SIGINT] and signal.getsignal(signal.SIGINT) is handler
-	finally:
-		signal.signal(signal.SIGINT, previous)
-
-
-def test_a_hold_left_in_place_hands_the_ctrl_c_on():
-	# a restore cut short leaves the hold installed but inactive: a Ctrl-C then still reaches the program's handler
-	calls = []
-	hold = multiCMD._HoldCtrlC()
-	hold.previous = lambda signum, frame: calls.append(signum)
-	previous = signal.signal(signal.SIGINT, hold)
-	try:
-		hold(signal.SIGINT, None)
-		assert calls == [signal.SIGINT] and signal.getsignal(signal.SIGINT) is hold.previous
+		assert calls == [signal.SIGINT, 'step'] and signal.getsignal(signal.SIGINT) is handler
 	finally:
 		signal.signal(signal.SIGINT, previous)
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_hold_whose_block_was_left_without_its_exit_hands_the_ctrl_c_on(another_thread):
-	# the exit itself cut short ( a KeyboardInterrupt from another signal's handler as it begins ): the hold is
-	# still active, but the code that holds it is gone
-	def enter():
-		hold = multiCMD._HoldCtrlC()
-		hold.__enter__()
-		return hold
-	hold = enter()
-	assert hold.active and signal.getsignal(signal.SIGINT) is hold
+def test_a_settled_step_touches_no_signal_state(monkeypatch, another_thread):
+	# ( review of round 9, finding 5 ) the hold swapped SIGINT's handler with signal.signal(), which also puts back
+	# CPython's own C-level one; a step cut short by a Ctrl-C now only runs again
+	calls = []
+	real = signal.signal
+	monkeypatch.setattr(signal, 'signal', lambda signum, handler: (calls.append(signum), real(signum, handler))[1])
+	runs = []
+	def step():
+		runs.append(1)
+		if len(runs) == 1:
+			_ctrl_c()
 	with pytest.raises(KeyboardInterrupt):
-		_ctrl_c()
-	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler and hold.held is None
-	# and a new hold is not taken for one already held
-	multiCMD._settle(lambda: None)
-	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
-
-
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
-@pytest.mark.parametrize('where', ['the main thread', 'another thread'])
-def test_commands_started_while_a_ctrl_c_is_held_do_not_inherit_a_blocked_or_ignored_sigint(where, tmp_path):
-	# the hold changes SIGINT's Python handler, never the signal mask: a caught signal is reset by exec
-	command = ['sh', '-c', 'grep -E "^Sig(Blk|Ign)" /proc/$$/status']
-	if where == 'the main thread':
-		# ( round 8 held the spawn itself; a normal run no longer holds anything: started inside a hold here )
-		result = []
-		multiCMD._settle(lambda: result.append(multiCMD.run_command(command, quiet=True)) if not result else None)
-		out = result[0]
-	else:
-		result = []
-		started = threading.Event()
-		def step():
-			if not started.is_set():
-				started.set()
-				worker = threading.Thread(target=lambda: result.append(multiCMD.run_command(command, quiet=True)))
-				worker.start()
-				worker.join(10)
 		multiCMD._settle(step)
-		out = result[0]
-	bits = {line.split(':')[0]: bool(int(line.split(':')[1], 16) & (1 << (signal.SIGINT - 1))) for line in out}
-	assert bits == {'SigBlk': False, 'SigIgn': False}
+	assert runs == [1, 1] and calls == []
+	assert not hasattr(multiCMD, '_HoldCtrlC')
 
 
-# ---- the messages a settled step shows: once, after it, with the program's handler back
+# ---- the messages a settled step shows: once, after it
 
 def test_messages_shown_in_a_settled_step_appear_once_after_it(monkeypatch):
 	written = []
@@ -195,7 +159,7 @@ def test_messages_shown_in_a_settled_step_appear_once_after_it(monkeypatch):
 	with pytest.raises(KeyboardInterrupt):
 		multiCMD._settle(step)
 	assert runs == [1, 1]
-	# shown once, outside the hold ( a write to a stalled stderr cannot keep a Ctrl-C waiting )
+	# shown once, after the step
 	assert written == [('first', signal.default_int_handler)]
 	multiCMD._show_error('now')
 	assert written[-1][0] == 'now'
@@ -226,7 +190,7 @@ def test_a_fire_and_forget_start_failure_cut_short_shows_its_message_once(monkey
 	assert capfd.readouterr().err.count('Error running command') == 1
 
 
-# ---- a Ctrl-C the bookkeeping of a failure held is not lost
+# ---- a Ctrl-C while the bookkeeping of a failure is done is not lost
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
 def test_a_ctrl_c_while_a_serial_run_cleans_up_a_failure_stops_the_run(monkeypatch):
@@ -500,8 +464,19 @@ def _normal_runs():
 	ex.wait()
 	assert [task.returncode for task in ex.tasks] == [0] * 3
 	ex.cleanup()
-	# a timeout kills the command: still no hold
+	# a timeout kills the command: still no signal handler set
 	assert multiCMD.run_command(['sleep', '5'], quiet=True, timeout=0.3, return_code_only=True) == 124
+	# ( review of round 9, finding 4 ) nothing to run: statbtrfs.execute_commands([]) and hpcp do this
+	assert run_commands([], max_threads=4, quiet=True) == [] and run_commands([], quiet=True) == []
+	# the executor stopped, and cleaned up, while a command runs and others are queued
+	for finish in ('stop', 'cleanup'):
+		ex = AsyncExecutor(max_threads=1, quiet=True)
+		ex.run_commands([['sleep', '5']] * 3)
+		deadline = time.monotonic() + 5
+		while not multiCMD._live_procs and time.monotonic() < deadline:
+			time.sleep(0.01)
+		getattr(ex, finish)()
+		assert not multiCMD._live_procs
 
 
 def test_a_normal_run_never_sets_a_signal_handler(monkeypatch):
@@ -516,6 +491,27 @@ def test_a_normal_run_never_sets_a_signal_handler(monkeypatch):
 	_normal_runs()
 	assert calls == []
 	assert signal.getsignal(signal.SIGINT) is before
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_the_rare_paths_never_set_a_signal_handler_either(monkeypatch):
+	# ( review of round 9, finding 5 ) a missing command, a thread that cannot start, a Ctrl-C while commands run
+	calls = []
+	real = signal.signal
+	monkeypatch.setattr(signal, 'signal', lambda signum, handler: (calls.append(signum), real(signum, handler))[1])
+	assert multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=True, return_code_only=True) == 127
+	_failing_worker_starts(monkeypatch, {1})
+	assert run_commands([['true']] * 3, max_threads=3, quiet=True, return_code_only=True) == [0] * 3
+	monkeypatch.undo()
+	monkeypatch.setattr(signal, 'signal', lambda signum, handler: (calls.append(signum), real(signum, handler))[1])
+	for max_threads in (1, 2):
+		with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+			run_commands([['sleep', '5']] * 2, max_threads=max_threads, quiet=True)
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+		ex = AsyncExecutor(max_threads=2, quiet=True)
+		ex.run_commands([['sleep', '5']] * 3)
+		ex.wait()
+	assert calls == [] and not multiCMD._live_procs
 
 
 _C_LEVEL_PROBE = r'''
@@ -568,7 +564,7 @@ def test_a_normal_run_leaves_a_c_level_sigint_handler_and_siginterrupt_in_place(
 	assert result['interrupted'] and 'most recent call first' in dump.read_text()
 
 
-# ---- review round 8: a held Ctrl-C is always handed on, never absorbed
+# ---- review round 8: a Ctrl-C while multiCMD stops its commands is always raised, never absorbed
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
 def test_a_ctrl_c_while_the_executor_stops_inside_the_programs_own_handler_is_raised(another_thread):
@@ -714,14 +710,17 @@ def test_a_second_ctrl_c_while_a_serial_run_deals_with_the_first_ends_the_wait_f
 			multiCMD._unregister(proc)
 
 
-# ---- review round 8: what a hold records comes before the Ctrl-C it hands on
+# ---- review round 8: what a settled step records comes before the Ctrl-C it raises
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
 def test_a_ctrl_c_while_a_missing_command_is_recorded_is_raised_once_it_is(monkeypatch, another_thread):
 	# ( finding 7 ) the command could not be run ( 127 ), and a Ctrl-C lands as that is recorded
 	real_cannot = multiCMD._cannot_run
+	sent = []
 	def cannot(*args, **kwargs):
-		_ctrl_c()
+		if not sent:
+			sent.append(1)
+			_ctrl_c()
 		return real_cannot(*args, **kwargs)
 	monkeypatch.setattr(multiCMD, '_cannot_run', cannot)
 	tasks = []
@@ -750,59 +749,6 @@ def test_a_ctrl_c_while_a_pool_fails_its_tasks_is_raised_once_every_one_is_recor
 	with pytest.raises(KeyboardInterrupt):
 		run_commands([['true']] * 4, max_threads=2, quiet=True)
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
-
-
-# ---- review round 8: a handler installed during a hold stays, and gets the held Ctrl-C
-
-@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-@pytest.mark.parametrize('held', [False, True])
-def test_a_handler_installed_during_a_hold_stays_and_gets_the_held_ctrl_c(held, another_thread):
-	# ( finding 6, review probe p_restore.py ) e.g. a SIGTERM handler running inside the hold that sets SIG_IGN
-	calls = []
-	def handler(signum, frame):
-		calls.append(signum)
-	def step():
-		if held:
-			_ctrl_c()
-		signal.signal(signal.SIGINT, handler)
-	try:
-		multiCMD._settle(step)
-		assert signal.getsignal(signal.SIGINT) is handler
-		assert calls == ([signal.SIGINT] if held else [])
-		# and SIG_IGN drops the held Ctrl-C
-		def ignore():
-			_ctrl_c()
-			signal.signal(signal.SIGINT, signal.SIG_IGN)
-		multiCMD._settle(ignore)
-		assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
-	finally:
-		signal.signal(signal.SIGINT, signal.default_int_handler)
-
-
-# ---- review round 8: a hold keeps no frame once it ends
-
-@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_hold_hands_the_ctrl_c_on_from_its_holder_and_keeps_nothing(another_thread):
-	# ( finding 10 ) round 8 kept the frame the Ctrl-C landed in, and kept it for good when it absorbed the Ctrl-C
-	seen = []
-	def handler(signum, frame):
-		seen.append(frame.f_code.co_name)
-	previous = signal.signal(signal.SIGINT, handler)
-	hold = multiCMD._HoldCtrlC()
-	def holder():
-		with hold:
-			_ctrl_c()
-			assert seen == [] and hold.held == signal.SIGINT
-			raise KeyboardInterrupt('the block\'s own')
-	try:
-		with pytest.raises(KeyboardInterrupt):
-			holder()
-		# handed on from the exit, as if it landed in the code that holds it
-		assert seen == ['holder']
-		assert hold.held is None and hold.owner is None and hold.early is None and not hold.active
-		assert signal.getsignal(signal.SIGINT) is handler
-	finally:
-		signal.signal(signal.SIGINT, previous)
 
 
 # ---- review round 8: a command whose Popen is cut short after the fork is still stopped
