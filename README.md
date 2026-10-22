@@ -406,10 +406,11 @@ arrives), can call `multiCMD.kill_all()` from its handler.
 
 A Ctrl-C that lands while multiCMD does its bookkeeping on the main thread ( after a Ctrl-C or a
 failure: which threads never ran, which commands to stop; or while it starts a command and
-registers it ) is held for those moments and raised right after, so it neither cuts that short nor
-gets lost. For that SIGINT's handler is briefly multiCMD's own, and your handler, if you installed
-one, is called with the Ctrl-C right after. A KeyboardInterrupt that another signal's handler raises
-is not held: the bookkeeping is then run again from the start.
+registers it ) is held for those moments and handed on right after, so it neither cuts that short
+nor gets lost. For that SIGINT's handler is briefly multiCMD's own: your handler, if you installed
+one, is called with every Ctrl-C right after, and the default one raises KeyboardInterrupt. A
+handler installed meanwhile stays, and gets the held Ctrl-C. A KeyboardInterrupt that another
+signal's handler raises is not held: the bookkeeping is then run again from the start.
 
 ## Key functions and objects
 

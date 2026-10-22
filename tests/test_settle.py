@@ -64,19 +64,21 @@ def test_a_ctrl_c_inside_a_settled_step_is_raised_right_after_it(another_thread)
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_ctrl_c_inside_a_settled_step_is_taken_when_the_caller_handles_one_already(another_thread):
+def test_a_ctrl_c_inside_a_settled_step_is_raised_when_the_caller_handles_one_already(another_thread):
+	# ( round 8 took it then, guessing from sys.exc_info() that the caller was on its way out: it is always handed on )
 	runs = []
 	def step():
 		runs.append(1)
 		if len(runs) == 1:
 			_ctrl_c()
-	try:
-		raise KeyboardInterrupt
-	except KeyboardInterrupt:
-		# the caller is on its way out with the first Ctrl-C: the second only tells it to end its wait
-		assert multiCMD._settle(step) is True
+	first = KeyboardInterrupt('first')
+	with pytest.raises(KeyboardInterrupt) as raised:
+		try:
+			raise first
+		except KeyboardInterrupt:
+			multiCMD._settle(step)
 	assert runs == [1]
-	assert multiCMD._settle(lambda: None) is False
+	assert raised.value is not first and raised.value.__context__ is first
 	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
@@ -147,7 +149,8 @@ def test_a_hold_whose_block_was_left_without_its_exit_hands_the_ctrl_c_on(anothe
 		_ctrl_c()
 	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler and hold.held is None
 	# and a new hold is not taken for one already held
-	assert multiCMD._settle(lambda: None) is False
+	multiCMD._settle(lambda: None)
+	assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
@@ -186,9 +189,8 @@ def test_messages_shown_in_a_settled_step_appear_once_after_it(monkeypatch):
 		assert written == []
 		if len(runs) == 1:
 			raise KeyboardInterrupt
-	try:
-		raise KeyboardInterrupt
-	except KeyboardInterrupt:
+	# ( the interrupt that cut the step short is raised after it: round 8 took it, the caller being on its way out )
+	with pytest.raises(KeyboardInterrupt):
 		multiCMD._settle(step)
 	assert runs == [1, 1]
 	# shown once, outside the hold ( a write to a stalled stderr cannot keep a Ctrl-C waiting )
@@ -452,3 +454,112 @@ def test_a_pool_whose_workers_cannot_start_fails_every_task_whatever_cuts_it_sho
 		run_commands([['true']] * 4, max_threads=2, quiet=True)
 	# before: the tasks after the interrupted one were left with return code None
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
+
+
+# ---- review round 8: a held Ctrl-C is always handed on, never absorbed
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_ctrl_c_while_the_executor_stops_inside_the_programs_own_handler_is_raised(another_thread):
+	# ( finding 3 ) the program handles a first Ctrl-C itself and stops its executor; a second lands meanwhile
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	sent = []
+	class Stopping(multiCMD.Task):
+		def __setattr__(self, name, value):
+			super().__setattr__(name, value)
+			if name == 'stop' and value and not sent:
+				sent.append(1)
+				_ctrl_c()
+	ex.tasks.append(Stopping(['x']))
+	first = KeyboardInterrupt('the program\'s')
+	with pytest.raises(KeyboardInterrupt) as raised:
+		try:
+			raise first
+		except KeyboardInterrupt:
+			ex.stop()
+	# before ( a96b922 ): taken for a second Ctrl-C of multiCMD's own, and lost: ex.stop() returned
+	assert sent and raised.value.__context__ is first
+
+
+def test_the_programs_handler_gets_every_ctrl_c(another_thread):
+	# ( finding 9, review probe p_custom.py ) e.g. "first Ctrl-C: stop gracefully; second: force quit"
+	calls = []
+	def handler(signum, frame):
+		calls.append(signum)
+		raise KeyboardInterrupt(len(calls))
+	previous = signal.signal(signal.SIGINT, handler)
+	release = threading.Event()
+	sent = []
+	class Thread(multiCMD._Thread):
+		@property
+		def task(self):
+			if threading.current_thread() is threading.main_thread() and not sent:
+				sent.append(1)
+				_ctrl_c()
+			return self._task
+		@task.setter
+		def task(self, value):
+			self._task = value
+	thread = Thread(release.wait, (10,), multiCMD.Task(['x']))
+	thread.start()
+	try:
+		with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
+			multiCMD.join_threads(threads=[thread])
+		# before ( a96b922 ): the second Ctrl-C never reached the program's handler
+		assert sent and calls == [signal.SIGINT, signal.SIGINT]
+	finally:
+		signal.signal(signal.SIGINT, previous)
+		release.set()
+	assert multiCMD._join(thread, 5)
+
+
+# ---- review round 8: a handler installed during a hold stays, and gets the held Ctrl-C
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+@pytest.mark.parametrize('held', [False, True])
+def test_a_handler_installed_during_a_hold_stays_and_gets_the_held_ctrl_c(held, another_thread):
+	# ( finding 6, review probe p_restore.py ) e.g. a SIGTERM handler running inside the hold that sets SIG_IGN
+	calls = []
+	def handler(signum, frame):
+		calls.append(signum)
+	def step():
+		if held:
+			_ctrl_c()
+		signal.signal(signal.SIGINT, handler)
+	try:
+		multiCMD._settle(step)
+		assert signal.getsignal(signal.SIGINT) is handler
+		assert calls == ([signal.SIGINT] if held else [])
+		# and SIG_IGN drops the held Ctrl-C
+		def ignore():
+			_ctrl_c()
+			signal.signal(signal.SIGINT, signal.SIG_IGN)
+		multiCMD._settle(ignore)
+		assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+	finally:
+		signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+# ---- review round 8: a hold keeps no frame once it ends
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_hold_hands_the_ctrl_c_on_from_its_holder_and_keeps_nothing(another_thread):
+	# ( finding 10 ) round 8 kept the frame the Ctrl-C landed in, and kept it for good when it absorbed the Ctrl-C
+	seen = []
+	def handler(signum, frame):
+		seen.append(frame.f_code.co_name)
+	previous = signal.signal(signal.SIGINT, handler)
+	hold = multiCMD._HoldCtrlC()
+	def holder():
+		with hold:
+			_ctrl_c()
+			assert seen == [] and hold.held == signal.SIGINT
+			raise KeyboardInterrupt('the block\'s own')
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			holder()
+		# handed on from the exit, as if it landed in the code that holds it
+		assert seen == ['holder']
+		assert hold.held is None and hold.owner is None and hold.early is None and not hold.active
+		assert signal.getsignal(signal.SIGINT) is handler
+	finally:
+		signal.signal(signal.SIGINT, previous)
