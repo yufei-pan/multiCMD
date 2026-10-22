@@ -1744,20 +1744,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				_display.message('Running command: ' + _quote_command(task.command), decor)
 				_display.message('-' * 100, decor)
 			_execute(task, timeout, quiet, decor, use_pty)
-		# if file not found
 		except FileNotFoundError as e:
-			print(f'Command path not found: {task.command[0]}',file=sys.stderr,flush=True)
-			task.stderr.append(str(e))
-			task.returncode = 127
-		except PermissionError as e:
-			print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
-			task.stderr.append(str(e))
-			task.returncode = 126
-		except _ExecRefused as e:
-			# the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-			print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
-			task.stderr.append(str(e))
-			task.returncode = 126
+			_cannot_run(task, 127, 'Command path not found', e, quiet)
+		except (PermissionError, _ExecRefused) as e:
+			# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
+			_cannot_run(task, 126, 'Command cannot be executed', e, quiet)
 		except Exception as e:
 			_fail_task(task, str(e), e, quiet)
 		finally:
@@ -1772,10 +1763,32 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
+def _show_error(text):
+	'''
+	Show a failure message on stderr ( internal ): one that cannot be shown ( stderr closed, a broken pipe ) is
+	dropped, as the failure it is about is already recorded on the task
+	'''
+	try:
+		print(text, file=sys.stderr, flush=True)
+	except Exception:
+		pass
+
+def _cannot_run(task, returncode, what, error, quiet=False):
+	'''
+	Record that a command could not be run ( internal ): not found ( 127 ) or not executable ( 126 ), with the
+	error in stderr; what it is about is shown on stderr unless quiet, as every failure multiCMD reports
+	'''
+	task.stderr.append(str(error))
+	task.returncode = returncode
+	if not quiet:
+		_show_error(f'{what}: {task.command[0]}')
+
 def _fail_task(task, message, error, quiet=False):
 	'''
 	Finalize a task multiCMD itself could not run ( internal ): return code -1 and _error ( not a SIGHUP death ),
-	the message and error's traceback in stderr, end_time; the message is shown on stderr unless quiet
+	the message and error's traceback in stderr, end_time; then the message is shown on stderr unless quiet
+	The failure is recorded before it is shown, so a message that cannot be shown changes nothing. Run again for
+	the same failure ( after a Ctrl-C cut it short ), it records the lines once.
 	@params:
 		task: The Task
 		message: What went wrong ( str )
@@ -1784,16 +1797,16 @@ def _fail_task(task, message, error, quiet=False):
 	'''
 	import traceback
 	lines = message.split('\n')
-	if not quiet:
-		print(f'Error running command: {task.command}', file=sys.stderr, flush=True)
-		print('\n'.join(lines), file=sys.stderr, flush=True)
-	task.stderr.extend(lines)
-	task.stderr.extend(''.join(traceback.format_exception(type(error), error, error.__traceback__)).split('\n'))
+	record = lines + ''.join(traceback.format_exception(type(error), error, error.__traceback__)).split('\n')
+	if task.stderr[-len(record):] != record:
+		task.stderr.extend(record)
 	task.returncode = -1
 	task._error = True
 	task.end_time = time.time()
 	task._env = task._extra_env = None
 	task._finalized = True
+	if not quiet:
+		_show_error(f'Error running command: {task.command}\n' + '\n'.join(lines))
 
 def _run_executor_task(task, permit, timeout, quiet, dry_run, finished, decor=('', '', ''), use_pty=False):
 	'''

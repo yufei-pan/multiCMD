@@ -304,6 +304,9 @@ command. On the command line: `mcmd -e LC_ALL=C -e UNSET_ME "cmd"`; `-n` shows t
 objects and its message lists each one with its return code and last error line.
 `Task` also records `start_time`, `end_time` and `duration`. With `dry_run=True` nothing
 runs; each command is printed once, quoted so it can be pasted into a shell.
+A command that is not found (return code 127), cannot be executed (126) or that multiCMD
+itself could not run (-1, `task._error`) says why in its `task.stderr`; multiCMD also
+prints that on stderr, unless `quiet=True`.
 
 ### Asynchronous / fire-and-forget
 

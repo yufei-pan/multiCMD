@@ -679,3 +679,58 @@ def test_an_internal_error_fails_the_command_and_shows_only_when_not_quiet(monke
 		assert out == '' and err == ''
 	else:
 		assert "Error running command: ['true']\nboom\n" in err and 'boom' not in out
+
+
+@pytest.mark.parametrize('quiet', [True, False])
+def test_every_failure_message_shows_only_when_not_quiet(tmp_path, capfd, quiet):
+	script = tmp_path / 'not-executable'
+	script.write_text('#!/bin/sh\necho hi\n')
+	tasks = run_commands([['mcmd-no-such-command-xyz'], [str(script)]], quiet=quiet, return_object=True)
+	assert [task.returncode for task in tasks] == [127, 126]
+	# the failure is on the task either way
+	assert 'mcmd-no-such-command-xyz' in tasks[0].stderr[0] and 'Permission denied' in tasks[1].stderr[0]
+	err = capfd.readouterr().err
+	if quiet:
+		assert err == ''
+	else:
+		assert 'Command path not found: mcmd-no-such-command-xyz' in err and f'Command cannot be executed: {script}' in err
+
+
+class _BrokenStderr:
+	def write(self, text):
+		raise BrokenPipeError(32, 'Broken pipe')
+
+	def flush(self):
+		raise BrokenPipeError(32, 'Broken pipe')
+
+
+def test_a_failure_that_cannot_be_shown_is_still_recorded(monkeypatch):
+	# a fire-and-forget thread that cannot start, its message on a stderr that cannot be written
+	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 1)
+	monkeypatch.setattr(sys, 'stderr', _BrokenStderr())
+	tasks = run_commands([['true']] * 3, wait_for_return=False, return_object=True)
+	multiCMD.join_threads()
+	# before the fix the write error stopped the whole batch and escaped from run_commands()
+	assert [task.returncode for task in tasks] == [-1, 0, 0]
+	assert tasks[0]._finalized and "can't start new thread" in tasks[0].stderr[0]
+	# the internal error path, and a command that is not found
+	def broken(*args, **kwargs):
+		raise ValueError('boom')
+	monkeypatch.setattr(multiCMD, '_execute', broken)
+	task = multiCMD.run_command(['true'], return_object=True)
+	assert task.returncode == -1 and task._finalized and task.stderr[0] == 'boom'
+	monkeypatch.undo()
+	monkeypatch.setattr(sys, 'stderr', _BrokenStderr())
+	assert multiCMD.run_command(['mcmd-no-such-command-xyz'], return_code_only=True) == 127
+
+
+def test_fail_task_run_again_records_the_failure_once():
+	task = multiCMD.Task(['true'])
+	try:
+		raise RuntimeError("can't start new thread")
+	except RuntimeError as e:
+		error = e
+	multiCMD._fail_task(task, 'cannot start its thread', error, quiet=True)
+	first = list(task.stderr)
+	multiCMD._fail_task(task, 'cannot start its thread', error, quiet=True)
+	assert task.stderr == first and task.returncode == -1 and task._finalized

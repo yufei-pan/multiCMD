@@ -110,7 +110,6 @@ def test_env_without_path_searches_the_default_path_not_the_parents(tmp_path, mo
 	for kwargs in ({'env': {'HOME': '/tmp'}}, {'extra_env': {'PATH': None}}):
 		task = run_command(['mcmd-env-tool'], quiet=True, return_object=True, **kwargs)
 		assert task.returncode == 127
-		assert 'mcmd-env-tool' in capsys.readouterr().err
 		assert 'mcmd-env-tool' in ' '.join(task.stderr)
 	# and the default path finds the system tools
 	assert run_command(['ls', '/'], quiet=True, return_code_only=True, env={'HOME': '/tmp'}) == 0
@@ -119,10 +118,10 @@ def test_env_without_path_searches_the_default_path_not_the_parents(tmp_path, mo
 	assert run_command(['ls', '/'], quiet=True, return_code_only=True, extra_env={'PATH': None}) == 0
 
 
-def test_error_still_names_the_command(capsys):
-	task = run_command(['mcmd-no-such-command', 'arg'], quiet=True, extra_env={'MCMD_T': 'x'}, return_object=True)
+def test_error_still_names_the_command(capfd):
+	task = run_command(['mcmd-no-such-command', 'arg'], extra_env={'MCMD_T': 'x'}, return_object=True)
 	assert task.returncode == 127
-	assert 'mcmd-no-such-command' in capsys.readouterr().err
+	assert 'Command path not found: mcmd-no-such-command' in capfd.readouterr().err
 	assert 'mcmd-no-such-command' in ' '.join(task.stderr)
 
 
