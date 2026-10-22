@@ -153,3 +153,42 @@ def test_spawn_restores_default_sigpipe_and_sigxfsz(launcher):
 	ignored = int(out.split()[1], 16)
 	assert not ignored & (1 << (signal.SIGPIPE - 1))
 	assert not ignored & (1 << (signal.SIGXFSZ - 1))
+
+
+def test_a_command_stopped_before_the_exec_wrapper_made_its_group_is_still_stopped(monkeypatch, tmp_path):
+	# ( review of round 9, finding 14 ) before 3.11 the group exists only once the wrapper's Python has called
+	# setpgid: a kill right after the start found no group ( ESRCH, swallowed ), took the command for gone and
+	# dropped it, and it then ran on, untracked. Here the wrapper takes 1.5 s to get there.
+	monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', False)
+	monkeypatch.setattr(multiCMD, '_PGROUP_EXEC', 'import time\ntime.sleep(1.5)\n' + multiCMD._PGROUP_EXEC)
+	marker = tmp_path / 'ran'
+	proc, pgid = multiCMD._spawn(['sh', '-c', f'touch {marker}; exec sleep 30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
+		multiCMD._unregister(proc)
+		time.sleep(1)
+		# before ( 0e4d015 ): still running, and the command ran once the wrapper got to it
+		assert proc.poll() is not None and not marker.exists()
+		assert proc not in multiCMD._live_procs
+	finally:
+		multiCMD._live_procs.pop(proc, None)
+		try:
+			os.killpg(proc.pid, signal.SIGKILL)
+		except OSError:
+			pass
+		proc.wait(5)
+
+
+def test_a_command_still_running_stays_registered():
+	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		multiCMD._unregister(proc)
+		assert proc in multiCMD._live_procs
+		multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
+		multiCMD._unregister(proc)
+		assert proc not in multiCMD._live_procs
+	finally:
+		multiCMD._live_procs.pop(proc, None)
+		multiCMD._kill_commands([(proc, pgid)], signal.SIGKILL)

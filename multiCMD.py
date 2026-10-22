@@ -1550,19 +1550,27 @@ def _register(proc, pgid):
 
 def _unregister(proc):
 	'''
-	Stop tracking a command once it is reaped ( internal )
+	Stop tracking a command once it is reaped ( internal ); one still running ( a kill did not reach it ) stays tracked
 	'''
+	if proc.poll() is None:
+		return
 	with _live_procs_lock:
 		_live_procs.pop(proc, None)
 
 def _send(proc, pgid, sig):
 	'''
 	Send sig to a command's process group, or to the process alone without a group ( internal )
+	Before Python 3.11 the exec wrapper's Python makes the group only once it runs: a command stopped right after
+	it started may have no group yet, and then gets sig as a process, before it can become the command.
 	'''
 	try:
 		if pgid is not None:
-			os.killpg(pgid, sig)
-		elif proc.poll() is None:
+			try:
+				os.killpg(pgid, sig)
+				return
+			except ProcessLookupError:
+				pass
+		if proc.poll() is None:
 			proc.send_signal(sig)
 	except OSError:
 		# already gone, or not ours to signal ( a root command under sudo: sudo relays the signal )
@@ -1571,13 +1579,14 @@ def _send(proc, pgid, sig):
 def _group_alive(proc, pgid):
 	'''
 	Whether anything in a command's process group is still running ( internal )
+	A group that does not exist ( yet: see _send ) is gone only once the command itself is.
 	'''
 	if pgid is None:
 		return proc.poll() is None
 	try:
 		os.killpg(pgid, 0)
 	except ProcessLookupError:
-		return False
+		return proc.poll() is None
 	except OSError:
 		pass
 	return True
