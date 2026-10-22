@@ -938,3 +938,25 @@ def test_a_ctrl_c_right_after_the_starts_is_a_first_one_and_is_waited_for(monkey
 	assert not multiCMD._live_procs
 	monkeypatch.undo()
 	assert _join_threads_returns_within(5)
+
+
+def test_a_ctrl_c_that_thread_start_turns_into_another_error_is_still_raised(monkeypatch):
+	# ( seen on free-threaded 3.13t ) a Ctrl-C inside Condition.wait()'s _acquire_restore(), as Thread.start() waits
+	# for an output reader: the Condition's release then raises RuntimeError, the reader runs all the same, and
+	# _start_threads() took the error for a start that worked after all: the Ctrl-C was lost and the run went on
+	real_start = threading.Thread.start
+	armed = [True]
+	def start(self):
+		real_start(self)
+		if armed[0] and getattr(self, '_target', None) is multiCMD._read_stream:
+			armed[0] = False
+			try:
+				raise KeyboardInterrupt
+			except KeyboardInterrupt:
+				raise RuntimeError('release unlocked lock')
+	monkeypatch.setattr(threading.Thread, 'start', start)
+	started = time.monotonic()
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD.run_command(['sleep', '2'], quiet=True)
+	# before: the command ran to its end and the call returned
+	assert time.monotonic() - started < 1.5 and not multiCMD._live_procs

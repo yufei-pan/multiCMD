@@ -286,9 +286,15 @@ class _Thread(threading.Thread):
 	def start(self):
 		try:
 			super().start()
-		except BaseException:
+		except BaseException as e:
 			# it cannot start, or a Ctrl-C landed while start() waited for it to come up: it runs if it got that far
 			self._abandon()
+			interrupt = _interrupt_in(e)
+			if interrupt is not None and interrupt is not e:
+				# a Ctrl-C that start()'s wait turned into another error: Condition.wait() releases its lock on the
+				# way out, and when the Ctrl-C cut short the _acquire_restore() that takes it back, that release
+				# raises RuntimeError ( seen on free-threaded 3.13t ). The Ctrl-C is what happened
+				raise interrupt
 			raise
 
 	def _abandon(self):
@@ -326,6 +332,16 @@ class _Thread(threading.Thread):
 				# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
 				left = 1 if left is None else min(left, 1)
 			super().join(left)
+
+def _interrupt_in(error):
+	'''The KeyboardInterrupt or SystemExit error is, or that it was raised while handling, if any ( internal )'''
+	seen = set()
+	while error is not None and id(error) not in seen:
+		if isinstance(error, _INTERRUPTS):
+			return error
+		seen.add(id(error))
+		error = error.__context__
+	return None
 
 # what cuts a settled step short, and runs it again ( see _settle ): a Ctrl-C, or a SystemExit from a signal handler
 # ( mcmd's own SIGTERM / SIGHUP one )
