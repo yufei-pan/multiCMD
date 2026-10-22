@@ -183,3 +183,23 @@ def test_a_pool_without_any_worker_fails_every_command(monkeypatch):
 	tasks = run_commands([['true']] * 3, max_threads=2, quiet=True, return_object=True)
 	assert [task.returncode for task in tasks] == [-1] * 3
 	assert all("cannot start a thread to run it: can't start new thread" in task.stderr[0] and task._finalized for task in tasks)
+
+
+def test_a_second_ctrl_c_while_the_pool_starts_still_stops_every_command(monkeypatch):
+	tasks = _record_tasks(monkeypatch)
+	_fail_worker_start(monkeypatch, {2}, KeyboardInterrupt())
+	real_stop = multiCMD._stop_tasks
+	armed = [True]
+	def stop(stopping):
+		if armed[0]:
+			armed[0] = False
+			stopping = list(stopping)
+			# cut short after the first task: the rest must be stopped all the same
+			stopping[0].stop = True
+			raise KeyboardInterrupt
+		real_stop(stopping)
+	monkeypatch.setattr(multiCMD, '_stop_tasks', stop)
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '0.3']] * 12, max_threads=4, quiet=True)
+	assert all(task.stop for task in tasks)
+	assert not multiCMD._live_procs

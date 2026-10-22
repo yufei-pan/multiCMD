@@ -273,3 +273,27 @@ def test_a_command_that_exits_just_past_the_inactivity_timeout_keeps_its_exit_co
 	monkeypatch.setattr(multiCMD, '_join', join)
 	task = run_command(['sh', '-c', 'echo hi; exit 3'], timeout=1, quiet=True, return_object=True)
 	assert (task.returncode, task.stdout, task.stderr) == (3, ['hi'], [])
+
+
+@pytest.mark.parametrize('exc', [KeyboardInterrupt, RuntimeError], ids=['ctrl-c', 'failure'])
+def test_a_ctrl_c_or_a_failure_right_after_the_spawn_still_stops_the_command(monkeypatch, exc):
+	# between _spawn() returning and the readers starting: before the fix the command ran on, unread and registered
+	procs = []
+	real_register = multiCMD._register
+	def register(proc, pgid):
+		procs.append(proc)
+		real_register(proc, pgid)
+		raise exc('right after the spawn')
+	monkeypatch.setattr(multiCMD, '_register', register)
+	try:
+		if exc is KeyboardInterrupt:
+			with pytest.raises(KeyboardInterrupt):
+				run_command(['sleep', '30'], quiet=True)
+		else:
+			task = run_command(['sleep', '30'], quiet=True, return_object=True)
+			assert task.returncode == -1 and task._error and 'right after the spawn' in task.stderr[0]
+		assert not multiCMD._live_procs
+		assert procs and procs[0].poll() is not None
+		assert procs[0].stdout.closed and procs[0].stderr.closed
+	finally:
+		multiCMD.kill_all(signal.SIGKILL)

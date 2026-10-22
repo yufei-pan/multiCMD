@@ -188,12 +188,12 @@ def test_failed_thread_start_keeps_executor_usable(monkeypatch):
 
 def test_a_command_whose_thread_cannot_start_is_finalized_as_failed(monkeypatch, capsys):
 	ex = AsyncExecutor(max_threads=1, quiet=True)
-	real = ex._start_thread
+	real = ex._track
 	def broken(thread):
 		if thread.task is None:
 			return real(thread)
 		raise RuntimeError("can't start new thread")
-	monkeypatch.setattr(ex, '_start_thread', broken)
+	monkeypatch.setattr(ex, '_track', broken)
 	task = ex.run_command(['true'])
 	assert ex.wait(timeout=5) == []
 	assert task.returncode == -1 and task._error and task._finalized and task.thread is None
@@ -537,8 +537,19 @@ def test_join_threads_waits_for_a_registered_thread_that_has_not_started_yet(mon
 
 # ---- a thread that cannot start, or whose start a Ctrl-C interrupts, leaves nothing behind
 
+def _wait_until_it_runs(thread):
+	deadline = time.monotonic() + 5
+	while not thread._runs() and time.monotonic() < deadline:
+		time.sleep(0.001)
+	assert thread._runs()
+
+
 def _fail_nth_start(monkeypatch, target, n, exc=RuntimeError("can't start new thread"), after=False):
-	'''Make the nth start() of a thread running target raise exc: before the thread starts, or after it got to its target'''
+	'''
+	Make the nth start() of a thread running target raise exc: before the thread starts, or after it got to its target.
+	Every other start of such a thread returns only once it got to its target, so what ran before the nth does not
+	depend on timing.
+	'''
 	real_start = multiCMD._Thread.start
 	count = [0]
 	def start(self):
@@ -547,10 +558,11 @@ def _fail_nth_start(monkeypatch, target, n, exc=RuntimeError("can't start new th
 			if count[0] == n:
 				if after:
 					real_start(self)
-					deadline = time.monotonic() + 5
-					while not self._runs() and time.monotonic() < deadline:
-						time.sleep(0.001)
+					_wait_until_it_runs(self)
 				raise exc
+			real_start(self)
+			_wait_until_it_runs(self)
+			return
 		real_start(self)
 	monkeypatch.setattr(multiCMD._Thread, 'start', start)
 
@@ -577,6 +589,19 @@ def test_a_fire_and_forget_thread_that_cannot_start_fails_and_the_rest_still_run
 	assert "cannot start its thread: can't start new thread" in tasks[1].stderr[0]
 	assert not _global_threads()
 	assert capfd.readouterr().err == ''
+	# its task keeps the thread, done: a caller that joins task.thread ( statblk ) is not broken
+	assert tasks[1].thread is not None and not tasks[1].thread.is_alive() and not tasks[1].is_alive()
+	tasks[1].thread.join(1)
+
+
+def test_a_fire_and_forget_task_whose_thread_cannot_start_can_still_be_joined(monkeypatch):
+	# statblk: lsblk_result = run_command(..., wait_for_return=False, return_object=True); lsblk_result.thread.join(timeout)
+	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 1)
+	task = multiCMD.run_command(['true'], timeout=5, quiet=True, wait_for_return=False, return_object=True)
+	start = time.monotonic()
+	task.thread.join(1)
+	assert time.monotonic() - start < 0.5
+	assert not task.thread.is_alive() and task.returncode == -1
 
 
 @pytest.mark.parametrize('after', [False, True], ids=['before-it-runs', 'once-it-runs'])
@@ -588,16 +613,85 @@ def test_ctrl_c_while_fire_and_forget_threads_start(monkeypatch, after):
 		tasks.extend(built[0])
 		return built
 	monkeypatch.setattr(multiCMD, '_build_tasks', build)
+	# ( the first thread got to its target before the second start fails, see _fail_nth_start )
 	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 2, KeyboardInterrupt(), after)
 	start = time.monotonic()
 	with pytest.raises(KeyboardInterrupt):
 		run_commands([['sleep', '30']] * 4, max_threads=0, quiet=True, wait_for_return=False)
 	assert time.monotonic() - start < 4
 	ran = 2 if after else 1
-	# the ones that run are stopped ( killed, or skipped if they had not spawned yet ) before the call re-raises, the others never start
-	assert all(task.stop and task.thread is not None and not task.is_alive() for task in tasks[:ran])
-	assert all(task.stop and task.thread is None and task.returncode is None and task._extra_env is None for task in tasks[ran:])
+	# the ones that run are stopped ( killed, or skipped if they had not spawned yet ) before the call re-raises
+	assert all(task.stop and task.thread._runs() and not task.is_alive() for task in tasks[:ran])
+	# the others never start: skipped, each with its thread done, which a join returns from at once
+	assert all(task.stop and not task.thread._runs() and not task.thread.is_alive() and task.returncode is None
+		and task._extra_env is None for task in tasks[ran:])
 	assert not _global_threads() or all(not thread.is_alive() for thread in _global_threads())
+	assert not set(task.thread for task in tasks[ran:]) & _global_threads()
+	assert not multiCMD._live_procs
+
+
+def _join_threads_returns_within(seconds):
+	'''Whether a join_threads() ( timeout None ) from another thread returns within seconds'''
+	done = threading.Event()
+	def joiner():
+		multiCMD.join_threads()
+		done.set()
+	threading.Thread(target=joiner, daemon=True).start()
+	return done.wait(seconds)
+
+
+def _settled(tasks):
+	'''Every task's thread is done and none is left tracked'''
+	return all(task.thread is not None and not task.thread.is_alive() for task in tasks) \
+		and not any(thread.is_alive() for thread in _global_threads())
+
+
+def test_ctrl_c_right_after_the_fire_and_forget_threads_are_registered(monkeypatch):
+	# before the fix: registered, never started nor abandoned, alive for good, and every join_threads() waited forever
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	armed = [True]
+	class Registry(set):
+		def _interrupt(self):
+			if armed[0]:
+				armed[0] = False
+				raise KeyboardInterrupt
+		def add(self, item):
+			super().add(item)
+			self._interrupt()
+		def update(self, *items):
+			super().update(*items)
+			self._interrupt()
+	monkeypatch.setattr(multiCMD, '__running_threads', Registry(_global_threads()))
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '30']] * 3, max_threads=0, quiet=True, wait_for_return=False)
+	assert _join_threads_returns_within(3)
+	assert _settled(tasks) and all(task.stop and task.returncode is None for task in tasks)
+	assert not multiCMD._live_procs
+
+
+def test_a_second_ctrl_c_while_the_starts_are_settled_still_settles_them(monkeypatch):
+	# the first Ctrl-C lands as the second thread starts, the second one while the threads not started are abandoned
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 2, KeyboardInterrupt())
+	real_abandon = multiCMD._Thread._abandon
+	calls = [0]
+	def abandon(self):
+		result = real_abandon(self)
+		calls[0] += 1
+		if calls[0] == 2:
+			raise KeyboardInterrupt
+		return result
+	monkeypatch.setattr(multiCMD._Thread, '_abandon', abandon)
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '30']] * 4, max_threads=0, quiet=True, wait_for_return=False)
+	assert calls[0] > 2
+	assert _join_threads_returns_within(5)
+	assert _settled(tasks) and all(task.stop for task in tasks)
+	assert all(task.returncode is None and task._extra_env is None for task in tasks[1:])
 	assert not multiCMD._live_procs
 
 
@@ -641,29 +735,171 @@ def test_a_join_after_an_interrupted_one_left_the_tstate_lock_held_does_not_bloc
 		thread._tstate_lock.release()
 
 
+# ---- _start_threads: every thread runs or is abandoned, whatever cuts the starts short
+
+def _threads(n, release):
+	return [multiCMD._Thread(release.wait, (10,)) for _ in range(n)]
+
+
+@pytest.mark.parametrize('where', ['register', 'start', 'fail'])
+def test_start_threads_settles_every_thread_when_the_starts_end_early(monkeypatch, where):
+	release = threading.Event()
+	threads = _threads(4, release)
+	tracked, aborted = set(), []
+	def register(thread):
+		tracked.add(thread)
+		if where == 'register' and thread is threads[2]:
+			raise KeyboardInterrupt
+	failed = []
+	def fail(thread, error):
+		failed.append(thread)
+		if where == 'fail' and len(failed) == 1:
+			# a Ctrl-C while the failure is recorded: it is recorded again
+			raise KeyboardInterrupt
+	if where in ('start', 'fail'):
+		real_start = multiCMD._Thread.start
+		def start(self):
+			if self is threads[2]:
+				raise (RuntimeError("can't start new thread") if where == 'fail' else KeyboardInterrupt())
+			real_start(self)
+			_wait_until_it_runs(self)
+		monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	else:
+		real_start = multiCMD._Thread.start
+		def start(self):
+			real_start(self)
+			_wait_until_it_runs(self)
+		monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			multiCMD._start_threads(threads, register, tracked.discard, fail, lambda: aborted.append(1))
+		assert aborted
+		# the two started run; the others, registered or not, are abandoned and forgotten
+		assert [thread._runs() for thread in threads] == [True, True, False, False]
+		assert all(thread.done.is_set() for thread in threads[2:])
+		assert tracked == set(threads[:2])
+		assert failed == ([threads[2]] * 2 if where == 'fail' else [])
+	finally:
+		release.set()
+	assert all(multiCMD._join(thread, 5) for thread in threads)
+
+
+def test_start_threads_fails_the_ones_that_cannot_start_and_goes_on(monkeypatch):
+	release = threading.Event()
+	release.set()
+	threads = _threads(3, release)
+	real_start = multiCMD._Thread.start
+	def start(self):
+		if self is threads[1]:
+			raise RuntimeError("can't start new thread")
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	tracked, failed = set(), []
+	running = multiCMD._start_threads(threads, tracked.add, tracked.discard, lambda thread, error: failed.append((thread, str(error))))
+	assert running == [threads[0], threads[2]]
+	assert failed == [(threads[1], "can't start new thread")] and tracked == {threads[0], threads[2]}
+	assert all(multiCMD._join(thread, 5) for thread in threads)
+
+
+def test_start_threads_without_fail_ends_the_starts_on_the_first_error(monkeypatch):
+	release = threading.Event()
+	release.set()
+	threads = _threads(3, release)
+	real_start = multiCMD._Thread.start
+	def start(self):
+		if self is threads[1]:
+			raise RuntimeError("can't start new thread")
+		real_start(self)
+		_wait_until_it_runs(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	with pytest.raises(RuntimeError):
+		multiCMD._start_threads(threads)
+	assert [thread._runs() for thread in threads] == [True, False, False]
+	assert all(multiCMD._join(thread, 5) for thread in threads)
 
 
 def test_ctrl_c_while_the_dispatcher_starts_keeps_it_once_it_runs(monkeypatch):
 	ex = AsyncExecutor(max_threads=1, quiet=True)
 	_fail_nth_start(monkeypatch, ex._dispatch, 1, KeyboardInterrupt(), after=True)
+	start = time.monotonic()
 	with pytest.raises(KeyboardInterrupt):
-		ex.run_commands([['sleep', '0.2']] * 3)
+		ex.run_commands([['sleep', '30']] * 3)
 	assert ex._dispatching
+	# the dispatcher runs, but the call that was interrupted does not leave its commands to it unsupervised
+	assert all(task.stop for task in ex.tasks)
 	ex.run_commands([['true']])
 	assert len([thread for thread in ex.runningThreads if thread.task is None]) <= 1
 	assert ex.wait(timeout=10) == []
-	assert [task.returncode for task in ex.tasks] == [0, 0, 0, 0]
+	assert time.monotonic() - start < 5
+	assert [task.returncode for task in ex.tasks][3] == 0
+	assert all(task.returncode != 0 for task in ex.tasks[:3])
+	assert not multiCMD._live_procs
 
 
-def test_ctrl_c_before_the_dispatcher_runs_leaves_the_queue_to_the_next_call(monkeypatch):
+def test_ctrl_c_before_the_dispatcher_runs_skips_the_call_and_leaves_the_queue_to_the_next_one(monkeypatch):
 	ex = AsyncExecutor(max_threads=1, quiet=True)
 	_fail_nth_start(monkeypatch, ex._dispatch, 1, KeyboardInterrupt())
 	with pytest.raises(KeyboardInterrupt):
 		ex.run_commands([['true']] * 2)
 	assert not ex._dispatching and ex.runningThreads == []
+	# the same outcome as when the dispatcher got to run: the interrupted call's commands are skipped
+	assert all(task.stop for task in ex.tasks)
 	ex.run_commands([['true']])
 	assert ex.wait(timeout=10) == []
-	assert [task.returncode for task in ex.tasks] == [0, 0, 0]
+	assert [task.returncode for task in ex.tasks] == [None, None, 0]
+	assert all(task._extra_env is None and task._env is None for task in ex.tasks)
+
+
+@pytest.mark.parametrize('where', ['the dispatcher thread', 'the queue'])
+def test_ctrl_c_while_run_commands_queues_or_makes_the_dispatcher(monkeypatch, where):
+	# a Ctrl-C while the dispatcher _Thread is made, or right after the commands are queued
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	armed = [True]
+	if where == 'the dispatcher thread':
+		real_init = multiCMD._Thread.__init__
+		def init(self, target, args=(), task=None):
+			if armed[0] and getattr(target, '__name__', '') == '_dispatch':
+				armed[0] = False
+				raise KeyboardInterrupt
+			real_init(self, target, args, task)
+		monkeypatch.setattr(multiCMD._Thread, '__init__', init)
+	else:
+		class Queue(type(ex._queue)):
+			def extend(self, items):
+				super().extend(items)
+				if armed[0]:
+					armed[0] = False
+					raise KeyboardInterrupt
+		ex._queue = Queue()
+	with pytest.raises(KeyboardInterrupt):
+		ex.run_commands([['true']])
+	# before the fix _dispatching stayed True with no dispatcher: later calls only queued, wait() returned at once
+	assert not ex._dispatching
+	ex.run_commands([['true']])
+	assert ex.wait(timeout=10) == []
+	assert [task.returncode for task in ex.tasks] == [None, 0]
+
+
+@pytest.mark.parametrize('what', ['_Thread', '_HeldPermit'])
+def test_a_command_thread_that_cannot_be_made_fails_and_gives_its_permit_back(monkeypatch, what):
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	armed = [True]
+	cls = getattr(multiCMD, what)
+	real_init = cls.__init__
+	def init(self, *args, **kwargs):
+		if armed[0] and (what == '_HeldPermit' or getattr(args[0], '__name__', '') == '_run_executor_task'):
+			armed[0] = False
+			raise MemoryError
+		real_init(self, *args, **kwargs)
+	monkeypatch.setattr(cls, '__init__', init)
+	tasks = ex.run_commands([['true'], ['true']])
+	assert ex.wait(timeout=10) == []
+	# with the one permit leaked the second command would wait for good
+	assert [task.returncode for task in tasks] == [-1, 0]
+	assert tasks[0]._finalized and 'MemoryError' in '\n'.join(tasks[0].stderr)
+	ex.run_command(['true'])
+	assert ex.wait(timeout=10) == []
+	assert ex.tasks[-1].returncode == 0
 
 
 @pytest.mark.parametrize('quiet', [True, False])

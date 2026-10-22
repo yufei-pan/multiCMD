@@ -216,9 +216,9 @@ class _Thread(threading.Thread):
 	  starts counts as running, so a wait from another thread meanwhile waits for it.
 	A thread is therefore either started or abandoned, never left in between: start() abandons it when it
 	cannot start, or when a Ctrl-C lands while it waits for the thread to come up and the thread has not got
-	to its target yet; a caller abandons the threads it meant to start but did not. Whichever comes first,
-	run() or _abandon(), decides whether the target runs, so the answer never depends on timing afterwards, and
-	_abandon() gives the same answer however often it is asked, a Ctrl-C between two included.
+	to its target yet; whoever meant to start it abandons it when it did not ( see _start_threads ). Whichever
+	comes first, run() or _abandon(), decides whether the target runs, so the answer never depends on timing
+	afterwards, and _abandon() gives the same answer however often it is asked, a Ctrl-C between two included.
 	@attributes:
 		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
 		done: Set once the target has returned or raised, or the thread was abandoned
@@ -280,6 +280,71 @@ class _Thread(threading.Thread):
 				# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
 				left = 1 if left is None else min(left, 1)
 			super().join(left)
+
+def _settle(step):
+	'''
+	Run step() to its end, whatever Ctrl-C lands meanwhile ( internal )
+	A Ctrl-C cuts step() short and it runs again from the start, so step must give the same result run again
+	after being cut short anywhere ( idempotent ). Such a Ctrl-C is taken here: the caller is already on its way
+	out, with the exception that made it settle.
+	'''
+	while True:
+		try:
+			step()
+			return
+		except KeyboardInterrupt:
+			pass
+
+def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
+	'''
+	Start _Threads so that every one either runs or is abandoned, none left tracked that never runs ( internal )
+
+	Each thread in turn is registered ( register(thread) ) and started. One that cannot start ( an Exception ) is
+	abandoned, forgotten ( forget(thread) ) and failed ( fail(thread, error) ), and the next one starts; without
+	fail, the error ends the starts. When the starts end early ( that error, a Ctrl-C, register or fail
+	raising ), every thread that does not run, registered yet or not, is abandoned and forgotten, a fail cut
+	short is run again, abort() is called and the exception is raised. That bookkeeping runs to its end
+	whatever Ctrl-C lands meanwhile ( see _settle ), so forget, fail and abort must be idempotent.
+	@params:
+		threads: The _Threads to start ( list )
+		register: Called with each thread right before it starts ( None: nothing to do )
+		forget: Undoes register for a thread that never runs; called for every such thread, registered or not
+		fail: Called with a thread that cannot start and the error ( None: the error ends the starts )
+		abort: Called once the starts end early ( None: nothing to do )
+	@returns:
+		list: The threads that run ( or may yet get to their target )
+	'''
+	failing = {}
+	try:
+		for thread in threads:
+			if register is not None:
+				register(thread)
+			try:
+				thread.start()
+			except Exception as e:
+				if not thread._abandon():
+					# it got to its target all the same
+					continue
+				if forget is not None:
+					forget(thread)
+				if fail is None:
+					raise
+				failing[thread] = e
+				fail(thread, e)
+				failing[thread] = None
+	except BaseException:
+		def settle():
+			for thread in threads:
+				if thread._abandon() and forget is not None:
+					forget(thread)
+			for thread, error in failing.items():
+				if error is not None:
+					fail(thread, error)
+			if abort is not None:
+				abort()
+		_settle(settle)
+		raise
+	return [thread for thread in threads if thread not in failing]
 
 class _Display:
 	'''
@@ -440,37 +505,31 @@ class AsyncExecutor:
 					if task is not None and task.thread is thread:
 						task.thread = None
 
-	def _start_thread(self, thread):
+	def _track(self, thread):
 		'''
-		Start a _Thread the executor tracks until it reports itself finished ( internal )
-		On an exception the caller calls _forget_if_abandoned(): the thread may run all the same ( see _Thread ).
+		Track a _Thread about to start until it reports itself finished ( internal; register for _start_threads )
+		Tracked before it starts, so it is tracked before it can report itself finished, and its task has it
+		before it runs, so _reap() never sees the task without its thread.
 		'''
-		# registered before it starts, so it is tracked before it can report itself finished
 		with self._lock:
 			self._threads[thread] = None
 			if thread.task is not None:
-				# set before it starts, so _reap() never sees the task without its thread
 				thread.task.thread = thread
-		thread.start()
 
-	def _forget_if_abandoned(self, thread):
+	def _untrack(self, thread):
 		'''
-		Stop tracking a thread that was to start but never runs its target, as it would never report itself finished ( internal )
-		@returns:
-			bool: Whether it never runs ( False: it runs and stays tracked )
+		Stop tracking a thread that never runs its target, as it never reports itself finished ( internal; forget for _start_threads )
+		Its task drops it as a finished one does: an executor task has a thread only while it runs.
 		'''
-		if not thread._abandon():
-			return False
 		with self._lock:
 			self._threads.pop(thread, None)
 			if thread.task is not None and thread.task.thread is thread:
 				thread.task.thread = None
-		return True
 
 	def _dispatch(self):
 		'''
 		Start queued commands one permit at a time ( internal )
-		A command whose thread cannot start fails ( see _fail_task ), and the dispatcher goes on with the next one.
+		A command whose thread cannot be made or started fails ( see _fail_task ), and the dispatcher goes on with the next one.
 		'''
 		try:
 			while True:
@@ -489,12 +548,14 @@ class AsyncExecutor:
 					# never started: it keeps its place in the task list, not its environment
 					task._env = task._extra_env = None
 					continue
-				self._reap()
-				thread = _Thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished, decor, use_pty), task)
+				# from here the permit is the thread's once it runs, and given back if it never does
+				thread = None
 				try:
-					self._start_thread(thread)
+					self._reap()
+					thread = _Thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished, decor, use_pty), task)
+					_start_threads([thread], self._track, self._untrack)
 				except BaseException as e:
-					if self._forget_if_abandoned(thread):
+					if thread is None or thread._abandon():
 						sem.release()
 						# it is off the queue and will never run: it failed, as a command multiCMD cannot start does
 						_fail_task(task, f'cannot start its thread: {e}', e, quiet)
@@ -562,26 +623,35 @@ class AsyncExecutor:
 		use_color = _resolve_color(color, concurrent)
 		use_pty = _resolve_pty(pty)
 		self._reap()
-		with self._lock:
-			first = len(self.tasks) + 1
-			queued = [(task, sem, timeout, quiet, dry_run, _decor(first + i, 0, prefix and concurrent, use_color), use_pty)
-				for i, task in enumerate(taskObjects)]
-			self.tasks.extend(taskObjects)
-			self._queue.extend(queued)
-			start_dispatcher = not self._dispatching and bool(self._queue)
+		start_dispatcher = False
+		dispatcher = None
+		def settle():
+			# a Ctrl-C or a failure from here on: this call's commands are skipped, whoever would start them ( so
+			# the outcome does not depend on how far the dispatcher got ); a dispatcher that runs stays the
+			# dispatcher, and without one the next run_commands() starts one for what is still queued
+			_stop_tasks(taskObjects)
+			if start_dispatcher and (dispatcher is None or dispatcher._abandon()):
+				if dispatcher is not None:
+					self._untrack(dispatcher)
+				with self._lock:
+					self._dispatching = False
+		try:
+			with self._lock:
+				first = len(self.tasks) + 1
+				queued = [(task, sem, timeout, quiet, dry_run, _decor(first + i, 0, prefix and concurrent, use_color), use_pty)
+					for i, task in enumerate(taskObjects)]
+				self.tasks.extend(taskObjects)
+				self._queue.extend(queued)
+				if not self._dispatching and self._queue:
+					start_dispatcher = True
+					# only the dispatcher clears this, under the lock, once it sees the queue empty ( or settle(), when there is none )
+					self._dispatching = True
 			if start_dispatcher:
-				# only the dispatcher clears this, under the lock, once it sees the queue empty
-				self._dispatching = True
-		if start_dispatcher:
-			dispatcher = _Thread(self._dispatch)
-			try:
-				self._start_thread(dispatcher)
-			except BaseException:
-				# a Ctrl-C while start() waited for it to come up: once it runs it stays the dispatcher
-				if self._forget_if_abandoned(dispatcher):
-					with self._lock:
-						self._dispatching = False
-				raise
+				dispatcher = _Thread(self._dispatch)
+				_start_threads([dispatcher], self._track, self._untrack, abort=settle)
+		except BaseException:
+			_settle(settle)
+			raise
 		return taskObjects
 	
 	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...):
@@ -612,8 +682,7 @@ class AsyncExecutor:
 			self._wait_until(deadline, threads)
 		except KeyboardInterrupt:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
-			for task in self.tasks:
-				task.stop = True
+			_stop_tasks(self.tasks)
 			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its __context__ )
 			self._wait_until(time.monotonic() + 5)
 			raise
@@ -644,8 +713,7 @@ class AsyncExecutor:
 		@returns:
 			list[Task]: The list of tasks that are managed by this object
 		'''
-		for task in self.tasks:
-			task.stop = True
+		_stop_tasks(self.tasks)
 		self.wait(timeout)
 		return self.tasks
 	
@@ -1457,16 +1525,16 @@ def _drain(task, readers, timeout):
 			return 'timeout'
 	return None
 
-def _join_readers(readers, limit):
+def _join_all(threads, limit):
 	'''
-	Wait for a command's output readers to reach the end of their streams ( internal )
+	Wait for threads ( a command's output readers, the threads of stopped commands ), up to limit seconds in all ( internal )
 	@params:
-		readers: The reader threads
+		threads: The threads
 		limit: The longest to wait in total, in seconds ( None: no limit )
 	'''
 	deadline = None if limit is None else time.monotonic() + limit
-	for reader in readers:
-		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
+	for thread in threads:
+		_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
 
 def _snapshot(mapping, drop_empty=False):
 	'''
@@ -1636,43 +1704,52 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	explicit = task._env is not None or task._extra_env is not None
 	if use_pty:
 		master, slave = _open_pty(len(decor[0]))
-	if master is not None:
-		try:
-			proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
-		except BaseException:
-			os.close(master)
-			raise
-		finally:
-			# only the command keeps the terminal side open, so the master sees EIO once it is gone
-			os.close(slave)
-		task._pty = True
-		streams = [(io.open(master, 'rb'), task.stdout)]
-	else:
-		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
-		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
-	# started: a long-lived executor keeps its tasks, not the environments they were started with
-	task._env = task._extra_env = None
-	task.start_time = time.time()
-	task._last_output = time.monotonic()
-	_register(proc, pgid)
-	readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
+	proc = None
+	streams = []
+	readers = []
 	interrupted = False
-	started = []
+	# from the spawn on, a Ctrl-C or any failure still stops the command, which runs in a process group of its own
 	try:
-		# started where a Ctrl-C or a reader that cannot start still stops the command, which already runs
-		for reader in readers:
-			reader.start()
-			started.append(reader)
+		if master is not None:
+			try:
+				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
+			finally:
+				# only the command keeps the terminal side open, so the master sees EIO once it is gone
+				os.close(slave)
+			task._pty = True
+			streams.append((io.open(master, 'rb'), task.stdout))
+		else:
+			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
+			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
+		_register(proc, pgid)
+		# started: a long-lived executor keeps its tasks, not the environments they were started with
+		task._env = task._extra_env = None
+		task.start_time = time.time()
+		task._last_output = time.monotonic()
+		readers.extend(_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams)
+		_start_threads(readers)
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
-		# a stream no reader reads is closed here ( a reader closes its own )
-		for reader, (stream, _) in zip(readers, streams):
-			if reader not in started and reader._abandon():
-				stream.close()
+		def settle():
+			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
+			pending = streams or ([] if proc is None or master is not None else [(proc.stdout, None), (proc.stderr, None)])
+			for i, (stream, _) in enumerate(pending):
+				if i >= len(readers) or readers[i]._abandon():
+					stream.close()
+		_settle(settle)
+		if master is not None and not streams:
+			# the pty's side of the command, never handed to a stream
+			try:
+				os.close(master)
+			except OSError:
+				pass
+		if proc is None:
+			# it never started ( or _spawn raised )
+			raise
 		if not isinstance(e, KeyboardInterrupt):
 			_kill_commands([(proc, pgid)], signal.SIGINT)
 			_unregister(proc)
-			_join_readers(readers, 1)
+			_join_all(readers, 1)
 			raise
 		reason, interrupted = 'stop', True
 	if reason == 'timeout':
@@ -1697,7 +1774,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			task.stderr.append('Timeout!')
 		if reason is not None:
 			_kill_commands([(proc, pgid)], signal.SIGINT)
-	_join_readers(readers, None if reason is None else 1)
+	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124
 	elif task.returncode is None:
@@ -2047,9 +2124,12 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 def _stop_tasks(tasks):
 	'''
 	Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )
+	Every task is asked, whatever Ctrl-C lands meanwhile ( see _settle ).
 	'''
-	for task in tasks:
-		task.stop = True
+	def stop():
+		for task in tasks:
+			task.stop = True
+	_settle(stop)
 
 def _stop_and_wait(tasks, threads, limit=5):
 	'''
@@ -2058,9 +2138,7 @@ def _stop_and_wait(tasks, threads, limit=5):
 	Ctrl-C ends the wait at once ( raised while the first is handled, it has the first as its __context__ ).
 	'''
 	_stop_tasks(tasks)
-	deadline = time.monotonic() + limit
-	for thread in threads:
-		_join(thread, max(0, deadline - time.monotonic()))
+	_join_all(threads, limit)
 
 def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=False):
 	'''
@@ -2084,28 +2162,24 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			finally:
 				# the worker goes on to other tasks: this one is not alive with it, and keeps no Thread object
 				task.thread = None
-	workers = [_Thread(worker) for _ in range(min(max_threads, len(tasks)))]
+	wanted = min(max_threads, len(tasks))
+	workers = []
+	errors = []
 	try:
-		running = []
-		for thread in workers:
-			try:
-				thread.start()
-			except Exception as e:
-				# fewer workers run the commands; only without any do they fail
-				failure = e
-				if thread._abandon():
-					continue
-			running.append(thread)
+		workers.extend(_Thread(worker) for _ in range(wanted))
+		# a worker that cannot start leaves the commands to the others ( only without any do they fail ); a Ctrl-C
+		# while they start stops every task, so the workers already started do not run them unsupervised
+		running = _start_threads(workers, fail=lambda thread, error: errors.append(error), abort=lambda: _stop_tasks(tasks))
 		if not running:
 			for task in tasks:
-				_fail_task(task, f'cannot start a thread to run it: {failure}', failure, quiet)
+				_fail_task(task, f'cannot start a thread to run it: {errors[0]}', errors[0], quiet)
 			return
 		for thread in running:
 			_join(thread)
-	except KeyboardInterrupt:
-		# a Ctrl-C while the workers start, or while they run: the workers not started yet never will
-		for thread in workers:
-			thread._abandon()
+	except BaseException:
+		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will,
+		# nor do workers made but not started yet ( _start_threads settles the ones it was given )
+		_settle(lambda: [thread._abandon() for thread in workers])
 		_stop_and_wait(tasks, workers)
 		raise
 
@@ -2212,31 +2286,26 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	elif not wait_for_return:
 		__reap_finished_threads()
 		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors)]
-		# tracked before they start, so a thread is always registered before it reports itself finished
-		# ( and a join_threads() meanwhile waits for it, see _Thread )
-		with __running_threads_lock:
-			__running_threads.update(threads)
-		for thread,task in zip(threads,tasks):
-			task.thread = thread
-		try:
-			for thread, task in zip(threads, tasks):
-				try:
-					thread.start()
-				except Exception as e:
-					# that command fails, the others run
-					if thread._abandon():
-						with __running_threads_lock:
-							__running_threads.discard(thread)
-						task.thread = None
-						_fail_task(task, f'cannot start its thread: {e}', e, quiet)
-		except BaseException:
-			# a Ctrl-C while they start: the commands not started yet never will ( skipped, untracked ), the others are stopped
-			idle = [thread for thread in threads if thread._abandon()]
+		def register(thread):
+			# tracked before it starts, so a thread is always registered before it reports itself finished
+			# ( and a join_threads() meanwhile waits for it, see _Thread )
 			with __running_threads_lock:
-				__running_threads.difference_update(idle)
-			for thread in idle:
-				thread.task.thread = None
-				thread.task._env = thread.task._extra_env = None
+				__running_threads.add(thread)
+			thread.task.thread = thread
+		def forget(thread):
+			# it never runs: untracked, as it never reports itself finished, and its task keeps it ( done, so
+			# task.thread.join() returns at once ) but not its environment
+			with __running_threads_lock:
+				__running_threads.discard(thread)
+			thread.task.thread = thread
+			thread.task._env = thread.task._extra_env = None
+		def fail(thread, error):
+			# that command fails, the others run
+			_fail_task(thread.task, f'cannot start its thread: {error}', error, quiet)
+		try:
+			# a Ctrl-C while they start: the commands not started yet never will ( skipped ), the others are stopped
+			_start_threads(threads, register, forget, fail, abort=lambda: _stop_tasks(tasks))
+		except BaseException:
 			_stop_and_wait(tasks, threads)
 			raise
 	elif max_threads > 1:
@@ -2287,8 +2356,12 @@ def join_threads(threads=...,timeout=None):
 		for thread in threads:
 			_join(thread, timeout)
 	except KeyboardInterrupt:
-		ours = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
-		_stop_and_wait([thread.task for thread in ours], ours)
+		ours = []
+		def stop():
+			ours[:] = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
+			_stop_tasks([thread.task for thread in ours])
+		_settle(stop)
+		_join_all(ours, 5)
 		raise
 	__reap_finished_threads()
 

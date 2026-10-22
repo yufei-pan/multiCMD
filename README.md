@@ -319,7 +319,8 @@ tasks = multiCMD.run_commands(
     max_threads=2, quiet=True,
     wait_for_return=False, return_object=True,
 )
-# tasks[i].returncode is None until that command completes
+# tasks[i].returncode is None until that command completes; tasks[i].thread.join(timeout)
+# waits for one command ( a command whose thread could not start fails with -1, its thread already done )
 
 # Later, block until everything launched this way has finished:
 multiCMD.join_threads()
@@ -346,7 +347,8 @@ executor holds at most one thread per permit plus the dispatcher, however many
 commands are queued. A command's `task.thread` is `None` until it starts, and goes
 back to `None` once it has finished and the executor has joined its thread, so a
 large batch does not keep a `Thread` object per finished command. `stop()` skips
-commands that have not started yet.
+commands that have not started yet, and so does a Ctrl-C ( or an error ) that interrupts
+`run_command(s)`, for that call's commands.
 
 ### Range expansion from Python
 
