@@ -425,3 +425,71 @@ def test_join_threads_after_an_interrupted_one_still_waits():
 	multiCMD.join_threads()
 	assert task.returncode == 0 and not task.is_alive()
 	assert task.thread not in _global_threads()
+
+
+# ---- a _Thread counts as running from its creation until it is done or abandoned, and its join() joins it
+
+def test_a_thread_whose_start_fails_is_abandoned(monkeypatch):
+	ran = []
+	thread = multiCMD._Thread(ran.append, (1,))
+	assert thread.is_alive()
+	def fail(self):
+		raise RuntimeError("can't start new thread")
+	monkeypatch.setattr(threading.Thread, 'start', fail)
+	with pytest.raises(RuntimeError):
+		thread.start()
+	assert thread.done.is_set() and not thread.is_alive() and thread._abandon()
+	thread.join()
+	assert multiCMD._join(thread, 1) and ran == []
+
+
+def test_an_abandoned_thread_never_runs_its_target_and_a_running_one_is_not_abandoned():
+	ran = []
+	thread = multiCMD._Thread(ran.append, (1,))
+	assert thread._abandon()
+	thread.start()
+	thread.join()
+	assert ran == [] and not thread.is_alive()
+	release = threading.Event()
+	thread = multiCMD._Thread(release.wait, (10,))
+	thread.start()
+	deadline = time.monotonic() + 5
+	while not thread._claim.locked() and time.monotonic() < deadline:
+		time.sleep(0.01)
+	assert not thread._abandon() and thread.is_alive()
+	release.set()
+	assert multiCMD._join(thread, 5)
+
+
+def test_join_threads_raises_for_a_thread_never_started():
+	with pytest.raises(RuntimeError):
+		multiCMD.join_threads(threads=[threading.Thread(target=print)])
+
+
+def test_join_threads_waits_for_a_registered_thread_that_has_not_started_yet(monkeypatch):
+	# a join_threads() on another thread between run_commands() registering the thread and starting it
+	main = threading.current_thread()
+	registered, gate = threading.Event(), threading.Event()
+	real_start = multiCMD._Thread.start
+	def slow_start(self):
+		if getattr(self, '_target', None) is getattr(multiCMD, '__run_tracked_command') and threading.current_thread() is main:
+			registered.set()
+			gate.wait(5)
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', slow_start)
+	joined = threading.Event()
+	def joiner():
+		registered.wait(5)
+		multiCMD.join_threads()
+		joined.set()
+	threading.Thread(target=joiner, daemon=True).start()
+	def release():
+		# the command has not even started: join_threads() must still be waiting
+		registered.wait(5)
+		if not joined.wait(0.3):
+			gate.set()
+	threading.Thread(target=release, daemon=True).start()
+	task = run_commands([['true']], quiet=True, wait_for_return=False, return_object=True)[0]
+	assert gate.is_set(), 'join_threads() returned before the command started'
+	assert joined.wait(5)
+	assert task.returncode == 0

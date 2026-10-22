@@ -88,3 +88,49 @@ def test_ctrl_c_in_a_pool_waits_for_a_command_slow_to_die(monkeypatch):
 	assert time.monotonic() - start >= 1.5
 	assert all(task.returncode is not None for task in tasks), [task.returncode for task in tasks]
 	assert not multiCMD._live_procs
+
+
+def test_a_finished_pool_task_does_not_report_its_worker(monkeypatch):
+	# one worker runs the first and the third command: while it runs the third, the first is not alive
+	real = getattr(multiCMD, '__run_command')
+	seen = []
+	def run(task, *args, **kwargs):
+		if task.command == ['echo', 'third']:
+			seen.append((first[0].is_alive(), first[0].thread))
+		return real(task, *args, **kwargs)
+	first = []
+	real_build = multiCMD._build_tasks
+	def build(*args, **kwargs):
+		built = real_build(*args, **kwargs)
+		first.append(built[0][0])
+		return built
+	monkeypatch.setattr(multiCMD, '__run_command', run)
+	monkeypatch.setattr(multiCMD, '_build_tasks', build)
+	tasks = run_commands([['true'], ['sleep', '0.5'], ['echo', 'third']], max_threads=2, quiet=True, return_object=True)
+	assert seen == [(False, None)]
+	assert all(task.thread is None and not task.is_alive() for task in tasks)
+
+
+def _maps():
+	with open('/proc/self/maps') as f:
+		return len(f.readlines())
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux') or sys.version_info < (3, 13), reason='from 3.13 an unjoined finished thread keeps its stack; checked through /proc')
+@pytest.mark.parametrize('how', ['pool', 'executor', 'fire-and-forget'])
+def test_finished_threads_release_their_stacks(how):
+	kept = []
+	before = _maps()
+	for _ in range(30):
+		if how == 'pool':
+			kept += run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
+		elif how == 'executor':
+			ex = multiCMD.AsyncExecutor(max_threads=4, quiet=True)
+			ex.run_commands([['true']] * 4)
+			ex.wait()
+			kept.append(ex)
+		else:
+			kept += run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True, wait_for_return=False)
+			multiCMD.join_threads()
+	# each unjoined thread stack is a mapping and its guard page another: 30 x 4 commands would add hundreds
+	assert _maps() - before < 40, (before, _maps())

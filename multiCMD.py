@@ -201,30 +201,71 @@ class _Thread(threading.Thread):
 	'''
 	A daemon thread that reports itself done, for every thread multiCMD starts and waits for ( internal )
 
-	On Python 3.9.8 through 3.12 a join() that a KeyboardInterrupt interrupts leaves the thread flagged as
-	stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and join() returns at
-	once, for good. done is set by the thread itself once its target has returned or raised, so is_alive()
-	here ( as documented: from the start until run() ends ) and _join(), which waits on done, stay right on
-	every Python, whatever join was interrupted before.
+	On Python 3.9.8 through 3.12 a Thread.join() that a KeyboardInterrupt interrupts leaves the thread flagged
+	as stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and Thread.join()
+	returns at once, for good. done is set by the thread itself once its target has returned or raised, and
+	is_alive() and join() go by it, so they stay right on every Python, whatever join was interrupted before:
+	- join(timeout) waits for done in 0.1 s steps ( so a Ctrl-C reaches the waiting thread ), bounded by
+	  timeout, and once done is set it joins the thread itself, which releases its stack ( from Python 3.13 a
+	  finished thread nobody joined keeps its stack mapped for as long as the Thread object lives );
+	- is_alive() is True until done is set, from the moment the thread is created: one registered before it
+	  starts counts as running, so a wait from another thread meanwhile waits for it.
+	A thread is therefore either started or abandoned, never left in between: start() abandons it when it
+	cannot start, or when a Ctrl-C lands while it waits for the thread to come up and the thread has not got
+	to its target yet; a caller abandons the threads it meant to start but did not. Whichever comes first,
+	run() or _abandon(), decides whether the target runs, so the answer never depends on timing afterwards.
+	@attributes:
+		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
+		done: Set once the target has returned or raised, or the thread was abandoned
 	'''
-	def __init__(self, target, args=()):
+	def __init__(self, target, args=(), task=None):
 		super().__init__(target=target, args=args, daemon=True)
+		self.task = task
 		self.done = threading.Event()
-		self._pid = None
+		# ( in a child forked meanwhile only the forking thread exists )
+		self._pid = os.getpid()
+		self._claim = threading.Lock()
+		self._abandoned = False
 
 	def start(self):
-		self._pid = os.getpid()
-		super().start()
+		try:
+			super().start()
+		except BaseException:
+			# it cannot start, or a Ctrl-C landed while start() waited for it to come up: it runs if it got that far
+			self._abandon()
+			raise
+
+	def _abandon(self):
+		'''
+		Make sure the thread never runs its target, unless it already does ( by the thread that starts it )
+		@returns:
+			bool: Whether it never runs its target ( done is then set )
+		'''
+		if self._claim.acquire(False):
+			self._abandoned = True
+			self.done.set()
+		return self._abandoned
 
 	def run(self):
 		try:
-			super().run()
+			if self._claim.acquire(False):
+				super().run()
 		finally:
 			self.done.set()
 
 	def is_alive(self):
-		# ( in a child forked meanwhile only the forking thread exists )
-		return self.ident is not None and not self.done.is_set() and self._pid == os.getpid()
+		return not self.done.is_set() and self._pid == os.getpid()
+
+	def join(self, timeout=None):
+		deadline = None if timeout is None else time.monotonic() + timeout
+		while not self.done.is_set():
+			step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
+			if step <= 0 or self._pid != os.getpid():
+				return
+			self.done.wait(step)
+		# ( an abandoned thread may never have come up )
+		if self._started.is_set() and self._pid == os.getpid():
+			super().join()
 
 class _Display:
 	'''
@@ -386,7 +427,7 @@ class AsyncExecutor:
 						task.thread = None
 
 	def _start_thread(self, target, args, task=None):
-		thread = _Thread(target, args)
+		thread = _Thread(target, args, task)
 		# registered before it starts, so it is tracked before it can report itself finished
 		with self._lock:
 			self._threads[thread] = None
@@ -1329,9 +1370,9 @@ def _join(thread, timeout=None):
 	'''
 	Wait for a thread to finish, in short steps ( internal )
 	A plain join() blocks in C, where a KeyboardInterrupt only arrives if the signal happens to
-	land on this very thread; short steps let the waiting thread see it within 0.1s.
-	A _Thread is waited for through its own report ( done ), not Thread.join(), which an earlier
-	interrupted join can leave lying ( see _Thread ); an interrupted wait on done harms nothing.
+	land on this very thread; short steps let the waiting thread see it within 0.1s. A _Thread
+	waits in such steps by itself ( see _Thread ). Like Thread.join(), this raises RuntimeError for
+	a threading.Thread that was never started.
 	@params:
 		thread: The thread to wait for
 		timeout: The longest to wait, in seconds ( None: until it ends )
@@ -1339,15 +1380,13 @@ def _join(thread, timeout=None):
 		bool: Whether it finished
 	'''
 	deadline = None if timeout is None else time.monotonic() + timeout
-	while thread.is_alive():
+	while True:
 		step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
+		thread.join(max(0, step))
+		if not thread.is_alive():
+			return True
 		if step <= 0:
 			return False
-		if isinstance(thread, _Thread):
-			thread.done.wait(step)
-		else:
-			thread.join(step)
-	return True
 
 def _drain(task, readers, timeout):
 	'''
@@ -1937,7 +1976,11 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 				except StopIteration:
 					return
 			task.thread = threading.current_thread()
-			__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
+			try:
+				__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
+			finally:
+				# the worker goes on to other tasks: this one is not alive with it, and keeps no Thread object
+				task.thread = None
 	workers = [_Thread(worker) for _ in range(min(max_threads, len(tasks)))]
 	for thread in workers:
 		thread.start()
@@ -2054,13 +2097,22 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task._env = task._extra_env = None
 	elif not wait_for_return:
 		__reap_finished_threads()
-		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty)) for task, decor in zip(tasks, decors)]
+		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors)]
 		# tracked before they start, so a thread is always registered before it reports itself finished
+		# ( and a join_threads() meanwhile waits for it, see _Thread )
 		with __running_threads_lock:
 			__running_threads.update(threads)
 		for thread,task in zip(threads,tasks):
 			task.thread = thread
-			thread.start()
+		try:
+			for thread in threads:
+				thread.start()
+		except BaseException:
+			# what has not started never will: it must not stay tracked as running
+			idle = [thread for thread in threads if thread._abandon()]
+			with __running_threads_lock:
+				__running_threads.difference_update(idle)
+			raise
 	elif max_threads > 1:
 		_run_pool(tasks, decors, sem, timeout, quiet, False, max_threads, use_pty)
 	else:
