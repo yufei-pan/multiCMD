@@ -3,6 +3,7 @@ import pathlib
 import subprocess
 import sys
 import threading
+import types
 from unittest import mock
 
 import pytest
@@ -351,9 +352,8 @@ def test_windows_names_are_case_insensitive_and_may_start_with_equals():
 
 def test_an_environment_is_checked_and_copied_once_per_call():
 	env = multiCMD._check_env({'PATH': os.environ['PATH']}, 'env')
-	assert multiCMD._check_env(env, 'env') is env
 	tasks, _ = multiCMD._build_tasks([['true'], ['true']], env=env, extra_env={'A': None})
-	assert tasks[0]._env is env and tasks[1]._env is env
+	assert tasks[0]._env is tasks[1]._env
 	assert tasks[0]._extra_env is tasks[1]._extra_env
 	assert tasks[0]._extra_env['A'] is None
 	# nothing to add: the command gets a copy of the validated snapshot
@@ -365,7 +365,15 @@ def test_an_environment_is_checked_and_copied_once_per_call():
 		env['X'] = 'y'
 	with pytest.raises(TypeError):
 		multiCMD._check_env(tasks[1]._extra_env, 'env')
-	assert multiCMD._check_env(tasks[1]._extra_env, 'extra_env', allow_none=True) is tasks[1]._extra_env
+	assert multiCMD._check_env(tasks[1]._extra_env, 'extra_env', allow_none=True) == {'A': None}
+	# a read-only view of something the caller can still change is checked again, not trusted
+	backing = {'A': '1'}
+	view = types.MappingProxyType(backing)
+	snap = multiCMD._check_env(view, 'env')
+	backing['A'] = 2
+	assert snap == {'A': '1'}
+	with pytest.raises(TypeError):
+		multiCMD._check_env(view, 'env')
 
 
 def test_changing_the_executors_defaults_later_never_reaches_queued_commands():

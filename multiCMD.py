@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from pprint import pformat
 
 #%% global vars
@@ -1267,27 +1268,6 @@ def _join_readers(readers, limit):
 	for reader in readers:
 		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
 
-class _Env(collections.abc.Mapping):
-	'''A validated environment ( internal ): built once by _check_env, shared by every command of a call, and read-only'''
-	__slots__ = ('_data', 'none_allowed')
-
-	def __init__(self, data, none_allowed):
-		self._data = data
-		# whether a value may be None ( an extra_env: remove the variable ) rather than a str
-		self.none_allowed = none_allowed
-
-	def __getitem__(self, key):
-		return self._data[key]
-
-	def __iter__(self):
-		return iter(self._data)
-
-	def __len__(self):
-		return len(self._data)
-
-	def copy(self):
-		return dict(self._data)
-
 def _snapshot(mapping):
 	'''
 	The ( key, value ) pairs of a mapping other threads may change, as os.environ ( internal )
@@ -1319,17 +1299,16 @@ def _check_env(mapping, name, allow_none=False):
 	'''
 	Validate an environment mapping and take a snapshot of it, so the caller changing it later does not reach the command ( internal )
 	Names and values are what subprocess accepts: str, and on POSIX bytes and os.PathLike too ( stored as str ).
-	The snapshot is read-only and an already checked one of the same kind is returned as it is, so passing it on
-	costs nothing. A mapping the caller can still change ( an AsyncExecutor's env ) is copied again every time.
+	The snapshot is read-only ( a types.MappingProxyType over a dict nobody else holds ); it is checked again whenever it
+	is passed on, as is any mapping the caller can still change ( an AsyncExecutor's env ).
 	Everything is encoded here, so a name or value the file system encoding cannot represent is refused before any command starts.
+	An empty name is refused; only a variable inherited from os.environ can have one, and it is left out ( see _child_env ).
 
 	@returns:
-		_Env | None: The snapshot ( None when mapping is None, or is empty and allow_none: nothing to add )
+		types.MappingProxyType | None: The snapshot ( None when mapping is None, or is empty and allow_none: nothing to add )
 	'''
 	if mapping is None:
 		return None
-	if type(mapping) is _Env and mapping.none_allowed == allow_none:
-		return mapping
 	if not isinstance(mapping, collections.abc.Mapping):
 		raise TypeError(f'{name} must be a mapping of variable names to values, not {type(mapping).__name__}')
 	env = {}
@@ -1338,22 +1317,19 @@ def _check_env(mapping, name, allow_none=False):
 		# Windows has hidden variables such as '=C:': its names may start with '='
 		if not key or '\0' in key or '=' in key[os.name == 'nt':]:
 			raise ValueError(f'{name}: invalid variable name {key!r}')
-		if value is None and allow_none:
-			env[key] = None
-			continue
-		value = _env_text(value, f'{name}[{key!r}]' + (' ( or None )' if allow_none else ''))
-		if '\0' in value:
-			raise ValueError(f'{name}[{key!r}] holds a NUL character')
-		env[key] = value
-	if os.name != 'nt':
-		for key, value in env.items():
+		if value is not None or not allow_none:
+			value = _env_text(value, f'{name}[{key!r}]' + (' ( or None )' if allow_none else ''))
+			if '\0' in value:
+				raise ValueError(f'{name}[{key!r}] holds a NUL character')
+		if os.name != 'nt':
 			try:
 				os.fsencode(key)
 				if value is not None:
 					os.fsencode(value)
 			except UnicodeEncodeError as e:
 				raise ValueError(f'{name}[{key!r}] cannot be encoded: {e}') from None
-	return _Env(env, allow_none) if env or not allow_none else None
+		env[key] = value
+	return types.MappingProxyType(env) if env or not allow_none else None
 
 def _apply_extra_env(env, extra_env):
 	'''
