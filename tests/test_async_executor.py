@@ -820,15 +820,26 @@ def test_start_threads_without_fail_ends_the_starts_on_the_first_error(monkeypat
 
 def test_ctrl_c_while_the_dispatcher_starts_keeps_it_once_it_runs(monkeypatch):
 	ex = AsyncExecutor(max_threads=1, quiet=True)
-	_fail_nth_start(monkeypatch, ex._dispatch, 1, KeyboardInterrupt(), after=True)
+	# the dispatcher is held until the checks are done: with nothing left to run it would soon be gone
+	gate = threading.Event()
+	real_dispatch = ex._dispatch
+	def dispatch():
+		gate.wait(10)
+		real_dispatch()
+	monkeypatch.setattr(ex, '_dispatch', dispatch)
+	_fail_nth_start(monkeypatch, dispatch, 1, KeyboardInterrupt(), after=True)
 	start = time.monotonic()
-	with pytest.raises(KeyboardInterrupt):
-		ex.run_commands([['sleep', '30']] * 3)
-	assert ex._dispatching
-	# the dispatcher runs, but the call that was interrupted does not leave its commands to it unsupervised
-	assert all(task.stop for task in ex.tasks)
-	ex.run_commands([['true']])
-	assert len([thread for thread in ex.runningThreads if thread.task is None]) <= 1
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			ex.run_commands([['sleep', '30']] * 3)
+		assert ex._dispatching
+		# the dispatcher runs, but the call that was interrupted does not leave its commands to it unsupervised
+		assert all(task.stop for task in ex.tasks)
+		ex.run_commands([['true']])
+		# it stays the dispatcher: the next call only queues
+		assert len([thread for thread in ex.runningThreads if thread.task is None]) == 1
+	finally:
+		gate.set()
 	assert ex.wait(timeout=10) == []
 	assert time.monotonic() - start < 5
 	assert [task.returncode for task in ex.tasks][3] == 0
