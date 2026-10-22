@@ -50,9 +50,13 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
 # preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo.
 # It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
-# like included ) and gets the command's environment, when that differs, as NAME=VALUE entries separated by NUL
-# on the file descriptor given as its first argument ( '-' : inherit ); it adds nothing to it and, like
-# Python 3.11+'s Popen, looks the command up in that environment's PATH
+# like included ). Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
+# the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
+# _MULTICMD_ENV_0 .. _MULTICMD_ENV_<N-1>, handed over by exec itself ( nothing can be cut short ), and it
+# runs with exactly those, found in their PATH like Python 3.11+'s Popen does. A missing or malformed entry
+# stops it with 126 before anything runs. Python 3.7-3.10 coerce a C locale for themselves and set LC_CTYPE
+# in the wrapper's environment: only a command started with '-' inherits that ( as it always has ).
+_ENV_VAR = '_MULTICMD_ENV_'
 _PGROUP_EXEC = (
 	"import os,signal,sys\n"
 	# Python ignores SIGPIPE / SIGXFSZ at startup and an ignored signal survives exec; give the command the defaults
@@ -62,14 +66,21 @@ _PGROUP_EXEC = (
 	"a=sys.argv\n"
 	"try:\n"
 	"\tif a[1]=='-':os.execvp(a[2],a[2:])\n"
-	"\td=[]\n"
-	"\twhile 1:\n"
-	"\t\tb=os.read(int(a[1]),65536)\n"
-	"\t\tif not b:break\n"
-	"\t\td.append(b)\n"
-	"\tos.close(int(a[1]))\n"
-	"\td=b''.join(d)\n"
-	"\tos.execvpe(a[2],a[2:],dict(os.fsdecode(i).partition('=')[::2] for i in d.split(b'\\0')) if d else {})\n"
+	"\ttry:\n"
+	"\t\te=dict(os.environb.pop(b'_MULTICMD_ENV_%d'%i).split(b'=',1) for i in range(int(a[1])))\n"
+	"\texcept(KeyError,ValueError):\n"
+	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%a[2]);sys.exit(126)\n"
+	"\tif b'' not in e:os.execvpe(a[2],a[2:],e)\n"
+	# a variable with an empty name: os.execve refuses it, the C library's does not ( as Popen in 3.11+ )
+	"\timport ctypes\n"
+	"\tL=ctypes.CDLL(None,use_errno=True)\n"
+	"\tA=(ctypes.c_char_p*(len(a)-1))(*map(os.fsencode,a[2:]),None)\n"
+	"\tV=(ctypes.c_char_p*(len(e)+1))(*[k+b'='+v for k,v in e.items()],None)\n"
+	"\tf=os.fsencode(a[2]);x=0\n"
+	"\tfor p in [f] if b'/' in f else [os.path.join(os.fsencode(d),f) for d in os.get_exec_path(e)]:\n"
+	"\t\tL.execve(p,A,V);r=ctypes.get_errno()\n"
+	"\t\tif r not in(2,20):x=x or r\n"
+	"\traise OSError(x or 2,os.strerror(x or 2))\n"
 	"except FileNotFoundError as e:\n"
 	"\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(127)\n"
 	"except OSError as e:\n"
@@ -276,8 +287,10 @@ class AsyncExecutor:
 		self.prefix = prefix
 		self.color = color
 		self.pty = pty
-		self.env = _check_env(env, 'env')
-		self.extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
+		# plain dicts: a later change is checked and snapshotted by the next run_commands, never shared with queued commands
+		env, extra_env = _check_env(env, 'env'), _check_env(extra_env, 'extra_env', allow_none=True)
+		self.env = None if env is None else env.copy()
+		self.extra_env = None if extra_env is None else extra_env.copy()
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
@@ -832,7 +845,7 @@ def set_sudo(use_sudo):
 		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
 		USE_SUDO = False
 
-def _spawn(argv, stdout, stderr, env=None):
+def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	'''
 	Start a command in a process group of its own ( internal )
 
@@ -842,11 +855,22 @@ def _spawn(argv, stdout, stderr, env=None):
 	Python 3.11+ uses Popen(process_group=0); older Pythons run the command through the exec
 	wrapper _PGROUP_EXEC. Windows gets a plain Popen.
 
+	The wrapper itself always starts in this process's environment. A command given an environment of
+	its own ( explicit ) gets it as reserved variables of the wrapper's, which the wrapper unpacks and
+	passes to exec: it is encoded before anything starts and exec hands it over whole or not at all.
+	The wrapper's environment is this process's plus the command's, so the command's environment and this
+	process's own together must fit the system's limit ( ARG_MAX; on Linux 2 MiB for the default 8 MiB stack,
+	and 128 KiB for one NAME=VALUE entry, 16 bytes less here ); beyond it the command fails with 126
+	'Argument list too long' ( on every Python ).
+
 	@params:
 		argv: The command ( list[str] )
 		stdout: Where the command's stdout goes ( subprocess.PIPE or a file descriptor )
 		stderr: Where the command's stderr goes
 		env: The environment, None to inherit
+		explicit: Whether env comes from the caller's env / extra_env ( the exec wrapper then looks the
+			command up in env's PATH and hands env over whole ); otherwise env, if any, only adds to what
+			is inherited and the wrapper just runs with it, as it always has
 
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
@@ -855,49 +879,40 @@ def _spawn(argv, stdout, stderr, env=None):
 	if not _IS_POSIX:
 		return subprocess.Popen(argv, **kwargs), None
 	grouped = True
-	read_fd = write_fd = None
+	command = argv[0]
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
 	elif sys.executable and not getattr(sys, 'frozen', False):
 		# ( a frozen app's sys.executable is the app itself, not a Python that can run the wrapper )
-		# the wrapper would only report a missing command through its exit code; fail like Popen does, which
-		# looks in the PATH of the command's environment ( the default path when that has none )
-		if os.sep not in argv[0] and shutil.which(argv[0], path=os.pathsep.join(d or os.curdir for d in os.get_exec_path(env))) is None:
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), argv[0])
-		# the wrapper itself starts in this process's environment; the command's goes over a pipe
-		kwargs['env'] = None
-		if env is not None:
-			read_fd, write_fd = os.pipe()
-			kwargs['pass_fds'] = (read_fd,)
-		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, '-' if env is None else str(read_fd)] + list(argv)
+		# the wrapper would only report a missing command through its exit code; fail like Popen does
+		if os.sep not in command:
+			if explicit:
+				# Popen looks in the PATH of the command's environment ( the default path when that has none )
+				search_path = os.pathsep.join(d or os.curdir for d in os.get_exec_path(env))
+			else:
+				search_path = (env if env is not None else os.environ).get('PATH')
+			if shutil.which(command, path=search_path) is None:
+				raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
+		count = '-'
+		if explicit:
+			# the wrapper's environment is this process's, plus the command's entries
+			entries = [os.fsencode(k) + b'=' + os.fsencode(v) for k, v in env.items()]
+			kwargs['env'] = dict(_snapshot(os.environb))
+			kwargs['env'].update((os.fsencode(_ENV_VAR + str(i)), entry) for i, entry in enumerate(entries))
+			count = str(len(entries))
+		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count] + list(argv)
 	else:
 		grouped = False
 	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
 	try:
 		proc = subprocess.Popen(argv, **kwargs)
-	except BaseException:
-		if write_fd is not None:
-			os.close(write_fd)
+	except OSError as e:
+		if e.errno == errno.E2BIG and argv[0] != command:
+			# the wrapper could not start: say it for the command, as the wrapper does when exec fails
+			raise OSError(e.errno, e.strerror, command)
 		raise
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
-		if read_fd is not None:
-			os.close(read_fd)
-	if write_fd is not None:
-		try:
-			data = memoryview(b'\0'.join(os.fsencode(k) + b'=' + os.fsencode(v) for k, v in env.items()))
-			while data:
-				data = data[os.write(write_fd, data):]
-		except BrokenPipeError:
-			# the wrapper is gone ( it could not start ): its exit status says so
-			pass
-		except BaseException:
-			# never let the command run with half an environment
-			proc.kill()
-			proc.wait()
-			raise
-		finally:
-			os.close(write_fd)
 	return proc, (proc.pid if grouped else None)
 
 def _stdout_isatty():
@@ -1232,9 +1247,26 @@ def _join_readers(readers, limit):
 	for reader in readers:
 		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
 
-class _Env(dict):
-	'''A validated environment ( internal ): built once by _check_env, shared by every command of a call and never changed'''
-	__slots__ = ()
+class _Env(collections.abc.Mapping):
+	'''A validated environment ( internal ): built once by _check_env, shared by every command of a call, and read-only'''
+	__slots__ = ('_data', 'none_allowed')
+
+	def __init__(self, data, none_allowed):
+		self._data = data
+		# whether a value may be None ( an extra_env: remove the variable ) rather than a str
+		self.none_allowed = none_allowed
+
+	def __getitem__(self, key):
+		return self._data[key]
+
+	def __iter__(self):
+		return iter(self._data)
+
+	def __len__(self):
+		return len(self._data)
+
+	def copy(self):
+		return dict(self._data)
 
 def _snapshot(mapping):
 	'''
@@ -1267,16 +1299,20 @@ def _check_env(mapping, name, allow_none=False):
 	'''
 	Validate an environment mapping and take a snapshot of it, so the caller changing it later does not reach the command ( internal )
 	Names and values are what subprocess accepts: str, and on POSIX bytes and os.PathLike too ( stored as str ).
-	An already checked environment is returned as it is, so passing it on costs nothing.
+	The snapshot is read-only and an already checked one of the same kind is returned as it is, so passing it on
+	costs nothing. A mapping the caller can still change ( an AsyncExecutor's env ) is copied again every time.
+	Everything is encoded here, so a name or value the file system encoding cannot represent is refused before any command starts.
 
 	@returns:
 		_Env | None: The snapshot ( None when mapping is None, or is empty and allow_none: nothing to add )
 	'''
-	if mapping is None or type(mapping) is _Env:
+	if mapping is None:
+		return None
+	if type(mapping) is _Env and mapping.none_allowed == allow_none:
 		return mapping
 	if not isinstance(mapping, collections.abc.Mapping):
 		raise TypeError(f'{name} must be a mapping of variable names to values, not {type(mapping).__name__}')
-	env = _Env()
+	env = {}
 	for key, value in _snapshot(mapping):
 		key = _env_text(key, f'{name}: variable name')
 		# Windows has hidden variables such as '=C:': its names may start with '='
@@ -1289,7 +1325,15 @@ def _check_env(mapping, name, allow_none=False):
 		if '\0' in value:
 			raise ValueError(f'{name}[{key!r}] holds a NUL character')
 		env[key] = value
-	return env if env or not allow_none else None
+	if os.name != 'nt':
+		for key, value in env.items():
+			try:
+				os.fsencode(key)
+				if value is not None:
+					os.fsencode(value)
+			except UnicodeEncodeError as e:
+				raise ValueError(f'{name}[{key!r}] cannot be encoded: {e}') from None
+	return _Env(env, allow_none) if env or not allow_none else None
 
 def _apply_extra_env(env, extra_env):
 	'''
@@ -1321,7 +1365,7 @@ def _child_env(task, pager=False):
 		pager: Whether to default PAGER / GIT_PAGER to cat ( for a pty ); a variable the caller set stays as it is
 
 	@returns:
-		dict | None: The environment ( do not change it ), None to inherit the parent's untouched
+		dict | None: The environment ( a new dict ), None to inherit the parent's untouched
 	'''
 	base, extra = task._env, task._extra_env
 	if base is None and extra is None and not pager:
@@ -1331,9 +1375,9 @@ def _child_env(task, pager=False):
 		if pager:
 			env.update(PAGER='cat', GIT_PAGER='cat')
 	elif extra is None and not pager:
-		return base
+		return base.copy()
 	else:
-		env = dict(base)
+		env = base.copy()
 		if pager:
 			env.setdefault('PAGER', 'cat')
 			env.setdefault('GIT_PAGER', 'cat')
@@ -1361,11 +1405,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		use_pty: Whether the command writes to a pty instead of pipes ( POSIX only )
 	'''
 	master = slave = None
+	# whether the caller gave this command an environment ( rather than only the pty's pager defaults )
+	explicit = task._env is not None or task._extra_env is not None
 	if use_pty:
 		master, slave = _open_pty(len(decor[0]))
 	if master is not None:
 		try:
-			proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True))
+			proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
 		except BaseException:
 			os.close(master)
 			raise
@@ -1375,7 +1421,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._pty = True
 		streams = [(io.open(master, 'rb'), task.stdout)]
 	else:
-		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task))
+		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
 		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
 	# started: a long-lived executor keeps its tasks, not the environments they were started with
 	task._env = task._extra_env = None
@@ -1448,6 +1494,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 	with sem:
 		if task.stop:
 			# stopped before it started: it stays unfinished, like a skipped queued command
+			task._env = task._extra_env = None
 			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
 			if dry_run:
@@ -1468,15 +1515,23 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			task.stderr.append(str(e))
 			task.returncode = 126
 		except Exception as e:
-			import traceback
-			print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
-			print(str(e).split('\n'))
-			task.stderr.extend(str(e).split('\n'))
-			task.stderr.extend(traceback.format_exc().split('\n'))
-			task.returncode = -1
-			task._error = True
+			if isinstance(e, OSError) and e.filename is not None:
+				# the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started
+				print(f'Command cannot be executed: {task.command[0]}',file=sys.stderr,flush=True)
+				task.stderr.append(str(e))
+				task.returncode = 126
+			else:
+				import traceback
+				print(f'Error running command: {task.command}',file=sys.stderr,flush=True)
+				print(str(e).split('\n'))
+				task.stderr.extend(str(e).split('\n'))
+				task.stderr.extend(traceback.format_exc().split('\n'))
+				task.returncode = -1
+				task._error = True
 		finally:
 			task._finalized = True
+			# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
+			task._env = task._extra_env = None
 		if not quiet:
 			_display.message('-' * 100, decor)
 			_display.message(f'Process exited with return code {task.returncode}', decor)
@@ -1787,7 +1842,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
 			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
-			Names and values are str, on POSIX bytes and os.PathLike too; the command is looked up in the PATH of the environment it gets
+			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:
@@ -1829,7 +1884,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
 			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
-			Names and values are str, on POSIX bytes and os.PathLike too; the command is looked up in the PATH of the environment it gets
+			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:

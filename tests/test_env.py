@@ -216,6 +216,11 @@ def test_cli_env_option():
 
 
 def test_cli_rejects_a_bad_assignment_before_the_sudo_check(monkeypatch, capsys):
+	# main() runs in this process: nothing past the argument check may happen ( no signal handlers, no command )
+	def forbidden(*args, **kwargs):
+		raise AssertionError('main() went past the argument check')
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', forbidden)
+	monkeypatch.setattr(multiCMD, 'run_commands', forbidden)
 	monkeypatch.setattr(multiCMD, 'SUDO_PATH', None)
 	monkeypatch.setattr(os, 'geteuid', lambda: 1000)
 	monkeypatch.setattr(sys, 'argv', ['mcmd', '--sudo', '-e', '=X', 'ls'])
@@ -241,19 +246,26 @@ print(sorted(multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'LC_C
 	assert 'A=1' in out[3] and 'LC_CTYPE' not in out[3]
 
 
-def test_wrapper_starts_in_the_parents_environment_and_gets_the_target_one_separately(launcher, monkeypatch):
+def test_wrapper_starts_in_the_parents_environment_and_gets_the_target_one_in_reserved_variables(launcher, monkeypatch):
 	if launcher == 'native':
 		pytest.skip('only the exec wrapper starts a Python first')
 	real_popen = subprocess.Popen
 	seen = []
 	def popen(argv, **kwargs):
-		seen.append(kwargs.get('env', 'unset'))
+		seen.append((argv, kwargs.get('env')))
 		return real_popen(argv, **kwargs)
 	monkeypatch.setattr(subprocess, 'Popen', popen)
+	monkeypatch.setenv('LD_LIBRARY_PATH', '/mcmd/lib')
 	# the interpreter running the wrapper must not be starved of what the parent's environment gives it ( LD_LIBRARY_PATH, ... )
-	assert run_command(['sh', '-c', 'echo "[$A]"'], quiet=True, env={'A': 'x', 'PATH': os.environ['PATH']}) == ['[x]']
+	assert run_command(['sh', '-c', 'echo "[$A][$LD_LIBRARY_PATH]"'], quiet=True, env={'A': 'x', 'PATH': os.environ['PATH']}) == ['[x][]']
 	assert run_command(ECHO, quiet=True, extra_env={'MCMD_T': 'y', 'LD_LIBRARY_PATH': None}) == ['[y]']
-	assert seen == [None, None]
+	for argv, env in seen:
+		assert env[b'LD_LIBRARY_PATH'] == b'/mcmd/lib'
+		assert argv[5] == str(len([k for k in env if k.startswith(b'_MULTICMD_ENV_')]))
+	assert sorted(v for k, v in seen[0][1].items() if k.startswith(b'_MULTICMD_ENV_')) == sorted([b'A=x', b'PATH=' + os.fsencode(os.environ['PATH'])])
+	# the command itself never sees the reserved names
+	out = run_command(['env'], quiet=True, extra_env={'MCMD_T': 'y'})
+	assert 'MCMD_T=y' in out and not [line for line in out if line.startswith('_MULTICMD_ENV_')]
 
 
 def test_child_env_survives_other_threads_changing_os_environ():
@@ -337,15 +349,45 @@ def test_windows_names_are_case_insensitive_and_may_start_with_equals():
 		multiCMD._check_env({'=C:': 'x'}, 'env')
 
 
-def test_an_environment_is_checked_and_copied_once():
-	ex = AsyncExecutor(quiet=True, env={'PATH': os.environ['PATH']}, extra_env={'MCMD_T': 'd'})
-	assert multiCMD._check_env(ex.env, 'env') is ex.env
-	tasks, _ = multiCMD._build_tasks([['true'], ['true']], env=ex.env, extra_env=ex.extra_env)
-	assert tasks[0]._env is ex.env and tasks[1]._env is ex.env
-	assert tasks[0]._extra_env is ex.extra_env
-	# nothing to add: the command gets the validated snapshot itself
+def test_an_environment_is_checked_and_copied_once_per_call():
+	env = multiCMD._check_env({'PATH': os.environ['PATH']}, 'env')
+	assert multiCMD._check_env(env, 'env') is env
+	tasks, _ = multiCMD._build_tasks([['true'], ['true']], env=env, extra_env={'A': None})
+	assert tasks[0]._env is env and tasks[1]._env is env
+	assert tasks[0]._extra_env is tasks[1]._extra_env
+	assert tasks[0]._extra_env['A'] is None
+	# nothing to add: the command gets a copy of the validated snapshot
 	tasks[0]._extra_env = None
-	assert multiCMD._child_env(tasks[0]) is ex.env
+	child = multiCMD._child_env(tasks[0])
+	assert child == dict(env) and type(child) is dict
+	# a snapshot is read-only, and one with None values is not an env
+	with pytest.raises(TypeError):
+		env['X'] = 'y'
+	with pytest.raises(TypeError):
+		multiCMD._check_env(tasks[1]._extra_env, 'env')
+	assert multiCMD._check_env(tasks[1]._extra_env, 'extra_env', allow_none=True) is tasks[1]._extra_env
+
+
+def test_changing_the_executors_defaults_later_never_reaches_queued_commands():
+	ex = AsyncExecutor(max_threads=1, quiet=True, env={'PATH': os.environ['PATH']}, extra_env={'MCMD_T': 'first'})
+	blocker = ex.run_command(['sh', '-c', 'sleep 0.5'])
+	queued = [ex.run_command(ECHO) for _ in range(3)]
+	ex.env['BAD'] = 5
+	ex.extra_env['MCMD_T'] = 'second'
+	ex.extra_env['MORE'] = None
+	ex.wait(timeout=10)
+	assert [t.stdout for t in queued] == [['[first]']] * 3
+	assert all(t.returncode == 0 for t in queued) and blocker.returncode == 0
+	# the new value is checked and used by the next call
+	with pytest.raises(TypeError):
+		ex.run_command(ECHO)
+	ex.env['BAD'] = '5'
+	assert ex.run_command(ECHO, quiet=True) is not None
+	ex.wait(timeout=10)
+	assert ex.tasks[-1].stdout == ['[second]']
+	# an extra_env snapshot is no env: None values only mean something to extra_env
+	with pytest.raises(TypeError):
+		AsyncExecutor(env=multiCMD._check_env({'A': None}, 'extra_env', allow_none=True))
 
 
 def test_tasks_do_not_keep_their_environment_once_started():
@@ -354,3 +396,181 @@ def test_tasks_do_not_keep_their_environment_once_started():
 	ex.wait(timeout=5)
 	assert task.stdout == ['[k]']
 	assert task._env is None and task._extra_env is None
+
+
+# ---- the environment reaches the command whole, whatever the parent's descriptors, signals and locale are
+
+def _in_fresh_python(code, launcher, env=None, closed=(), timeout=60, prefix=()):
+	'''Run code in a new Python ( multiCMD imported, the launcher chosen ) whose descriptors in closed are shut first; returns the CompletedProcess'''
+	script = ('import os, sys; sys.path.insert(0, %r); import multiCMD; multiCMD._HAS_PROCESS_GROUP = %r\n' % (str(PACKAGE_ROOT), launcher == 'native')
+		+ ''.join('os.close(%d)\n' % fd for fd in closed) + code)
+	return subprocess.run([*prefix, sys.executable, '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+		env=env or {'PATH': os.environ['PATH']}, timeout=timeout)
+
+
+def test_a_closed_standard_descriptor_in_the_parent_does_not_hurt(launcher, tmp_path):
+	for fd in (0, 1, 2):
+		out = tmp_path / ('out%d' % fd)
+		proc = _in_fresh_python("""
+task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
+open(%r, 'w').write(repr((task.returncode, sorted(task.stdout))))
+""" % str(out), launcher, closed=(fd,))
+		assert eval(out.read_text())[0] == 0, (fd, proc.stderr, out.read_text())
+		assert 'A=x' in eval(out.read_text())[1] and 'PATH=' + os.environ['PATH'] in eval(out.read_text())[1], fd
+
+
+def test_a_missing_part_of_the_environment_stops_the_wrapper_before_it_runs_anything(tmp_path):
+	marker = tmp_path / 'ran'
+	for count, entries in (('3', {b'_MULTICMD_ENV_0': b'A=1', b'_MULTICMD_ENV_1': b'B=2'}), ('1', {b'_MULTICMD_ENV_0': b'NOEQUALS'}), ('x', {})):
+		proc = subprocess.run([sys.executable, '-I', '-S', '-c', multiCMD._PGROUP_EXEC, count, 'touch', str(marker)],
+			env=dict({k.decode(): v.decode() for k, v in entries.items()}, PATH=os.environ['PATH']),
+			stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+		assert proc.returncode == 126, (count, proc.stderr)
+		assert 'incomplete environment' in proc.stderr
+		assert not marker.exists()
+
+
+def test_an_interrupt_between_the_spawn_and_the_registration_leaves_no_half_started_command(launcher, monkeypatch, tmp_path):
+	# the environment travels with the exec itself: whenever the spawn is cut short, the command either never ran or has all of it
+	marker = tmp_path / 'env'
+	real_register = multiCMD._register
+	def interrupt(proc, pgid):
+		real_register(proc, pgid)
+		raise KeyboardInterrupt
+	monkeypatch.setattr(multiCMD, '_register', interrupt)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			run_command(['sh', '-c', 'sleep 0.3; echo "[$A][$B]" > ' + str(marker)], quiet=True, extra_env={'A': 'a', 'B': 'b'}, timeout=5)
+		multiCMD.kill_all()
+		multiCMD.join_threads(timeout=5)
+	finally:
+		# the interrupt came before the command was reaped: do not leave it registered for the next test
+		multiCMD._live_procs.clear()
+	assert not marker.exists() or marker.read_text() == '[a][b]\n'
+
+
+def test_a_parent_that_restored_the_default_sigpipe_is_not_killed(launcher):
+	proc = _in_fresh_python("""
+import signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+# the wrapper dies without reading anything: its command cannot be started
+task = multiCMD.run_command(['/no/such/dir/cmd'], quiet=True, extra_env={'A': 'x'}, return_object=True)
+print(task.returncode)
+""", launcher)
+	assert proc.returncode == 0, (proc.returncode, proc.stderr)
+	assert proc.stdout.strip() == '127'
+
+
+def test_a_variable_with_an_empty_name_is_passed_on_like_python_311_does(launcher):
+	if launcher == 'wrapper' and sys.version_info >= (3, 11):
+		pytest.skip('a 3.11+ Popen starting the wrapper with this environment uses posix_spawn, which refuses an empty name; Pythons that need the wrapper use fork_exec')
+	proc = _in_fresh_python("""
+import subprocess
+task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
+print(task.returncode, sorted(task.stdout))
+task = multiCMD.run_command(['env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
+print(task.returncode, '=weird' in task.stdout)
+task = multiCMD.run_command(['/no/such/cmd'], quiet=True, extra_env={'A': 'x'}, return_object=True)
+print(task.returncode)
+""", launcher, prefix=('env', '=weird'))
+	assert proc.returncode == 0, proc.stderr
+	first, second, third = proc.stdout.splitlines()
+	assert first.startswith('0 ') and "'=weird'" in first and "'A=x'" in first
+	assert second == '0 True'
+	assert third == '127'
+
+
+def test_bytes_that_are_not_text_reach_the_command_unchanged(launcher):
+	value = '\udcff\udc80ok'
+	code = 'import os,sys; sys.stdout.write(repr(os.environb[b"A"]))'
+	assert run_command([sys.executable, '-c', code], quiet=True, extra_env={'A': value}) == [repr(b'\xff\x80ok')]
+	assert run_command([sys.executable, '-c', code], quiet=True, extra_env={'A': b'\xff\x80ok'}) == [repr(b'\xff\x80ok')]
+
+
+def test_a_value_that_cannot_be_encoded_is_refused_before_anything_starts(launcher, monkeypatch, tmp_path):
+	marker = tmp_path / 'ran'
+	started = []
+	real_popen = subprocess.Popen
+	def popen(*args, **kwargs):
+		started.append(args)
+		return real_popen(*args, **kwargs)
+	monkeypatch.setattr(subprocess, 'Popen', popen)
+	for bad in ({'A': '\ud800'}, {'\ud800': 'x'}):
+		with pytest.raises(ValueError):
+			run_command(['touch', str(marker)], quiet=True, extra_env=bad)
+		with pytest.raises(ValueError):
+			run_command(['touch', str(marker)], quiet=True, env=dict(bad, PATH=os.environ['PATH']))
+	assert not started and not marker.exists()
+
+
+def _arg_max():
+	return os.sysconf('SC_ARG_MAX')
+
+
+def test_an_environment_too_large_for_exec_fails_the_same_way_on_both_launchers(launcher, capsys):
+	# ~1.5x the system limit in 64 KiB values: no launcher can pass that on
+	extra = {'MCMD_BIG_%d' % i: 'x' * 65536 for i in range(_arg_max() * 3 // 2 // 65536 + 1)}
+	task = run_command(['true'], quiet=True, extra_env=extra, return_object=True)
+	assert task.returncode == 126
+	assert 'Argument list too long' in ' '.join(task.stderr)
+	assert not task._error
+	assert task._env is None and task._extra_env is None
+
+
+def test_a_large_environment_still_works(launcher, monkeypatch):
+	# an environment taking a quarter of the limit ( the wrapper needs it twice ) in values below the per-string limit
+	extra = {'MCMD_BIG_%d' % i: 'y' * 65536 for i in range(_arg_max() // 4 // 65536)}
+	for name in list(os.environ):
+		if len(name) + len(os.environ[name]) > 16384:
+			monkeypatch.delenv(name)
+	out = run_command(['sh', '-c', 'echo "$MCMD_BIG_0" | wc -c; echo "${MCMD_BIG_%d}" | wc -c' % (len(extra) - 1)], quiet=True, extra_env=extra)
+	assert [int(x) for x in out] == [65537, 65537]
+
+
+def test_the_pty_pager_defaults_alone_do_not_use_the_environment_hand_over(launcher, monkeypatch):
+	if launcher == 'native':
+		pytest.skip('only the exec wrapper has a hand-over')
+	real_popen = subprocess.Popen
+	seen = []
+	def popen(argv, **kwargs):
+		seen.append((argv, kwargs.get('env')))
+		return real_popen(argv, **kwargs)
+	monkeypatch.setattr(subprocess, 'Popen', popen)
+	monkeypatch.setenv('MCMD_T', 'parent')
+	assert run_command(ECHO, quiet=True, pty=True) == ['[parent]']
+	argv, env = seen[0]
+	# as before extra_env existed: the wrapper's own environment is the command's
+	assert argv[5] == '-'
+	assert env['PAGER'] == 'cat' and env['GIT_PAGER'] == 'cat' and env['MCMD_T'] == 'parent'
+	assert not [k for k in env if k.startswith('_MULTICMD_ENV_')]
+
+
+def test_a_command_without_env_or_extra_env_is_looked_up_in_the_parents_path_only(launcher, monkeypatch, tmp_path):
+	if launcher == 'native':
+		pytest.skip('Popen decides this on 3.11+')
+	_tool(tmp_path)
+	monkeypatch.chdir(tmp_path)
+	monkeypatch.setenv('PATH', '')
+	# an empty PATH finds nothing, as before; the current directory is not searched
+	for pty in (False, True):
+		task = run_command(['mcmd-env-tool'], quiet=True, pty=pty, return_object=True)
+		assert task.returncode == 127
+
+
+def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, monkeypatch):
+	ex = AsyncExecutor(quiet=True, dry_run=True)
+	dry = ex.run_command(ECHO, extra_env={'A': '1'})
+	ex.wait(timeout=5)
+	assert dry._env is None and dry._extra_env is None
+	failing = run_command(['/no/such/cmd'], quiet=True, extra_env={'A': '1'}, return_object=True)
+	assert failing._extra_env is None and failing._env is None
+	tasks, _ = multiCMD._build_tasks([['true']], env={'PATH': '/bin'}, extra_env={'A': '1'})
+	tasks[0].stop = True
+	multiCMD.__dict__['__run_command'](tasks[0], threading.Semaphore(1), quiet=True)
+	assert tasks[0]._env is None and tasks[0]._extra_env is None
+	# an exec the system refuses ( a file without a shebang ) is 126 on both launchers
+	script = tmp_path / 'noshebang'
+	script.write_text('echo hi\n')
+	script.chmod(0o755)
+	task = run_command([str(script)], quiet=True, extra_env={'A': '1'}, return_object=True)
+	assert task.returncode == 126 and not task._error
