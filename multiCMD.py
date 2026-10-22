@@ -444,6 +444,15 @@ def _settle(step):
 		return True
 	return hold.absorbed
 
+def _abandon_all(threads, forget=None):
+	'''
+	Abandon every thread that has not got to its target, and forget each one abandoned ( forget(thread), see
+	_start_threads ) ( internal ); idempotent, for a settled step
+	'''
+	for thread in threads:
+		if thread._abandon() and forget is not None:
+			forget(thread)
+
 def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 	'''
 	Start _Threads so that every one either runs or is abandoned, none left tracked that never runs ( internal )
@@ -490,13 +499,11 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 				_settle(lambda: failed(thread, e, index))
 				if ended[0] is not None:
 					# the ones after it never start
-					_settle(lambda: [forget(thread) for thread in threads[ended[0]:] if thread._abandon() and forget is not None])
+					_settle(lambda: _abandon_all(threads[ended[0]:], forget))
 					break
 	except BaseException:
 		def settle():
-			for thread in threads:
-				if thread._abandon() and forget is not None:
-					forget(thread)
+			_abandon_all(threads, forget)
 			for thread, error in failing.items():
 				if error is not None:
 					fail(thread, error)
@@ -2333,9 +2340,7 @@ def _stop_and_wait(tasks, threads, limit=5, forget=None):
 	tasks are stopped skips it.
 	'''
 	def stop():
-		for thread in threads:
-			if thread._abandon() and forget is not None:
-				forget(thread)
+		_abandon_all(threads, forget)
 		for task in tasks:
 			task.stop = True
 	if not _settle(stop):
