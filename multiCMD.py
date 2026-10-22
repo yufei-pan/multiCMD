@@ -277,19 +277,172 @@ class _Thread(threading.Thread):
 				left = 1 if left is None else min(left, 1)
 			super().join(left)
 
+class _HoldCtrlC:
+	'''
+	Hold a Ctrl-C that lands while a block runs, and hand it on once the block is done ( internal )
+
+	Python runs signal handlers only on the main thread, so only there can a Ctrl-C ( SIGINT ) raise
+	KeyboardInterrupt. There, for as long as the block runs, SIGINT's handler is this object, which only notes the
+	Ctrl-C; once the block is done the previous handler is back and is called with it ( the default one raises
+	KeyboardInterrupt ). Masking SIGINT with pthread_sigmask() would not do: the kernel then hands the signal to
+	another thread, whose C-level handler still has the main thread run the Python handler at once. Nothing
+	changes for the commands: a caught signal is reset to its default by exec, and the signal mask is untouched.
+	A KeyboardInterrupt raised as the hold begins ( a Ctrl-C that was pending ) is handed on after the block too.
+	A Ctrl-C is handed on unless the block raises a KeyboardInterrupt, or handling is set ( _settle sets it when
+	its caller is on its way out because of a Ctrl-C already ): it is then only noted in absorbed, and the caller
+	may end a wait that follows, as a second Ctrl-C during that wait would. Elsewhere ( another thread, SIGINT ignored, its
+	default or a handler set from C, a sub-interpreter ) nothing is held, and nothing needs to be. A
+	KeyboardInterrupt from anything but SIGINT ( another signal's handler that raises it, one injected into a
+	thread ) is not held. The block must not block for long ( see _settle ). Should such a KeyboardInterrupt cut
+	the restore short, the hold, left in place, sees that the code that holds it is no longer running and hands
+	every Ctrl-C to the previous handler, which it puts back.
+	@attributes:
+		absorbed: Whether a Ctrl-C landed and was not handed on, the caller being on its way out with one already
+		handling: Whether a Ctrl-C is only to be noted, not handed on ( set before the block )
+	'''
+	# ( no __init__: one call less before the hold is in place )
+	previous = None
+	active = False
+	# the frame of the code that holds it
+	owner = None
+	held = None
+	early = None
+	absorbed = False
+	handling = False
+
+	def _running(self, frame):
+		'''Whether the code that holds it is still running, frame being the main thread's current one'''
+		while frame is not None:
+			if frame is self.owner:
+				return True
+			frame = frame.f_back
+		return False
+
+	def __call__(self, signum, frame):
+		if self.active and (frame is None or self._running(frame)):
+			self.held = (signum, frame)
+			return
+		# left in place by a restore that something cut short: give the Ctrl-C to the handler this stands in for
+		self.active = False
+		try:
+			signal.signal(signum, self.previous)
+		except Exception:
+			pass
+		self.previous(signum, frame)
+
+	def __enter__(self):
+		try:
+			self._hold()
+		except KeyboardInterrupt as e:
+			self.early = e
+			if not self.active:
+				self._hold()
+		return self
+
+	def _hold(self):
+		if threading.current_thread() is not threading.main_thread():
+			return
+		current = signal.getsignal(signal.SIGINT)
+		if isinstance(current, _HoldCtrlC):
+			if current.active and current._running(sys._getframe()):
+				# itself, or an enclosing block that holds it already
+				return
+			current = current.previous
+		if not callable(current):
+			return
+		self.previous = current
+		# ( _hold <- __enter__ <- the code that holds it )
+		self.owner = sys._getframe(2)
+		self.active = True
+		try:
+			signal.signal(signal.SIGINT, self)
+		except ValueError:
+			# signals are the main interpreter's only: nothing to hold
+			self.active = False
+			self.previous = None
+		except BaseException:
+			# ( a KeyboardInterrupt right after the swap )
+			self._restore()
+			raise
+
+	def _restore(self):
+		self.active = False
+		try:
+			signal.signal(signal.SIGINT, self.previous)
+		except ValueError:
+			pass
+
+	def __exit__(self, exc_type, exc, tb):
+		# inactive first: should the restore be cut short, a later Ctrl-C still reaches the previous handler
+		self.active = False
+		self.owner = None
+		if self.previous is not None:
+			self._restore()
+		if self.held is None and self.early is None:
+			return False
+		if self.handling or (exc_type is not None and issubclass(exc_type, KeyboardInterrupt)):
+			self.absorbed = True
+			return False
+		early, self.early = self.early, None
+		if self.held is not None:
+			signum, frame = self.held
+			self.held = None
+			self.previous(signum, frame)
+		if early is not None:
+			raise early
+		return False
+
+# per thread: the failure messages to show once the outermost _settle() on that thread is done ( None: show at once )
+_settling = threading.local()
+
 def _settle(step):
 	'''
 	Run step() to its end, whatever Ctrl-C lands meanwhile ( internal )
-	A Ctrl-C cuts step() short and it runs again from the start, so step must give the same result run again
-	after being cut short anywhere ( idempotent ). Such a Ctrl-C is taken here: the caller is already on its way
-	out, with the exception that made it settle.
+
+	On the main thread a Ctrl-C is held while step runs and handed on right after it ( see _HoldCtrlC ): raised
+	then, unless the caller is already on its way out with a KeyboardInterrupt. A KeyboardInterrupt that cuts
+	step short all the same ( not a Ctrl-C: raised by another signal's handler, or injected; or on another thread )
+	makes it run again from the start, so step must give the same result run again after being cut short anywhere
+	( idempotent ); that KeyboardInterrupt is raised once step completed, under the same rule. The failure messages
+	step shows ( see _show_error ) are shown after it, each once, outside the hold: nothing step does may block for
+	long, as a held Ctrl-C cannot end it. A Ctrl-C pending as _settle is called can still be raised before step
+	starts ( from the call itself: no Python code can take it earlier ).
+	@returns:
+		bool: Whether a Ctrl-C ( KeyboardInterrupt ) landed and was taken, the caller being on its way out with one
+			already: a wait that follows should end at once, as a second Ctrl-C during it would end it
 	'''
-	while True:
-		try:
-			step()
-			return
-		except KeyboardInterrupt:
-			pass
+	hold = _HoldCtrlC()
+	# ( the caller is on its way out because of a Ctrl-C: one more only ends the wait that follows )
+	hold.handling = isinstance(sys.exc_info()[1], KeyboardInterrupt)
+	cut = None
+	own = False
+	try:
+		if getattr(_settling, 'messages', None) is None:
+			own = True
+			_settling.messages = {}
+		with hold:
+			# ( two loops: a KeyboardInterrupt that lands on the inner loop's way back is taken by the outer one )
+			while True:
+				try:
+					while True:
+						try:
+							step()
+							break
+						except KeyboardInterrupt as e:
+							cut = e
+					break
+				except KeyboardInterrupt as e:
+					cut = e
+	finally:
+		if own:
+			messages, _settling.messages = getattr(_settling, 'messages', None), None
+			for text in (messages or {}).values():
+				_write_error(text)
+	if cut is not None:
+		if not hold.handling:
+			raise cut
+		return True
+	return hold.absorbed
 
 def _start_threads(threads, register=None, forget=None, fail=None, abort=None):
 	'''
@@ -678,9 +831,9 @@ class AsyncExecutor:
 			self._wait_until(deadline, threads)
 		except KeyboardInterrupt:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
-			_stop_tasks(self.tasks)
 			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its __context__ )
-			self._wait_until(time.monotonic() + 5)
+			if not _stop_tasks(self.tasks):
+				self._wait_until(time.monotonic() + 5)
 			raise
 		return [thread for thread in self.runningThreads if thread.is_alive()]
 
@@ -1733,7 +1886,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			for i, (stream, _) in enumerate(pending):
 				if i >= len(readers) or readers[i]._abandon():
 					stream.close()
-		_settle(settle)
+		try:
+			_settle(settle)
+		except KeyboardInterrupt as ctrl_c:
+			# a Ctrl-C held while a failure was dealt with: from here on it is handled as any Ctrl-C
+			e = ctrl_c
 		if master is not None and not streams:
 			# the pty's side of the command, never handed to a stream
 			try:
@@ -1742,12 +1899,12 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				pass
 		if proc is None:
 			# it never started ( or _spawn raised )
-			raise
+			raise e
 		if not isinstance(e, KeyboardInterrupt):
 			_kill_commands([(proc, pgid)], signal.SIGINT)
 			_unregister(proc)
 			_join_all(readers, 1)
-			raise
+			raise e
 		reason, interrupted = 'stop', True
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
@@ -1837,15 +1994,27 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
-def _show_error(text):
+def _write_error(text):
 	'''
-	Show a failure message on stderr ( internal ): one that cannot be shown ( stderr closed, a broken pipe ) is
+	Write a failure message to stderr ( internal ): one that cannot be written ( stderr closed, a broken pipe ) is
 	dropped, as the failure it is about is already recorded on the task
 	'''
 	try:
 		print(text, file=sys.stderr, flush=True)
 	except Exception:
 		pass
+
+def _show_error(text, key=None):
+	'''
+	Show a failure message on stderr ( internal ); see _write_error
+	Inside _settle() it is shown once the step is done, outside its hold ( a write to a stalled stderr would
+	block it ), and a step run again shows it once: the last message given for each key ( default: the text ).
+	'''
+	messages = getattr(_settling, 'messages', None)
+	if messages is None:
+		_write_error(text)
+	else:
+		messages[text if key is None else key] = text
 
 def _cannot_run(task, returncode, what, error, quiet=False):
 	'''
@@ -2122,20 +2291,23 @@ def _stop_tasks(tasks):
 	'''
 	Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )
 	Every task is asked, whatever Ctrl-C lands meanwhile ( see _settle ).
+	@returns:
+		bool: Whether a Ctrl-C landed meanwhile that the caller, already on its way out with one, should end its wait for
 	'''
 	def stop():
 		for task in tasks:
 			task.stop = True
-	_settle(stop)
+	return _settle(stop)
 
 def _stop_and_wait(tasks, threads, limit=5):
 	'''
 	After a Ctrl-C: stop the tasks' commands, then wait for their threads, up to limit seconds in all ( internal )
 	The commands run in process groups of their own, so the terminal's Ctrl-C did not reach them. A second
-	Ctrl-C ends the wait at once ( raised while the first is handled, it has the first as its __context__ ).
+	Ctrl-C ends the wait at once ( raised while the first is handled, it has the first as its __context__ ); one
+	that lands while the tasks are stopped skips it.
 	'''
-	_stop_tasks(tasks)
-	_join_all(threads, limit)
+	if not _stop_tasks(tasks):
+		_join_all(threads, limit)
 
 def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=False):
 	'''
@@ -2360,8 +2532,8 @@ def join_threads(threads=...,timeout=None):
 		def stop():
 			ours[:] = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
 			_stop_tasks([thread.task for thread in ours])
-		_settle(stop)
-		_join_all(ours, 5)
+		if not _settle(stop):
+			_join_all(ours, 5)
 		raise
 	__reap_finished_threads()
 

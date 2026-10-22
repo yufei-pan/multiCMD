@@ -394,11 +394,18 @@ Because the commands are not in your program's process group, signals sent to th
 group do not reach them. multiCMD handles this for you: a call waiting on the main
 thread that gets Ctrl-C (`join_threads()` and `AsyncExecutor.wait()` included) stops its
 commands before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
-for them at once), `mcmd` stops them on
+for them at once; one that lands while multiCMD stops them or forgets the threads that never ran ends
+it too), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
 commands still running when the interpreter exits are killed. A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
 arrives), can call `multiCMD.kill_all()` from its handler.
+
+A Ctrl-C that lands while multiCMD does its bookkeeping on the main thread ( after a Ctrl-C or a
+failure: which threads never ran, which commands to stop ) is held for those moments and raised right after, so it neither cuts that short nor
+gets lost. For that SIGINT's handler is briefly multiCMD's own, and your handler, if you installed
+one, is called with the Ctrl-C right after. A KeyboardInterrupt that another signal's handler raises
+is not held: the bookkeeping is then run again from the start.
 
 ## Key functions and objects
 
