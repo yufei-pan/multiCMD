@@ -815,8 +815,18 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 				inside.append(not self.done.flag)
 			return real_take(self)
 		monkeypatch.setattr(multiCMD._Handoff, 'take', take)
+	swallowed = []
+	if hasattr(sys, 'unraisablehook'):
+		real_hook = sys.unraisablehook
+		def hook(unraisable):
+			if isinstance(unraisable.exc_value, KeyboardInterrupt):
+				swallowed.append(unraisable)
+			else:
+				real_hook(unraisable)
+		monkeypatch.setattr(sys, 'unraisablehook', hook)
 	before = _children()
 	lost = []
+	returned = 0
 	for _ in range(100):
 		first = random.uniform(0, 0.004)
 		delays = [first] + ([first + random.uniform(0, 0.002)] if ctrl_cs == 2 else [])
@@ -826,10 +836,11 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 				time.sleep(max(0, start + delay - time.monotonic()))
 				signal.pthread_kill(main, signal.SIGINT)
 		timer = threading.Thread(target=send)
-		timer.start()
 		try:
 			try:
-				multiCMD.run_command(['sleep', '30'], quiet=True)
+				# ( a Ctrl-C may land while the timer starts: then nothing starts )
+				timer.start()
+				multiCMD.run_command(['sleep', '3'], quiet=True)
 			finally:
 				while True:
 					try:
@@ -840,7 +851,9 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		except KeyboardInterrupt:
 			pass
 		else:
-			pytest.fail('the command ran to its end')
+			# CPython drops a KeyboardInterrupt its handler raises inside a weakref callback or a __del__ ( a
+			# Thread collected on the main thread ): that Ctrl-C never reached multiCMD
+			returned += 1
 		lost.extend(_left_running(before))
 		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
 		with multiCMD._live_procs_lock:
@@ -855,6 +868,8 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		os.killpg(pid, signal.SIGKILL)
 	# before ( 0e4d015 ): a command started, unknown to kill_all(), left running
 	assert lost == []
+	# every call that was not interrupted lost its Ctrl-C to CPython, not to multiCMD
+	assert returned <= (len(swallowed) if hasattr(sys, 'unraisablehook') else 3)
 	if hasattr(multiCMD, '_Handoff'):
 		assert any(inside), 'no Ctrl-C landed while the command started'
 
