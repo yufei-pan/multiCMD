@@ -60,31 +60,22 @@ _ENV_VAR = '_MULTICMD_ENV_'
 _PGROUP_EXEC = (
 	"import os,signal,sys\n"
 	# Python ignores SIGPIPE / SIGXFSZ at startup and an ignored signal survives exec; give the command the defaults
-	"for n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n"
+	"for n in ('SIGPIPE','SIGXFSZ'):\n"
 	"\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
 	"os.setpgid(0,0)\n"
 	"a=sys.argv\n"
 	"try:\n"
 	"\tif a[1]=='-':os.execvp(a[2],a[2:])\n"
 	"\ttry:\n"
-	"\t\te=dict(os.environb.pop(b'_MULTICMD_ENV_%d'%i).split(b'=',1) for i in range(int(a[1])))\n"
+	# read, not pop: the command is started with exactly the environment built here, and every removal is a scan of the whole environment
+	"\t\tv=dict(os.environb[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n"
 	"\texcept(KeyError,ValueError):\n"
 	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%a[2]);sys.exit(126)\n"
-	"\tif b'' not in e:os.execvpe(a[2],a[2:],e)\n"
-	# a variable with an empty name: os.execve refuses it, the C library's does not ( as Popen in 3.11+ )
-	"\timport ctypes\n"
-	"\tL=ctypes.CDLL(None,use_errno=True)\n"
-	"\tA=(ctypes.c_char_p*(len(a)-1))(*map(os.fsencode,a[2:]),None)\n"
-	"\tV=(ctypes.c_char_p*(len(e)+1))(*[k+b'='+v for k,v in e.items()],None)\n"
-	"\tf=os.fsencode(a[2]);x=0\n"
-	"\tfor p in [f] if b'/' in f else [os.path.join(os.fsencode(d),f) for d in os.get_exec_path(e)]:\n"
-	"\t\tL.execve(p,A,V);r=ctypes.get_errno()\n"
-	"\t\tif r not in(2,20):x=x or r\n"
-	"\traise OSError(x or 2,os.strerror(x or 2))\n"
-	"except FileNotFoundError as e:\n"
-	"\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(127)\n"
+	"\tos.execvpe(a[2],a[2:],v)\n"
+	# a plain command reports as it always has; one with an environment as Popen does ( Python 3.11+: the error with the command as given )
 	"except OSError as e:\n"
-	"\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(126)\n"
+	"\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,a[2])))+'\\n')\n"
+	"\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 )
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
@@ -887,7 +878,8 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False):
 	passes to exec: it is encoded before anything starts and exec hands it over whole or not at all.
 	The wrapper's environment is this process's plus the command's, so the command's environment and this
 	process's own together must fit the system's limit ( ARG_MAX; on Linux 2 MiB for the default 8 MiB stack,
-	and 128 KiB for one NAME=VALUE entry, 16 bytes less here ); beyond it the command fails with 126
+	and 128 KiB for one string; before 3.11 an entry travels as _MULTICMD_ENV_<i>=NAME=VALUE, so a NAME=VALUE entry may be
+	15 bytes plus the digits of its number i shorter than that ); beyond it the command fails with 126
 	'Argument list too long' ( on every Python ).
 
 	@params:
@@ -924,7 +916,8 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False):
 		if explicit:
 			# the wrapper's environment is this process's, plus the command's entries
 			entries = [os.fsencode(k) + b'=' + os.fsencode(v) for k, v in env.items()]
-			kwargs['env'] = dict(_snapshot(os.environb))
+			# ( a variable with an empty name could not be passed on by every Python's Popen, and is not the command's )
+			kwargs['env'] = dict(item for item in _snapshot(os.environb) if item[0])
 			kwargs['env'].update((os.fsencode(_ENV_VAR + str(i)), entry) for i, entry in enumerate(entries))
 			count = str(len(entries))
 		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count] + list(argv)
@@ -1398,7 +1391,8 @@ def _child_env(task, pager=False):
 	if base is None and extra is None and not pager:
 		return None
 	if base is None:
-		env = dict(_snapshot(os.environ))
+		# ( a variable inherited with an empty name is not passed on when the command has an environment of its own: exec refuses it before 3.11 )
+		env = dict(item for item in _snapshot(os.environ) if item[0] or extra is None)
 		if pager:
 			env.update(PAGER='cat', GIT_PAGER='cat')
 	elif extra is None and not pager:
@@ -1870,7 +1864,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		env: The whole environment of the command ( the commands ), replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
-			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name is left out. An empty name in env / extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
@@ -1912,7 +1906,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		env: The whole environment of each command, replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
-			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name is left out. An empty name in env / extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 

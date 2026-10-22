@@ -461,23 +461,27 @@ print(task.returncode)
 	assert proc.stdout.strip() == '127'
 
 
-def test_a_variable_with_an_empty_name_is_passed_on_like_python_311_does(launcher):
-	if launcher == 'wrapper' and sys.version_info >= (3, 11):
-		pytest.skip('a 3.11+ Popen starting the wrapper with this environment uses posix_spawn, which refuses an empty name; Pythons that need the wrapper use fork_exec')
+def test_an_inherited_variable_with_an_empty_name_is_left_out_of_an_explicit_environment(launcher):
 	proc = _in_fresh_python("""
-import subprocess
 task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
 print(task.returncode, sorted(task.stdout))
 task = multiCMD.run_command(['env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
 print(task.returncode, '=weird' in task.stdout)
 task = multiCMD.run_command(['/no/such/cmd'], quiet=True, extra_env={'A': 'x'}, return_object=True)
 print(task.returncode)
+task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': None}, return_object=True)
+print(task.returncode, '=weird' in task.stdout)
 """, launcher, prefix=('env', '=weird'))
 	assert proc.returncode == 0, proc.stderr
-	first, second, third = proc.stdout.splitlines()
-	assert first.startswith('0 ') and "'=weird'" in first and "'A=x'" in first
-	assert second == '0 True'
+	first, second, third, fourth = proc.stdout.splitlines()
+	assert first.startswith('0 ') and "'=weird'" not in first and "'A=x'" in first
+	assert second == '0 False'
 	assert third == '127'
+	assert fourth == '0 False'
+	# an explicit empty name is an error
+	for kwargs in ({'extra_env': {'': 'x'}}, {'env': {'': 'x'}}):
+		with pytest.raises(ValueError):
+			run_command(['true'], quiet=True, **kwargs)
 
 
 def test_bytes_that_are_not_text_reach_the_command_unchanged(launcher):
@@ -575,6 +579,35 @@ def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, 
 	task = run_command([str(script)], quiet=True, extra_env={'A': '1'}, return_object=True)
 	assert task.returncode == 126 and not task._error
 
+# ---- a command the system refuses to execute is 126 with the reason, whichever way it was started
+
+def _noshebang(tmp_path):
+	script = tmp_path / 'nsb'
+	script.write_text('echo hi\n')
+	script.chmod(0o755)
+	try:
+		subprocess.run([str(script)], stdout=subprocess.PIPE)
+	except PermissionError:
+		pytest.skip(f'{tmp_path} does not allow executing files')
+	except OSError:
+		pass
+	return script
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'extra_env': {'A': '1'}}, {'env': {'PATH': '/bin'}}], ids=['plain', 'extra_env', 'env'])
+def test_enoexec_is_126_with_the_reason(launcher, tmp_path, kwargs):
+	script = _noshebang(tmp_path)
+	task = run_command([str(script)], quiet=True, return_object=True, **kwargs)
+	assert task.returncode == 126 and not task._error
+	assert task.stderr and 'Exec format error' in task.stderr[0]
+	if kwargs:
+		# the same words whichever way an environment was handed over: Python 3.11+'s own, the error with the command as given
+		assert task.stderr[0] == "[Errno 8] Exec format error: %r" % str(script)
+	elif launcher == 'wrapper':
+		# a command without an environment of its own keeps the wrapper's text from before
+		assert task.stderr[0] == '[Errno 8] Exec format error'
+
+
 @pytest.mark.parametrize('kwargs', [{}, {'extra_env': {'A': '1'}}], ids=['plain', 'extra_env'])
 def test_e2big_is_126(launcher, kwargs):
 	# one argument longer than the system takes in a string
@@ -593,4 +626,16 @@ def test_an_internal_oserror_is_still_an_error_with_a_traceback(launcher, monkey
 		assert any('Traceback' in line for line in task.stderr)
 	finally:
 		multiCMD.kill_all()
+
+
+def test_the_wrapper_does_not_unset_each_variable_it_reads():
+	# unsetting one is a scan of the whole environment: N variables would cost N**2
+	assert 'SIGXFZ' not in multiCMD._PGROUP_EXEC and '.pop(' not in multiCMD._PGROUP_EXEC
+	code = ("import os, sys\nos.environb.unsetenv = lambda *a: sys.exit(99)\n"
+		"os.execvpe = lambda f, a, e: print(sorted(e.items()))\nexec(%r)" % multiCMD._PGROUP_EXEC)
+	env = {'PATH': os.environ['PATH'], '_MULTICMD_ENV_0': 'A=1', '_MULTICMD_ENV_1': 'B=x=y'}
+	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, '2', 'true'], env=env,
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	assert proc.returncode == 0, proc.stderr
+	assert proc.stdout.strip() == "[(b'A', b'1'), (b'B', b'x=y')]"
 

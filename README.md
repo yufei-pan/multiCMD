@@ -283,7 +283,7 @@ inherited environment, or of `env` when both are given; a `None` value removes t
 and an empty `extra_env` is the same as none. "Inherited" is `os.environ` as the process holds
 it when the command starts: a variable set behind Python's back ( `os.putenv`, `os.unsetenv`, a
 C library's `setenv` ) reaches commands started without `env` / `extra_env`, not the ones
-given them. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
+given them. An inherited variable with an empty name ( a corrupt `environ` entry such as `=x` ) is left out of the environment of a command given `env` / `extra_env`; an empty name in them is a `ValueError`. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
 there. On POSIX a command is looked up in the `PATH` of the environment it gets, on every Python
 version; Windows searches the calling process's `PATH` whatever the command's environment says.
 Before Python 3.11 the launcher starts in this process's environment and is handed the command's on
