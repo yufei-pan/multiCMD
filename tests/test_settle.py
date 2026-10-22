@@ -547,6 +547,14 @@ os._exit(0)
 '''
 
 
+def _glibc_sigaction_layout():
+	'''Whether struct sigaction is laid out as the probe reads it: glibc on x86_64 / aarch64 Linux'''
+	import platform
+	return sys.platform.startswith('linux') and platform.libc_ver()[0] == 'glibc' \
+		and platform.machine() in ('x86_64', 'aarch64') and hasattr(signal, 'siginterrupt')
+
+
+@pytest.mark.skipif(not _glibc_sigaction_layout(), reason="reads glibc's struct sigaction ( x86_64 / aarch64 ) and uses signal.siginterrupt")
 def test_a_normal_run_leaves_a_c_level_sigint_handler_and_siginterrupt_in_place(tmp_path):
 	# ( review round 8, finding 1 ) each signal.signal() put CPython's own C handler back: faulthandler's was dropped,
 	# and SA_RESTART with it, by the first serial run_command
