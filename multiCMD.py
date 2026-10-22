@@ -1866,24 +1866,27 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	explicit = task._env is not None or task._extra_env is not None
 	if use_pty:
 		master, slave = _open_pty(len(decor[0]))
-	proc = None
+	proc = pgid = None
 	streams = []
 	readers = []
 	interrupted = False
 	# from the spawn on, a Ctrl-C or any failure still stops the command, which runs in a process group of its own
 	try:
-		if master is not None:
-			try:
-				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
-			finally:
-				# only the command keeps the terminal side open, so the master sees EIO once it is gone
-				os.close(slave)
-			task._pty = True
-			streams.append((io.open(master, 'rb'), task.stdout))
-		else:
-			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
-			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
-		_register(proc, pgid)
+		# a Ctrl-C while it starts is held until it is registered, so it is never left running unknown to kill_all()
+		# ( see _HoldCtrlC; Popen and the PATH lookup do not block for long )
+		with _HoldCtrlC():
+			if master is not None:
+				try:
+					proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
+				finally:
+					# only the command keeps the terminal side open, so the master sees EIO once it is gone
+					os.close(slave)
+				task._pty = True
+				streams.append((io.open(master, 'rb'), task.stdout))
+			else:
+				proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
+				streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
+			_register(proc, pgid)
 		# started: a long-lived executor keeps its tasks, not the environments they were started with
 		task._env = task._extra_env = None
 		task.start_time = time.time()
@@ -1893,6 +1896,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		def settle():
+			if proc is not None:
+				# ( a Ctrl-C that came right after the spawn came before the registration: it is killed below, and a
+				# second Ctrl-C meanwhile leaves it to kill_all() and the exit hook )
+				with _live_procs_lock:
+					_live_procs[proc] = pgid
 			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
 			pending = streams or ([] if proc is None or master is not None else [(proc.stdout, None), (proc.stderr, None)])
 			for i, (stream, _) in enumerate(pending):

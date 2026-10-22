@@ -340,6 +340,52 @@ def test_a_second_ctrl_c_before_the_starts_settle_leaves_no_thread_tracked(monke
 	assert not multiCMD._live_procs
 
 
+# ---- a command interrupted as it starts is always registered while it is killed
+
+def test_a_ctrl_c_before_the_registration_still_registers_the_command_while_it_is_killed(monkeypatch):
+	real_register = multiCMD._register
+	armed = [True]
+	def register(proc, pgid):
+		if armed[0]:
+			armed[0] = False
+			raise KeyboardInterrupt
+		real_register(proc, pgid)
+	monkeypatch.setattr(multiCMD, '_register', register)
+	registered = []
+	real_kill = multiCMD._kill_commands
+	def kill(commands, first_signal):
+		commands = list(commands)
+		with multiCMD._live_procs_lock:
+			registered.extend(proc in multiCMD._live_procs for proc, _ in commands)
+		real_kill(commands, first_signal)
+	monkeypatch.setattr(multiCMD, '_kill_commands', kill)
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD.run_command(['sleep', '30'], quiet=True)
+	# before: a second Ctrl-C during the kill left a command neither dead nor known to kill_all()
+	assert registered == [True]
+	assert not multiCMD._live_procs
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
+def test_a_ctrl_c_while_the_command_starts_still_stops_it(monkeypatch, tmp_path):
+	pidfile = tmp_path / 'pid'
+	real_spawn = multiCMD._spawn
+	def spawn(*args, **kwargs):
+		result = real_spawn(*args, **kwargs)
+		# lands before the spawn has even returned
+		_ctrl_c()
+		return result
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD.run_command(['sh', '-c', f'echo $$ > {pidfile}; exec sleep 30'], quiet=True)
+	# before: the Ctrl-C lost the command, which ran on in its own process group, unknown to kill_all()
+	deadline = time.monotonic() + 5
+	while not pidfile.exists() and time.monotonic() < deadline:
+		time.sleep(0.01)
+	assert pid_gone(int(pidfile.read_text()))
+	assert not multiCMD._live_procs
+
+
 # ---- the pool: one failed start is enough, and failing every task is settled
 
 def test_the_pool_stops_starting_workers_after_the_first_that_cannot_start(monkeypatch, capfd):
