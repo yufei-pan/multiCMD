@@ -1,5 +1,6 @@
 import _thread
 import os
+import sys
 import threading
 import time
 
@@ -493,7 +494,7 @@ def test_an_abandoned_thread_never_runs_its_target_and_a_running_one_is_not_aban
 	thread = multiCMD._Thread(release.wait, (10,))
 	thread.start()
 	deadline = time.monotonic() + 5
-	while not thread._claim.locked() and time.monotonic() < deadline:
+	while not thread._runs() and time.monotonic() < deadline:
 		time.sleep(0.01)
 	assert not thread._abandon() and thread.is_alive()
 	release.set()
@@ -547,7 +548,7 @@ def _fail_nth_start(monkeypatch, target, n, exc=RuntimeError("can't start new th
 				if after:
 					real_start(self)
 					deadline = time.monotonic() + 5
-					while not self._claim.locked() and time.monotonic() < deadline:
+					while not self._runs() and time.monotonic() < deadline:
 						time.sleep(0.001)
 				raise exc
 		real_start(self)
@@ -598,6 +599,48 @@ def test_ctrl_c_while_fire_and_forget_threads_start(monkeypatch, after):
 	assert all(task.stop and task.thread is None and task.returncode is None and task._extra_env is None for task in tasks[ran:])
 	assert not _global_threads() or all(not thread.is_alive() for thread in _global_threads())
 	assert not multiCMD._live_procs
+
+
+def test_abandon_gives_the_same_answer_after_a_ctrl_c_cut_it_short():
+	thread = multiCMD._Thread(print)
+	real_set = thread.done.set
+	armed = [True]
+	def set_once():
+		if armed[0]:
+			armed[0] = False
+			raise KeyboardInterrupt
+		real_set()
+	thread.done.set = set_once
+	with pytest.raises(KeyboardInterrupt):
+		thread._abandon()
+	# asked again, it is still abandoned, and this time it is done
+	assert thread._abandon() and thread.done.is_set() and not thread.is_alive()
+	thread.start()
+	thread.join(1)
+	assert not thread._runs()
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 9, 8), reason='the held tstate lock of bpo-45274 needs Python < 3.9.8')
+def test_a_join_after_an_interrupted_one_left_the_tstate_lock_held_does_not_block():
+	thread = multiCMD._Thread(time.sleep, (0.1,))
+	thread.start()
+	thread.done.wait(5)
+	time.sleep(0.1)
+	# the state a Thread.join() leaves when a Ctrl-C lands right after it took the lock
+	thread._tstate_lock.acquire()
+	try:
+		joined = threading.Event()
+		def joiner():
+			multiCMD._join(thread, 0.5)
+			thread.join()
+			joined.set()
+		threading.Thread(target=joiner, daemon=True).start()
+		assert joined.wait(5)
+		assert not thread.is_alive()
+	finally:
+		thread._tstate_lock.release()
+
+
 
 
 def test_ctrl_c_while_the_dispatcher_starts_keeps_it_once_it_runs(monkeypatch):

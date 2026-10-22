@@ -34,6 +34,9 @@ __running_threads = set()
 __running_threads_lock = threading.Lock()
 # fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
 __finished_threads = collections.deque()
+# before 3.9.8 a Thread.join() that a Ctrl-C interrupts right after it took the thread's tstate lock leaves the
+# lock held, and every later Thread.join() without a timeout blocks for good ( bpo-45274 )
+_JOIN_MAY_HANG = sys.version_info < (3, 9, 8)
 
 # immutable helpers compiled once at import time
 _BRACKET_RX   = re.compile(r'\[([^\]]+)\]')
@@ -207,13 +210,15 @@ class _Thread(threading.Thread):
 	is_alive() and join() go by it, so they stay right on every Python, whatever join was interrupted before:
 	- join(timeout) waits for done in 0.1 s steps ( so a Ctrl-C reaches the waiting thread ), bounded by
 	  timeout, and once done is set it joins the thread itself, which releases its stack ( from Python 3.13 a
-	  finished thread nobody joined keeps its stack mapped for as long as the Thread object lives );
+	  finished thread nobody joined keeps its stack mapped for as long as the Thread object lives ), within
+	  what is left of timeout: a thread whose target has finished is done, whether or not it has left yet;
 	- is_alive() is True until done is set, from the moment the thread is created: one registered before it
 	  starts counts as running, so a wait from another thread meanwhile waits for it.
 	A thread is therefore either started or abandoned, never left in between: start() abandons it when it
 	cannot start, or when a Ctrl-C lands while it waits for the thread to come up and the thread has not got
 	to its target yet; a caller abandons the threads it meant to start but did not. Whichever comes first,
-	run() or _abandon(), decides whether the target runs, so the answer never depends on timing afterwards.
+	run() or _abandon(), decides whether the target runs, so the answer never depends on timing afterwards, and
+	_abandon() gives the same answer however often it is asked, a Ctrl-C between two included.
 	@attributes:
 		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
 		done: Set once the target has returned or raised, or the thread was abandoned
@@ -224,8 +229,9 @@ class _Thread(threading.Thread):
 		self.done = threading.Event()
 		# ( in a child forked meanwhile only the forking thread exists )
 		self._pid = os.getpid()
-		self._claim = threading.Lock()
-		self._abandoned = False
+		# who decided whether the target runs: 'run' or 'abandon'. setdefault() is one atomic step that also
+		# says who won, so no interrupt can leave the decision taken but unrecorded
+		self._claim = {}
 
 	def start(self):
 		try:
@@ -241,14 +247,18 @@ class _Thread(threading.Thread):
 		@returns:
 			bool: Whether it never runs its target ( done is then set )
 		'''
-		if self._claim.acquire(False):
-			self._abandoned = True
-			self.done.set()
-		return self._abandoned
+		if self._claim.setdefault('by', 'abandon') != 'abandon':
+			return False
+		self.done.set()
+		return True
+
+	def _runs(self):
+		'''Whether the thread has got to its target ( internal )'''
+		return self._claim.get('by') == 'run'
 
 	def run(self):
 		try:
-			if self._claim.acquire(False):
+			if self._claim.setdefault('by', 'run') == 'run':
 				super().run()
 		finally:
 			self.done.set()
@@ -265,7 +275,11 @@ class _Thread(threading.Thread):
 			self.done.wait(step)
 		# ( an abandoned thread may never have come up )
 		if self._started.is_set() and self._pid == os.getpid():
-			super().join()
+			left = None if deadline is None else max(0, deadline - time.monotonic())
+			if _JOIN_MAY_HANG:
+				# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
+				left = 1 if left is None else min(left, 1)
+			super().join(left)
 
 class _Display:
 	'''
