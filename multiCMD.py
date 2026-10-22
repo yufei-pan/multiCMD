@@ -280,9 +280,11 @@ class AsyncExecutor:
 		self.color = color
 		self.pty = pty
 		# plain dicts: a later change is checked and snapshotted by the next run_commands, never shared with queued commands
+		given = extra_env
 		env, extra_env = _check_env(env, 'env'), _check_env(extra_env, 'extra_env', allow_none=True)
 		self.env = None if env is None else env.copy()
-		self.extra_env = None if extra_env is None else extra_env.copy()
+		# an empty one ( which _check_env reduces to None ) stays a dict to add to, like env
+		self.extra_env = None if given is None else {} if extra_env is None else extra_env.copy()
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
@@ -376,6 +378,8 @@ class AsyncExecutor:
 				if task.stop:
 					if acquired:
 						sem.release()
+					# never started: it keeps its place in the task list, not its environment
+					task._env = task._extra_env = None
 					continue
 				self._reap()
 				try:
@@ -1906,9 +1910,11 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		_validate_sudo()
 	if dry_run:
 		# nothing runs: show each command once, quoted so it can be pasted into a shell
-		if not quiet:
-			for task in tasks:
+		for task in tasks:
+			if not quiet:
 				_display.message(_dry_run_line(task))
+			# nothing runs: the returned tasks do not keep their environments
+			task._env = task._extra_env = None
 	elif not wait_for_return:
 		__reap_finished_threads()
 		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,False,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]

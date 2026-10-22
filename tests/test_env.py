@@ -587,6 +587,7 @@ def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, 
 	task = run_command([str(script)], quiet=True, extra_env={'A': '1'}, return_object=True)
 	assert task.returncode == 126 and not task._error
 
+
 # ---- a command the system refuses to execute is 126 with the reason, whichever way it was started
 
 def _noshebang(tmp_path):
@@ -647,3 +648,25 @@ def test_the_wrapper_does_not_unset_each_variable_it_reads():
 	assert proc.returncode == 0, proc.stderr
 	assert proc.stdout.strip() == "[(b'A', b'1'), (b'B', b'x=y')]"
 
+
+def test_tasks_that_never_started_do_not_keep_their_environment():
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	blocker = ex.run_command(['sh', '-c', 'sleep 0.5'])
+	skipped = ex.run_command(ECHO, env={'PATH': os.environ['PATH']}, extra_env={'MCMD_T': 'k'})
+	skipped.stop = True
+	ex.wait(timeout=10)
+	assert skipped.returncode is None
+	assert skipped._env is None and skipped._extra_env is None
+	assert blocker.returncode == 0
+	tasks = run_commands([ECHO], quiet=True, dry_run=True, env={'PATH': '/bin'}, extra_env={'MCMD_T': 'k'}, return_object=True)
+	assert tasks[0]._env is None and tasks[0]._extra_env is None
+
+
+def test_an_executors_empty_extra_env_can_be_added_to():
+	ex = AsyncExecutor(quiet=True, extra_env={}, env={})
+	ex.extra_env['MCMD_T'] = '1'
+	ex.env['PATH'] = os.environ['PATH']
+	assert ex.run_command(ECHO) is not None
+	ex.wait(timeout=10)
+	assert ex.tasks[-1].stdout == ['[1]']
+	assert AsyncExecutor().extra_env is None
