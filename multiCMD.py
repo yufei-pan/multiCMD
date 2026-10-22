@@ -1291,7 +1291,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	if executable is not None:
 		kwargs['executable'] = executable
 	if not _IS_POSIX:
-		return subprocess.Popen(argv, **kwargs), None
+		return _reentrant_waitpid_lock(subprocess.Popen(argv, **kwargs)), None
 	grouped = True
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
@@ -1308,10 +1308,27 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		grouped = False
 	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
 	try:
-		proc = subprocess.Popen(argv, **kwargs)
+		proc = _reentrant_waitpid_lock(subprocess.Popen(argv, **kwargs))
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
+
+_LOCK_TYPE = type(threading.Lock())
+
+def _reentrant_waitpid_lock(proc):
+	'''
+	Give a new Popen an RLock as its _waitpid_lock, before anyone else can use it ( internal ); returns proc
+	Popen.poll() and wait(timeout) take that lock with acquire(False), then enter the try that releases it. A
+	KeyboardInterrupt landing in between ( on the main thread, which polls a serial run's command over and over )
+	leaves it held for good: every later poll() returns None and the command is never reaped, so it stays
+	registered and every wait for it runs to its timeout ( seen on free-threaded 3.13t and 3.14t, 1-3 % of
+	Ctrl-Cs in the start stress test ). An RLock knows its owner: the thread that was cut short takes it again and
+	reaps the command, and once its returncode is known nobody needs the lock. ( Popen never takes it twice
+	itself, and a test double without one is left as it is. )
+	'''
+	if isinstance(getattr(proc, '_waitpid_lock', None), _LOCK_TYPE):
+		proc._waitpid_lock = threading.RLock()
+	return proc
 
 def _stdout_isatty():
 	'''

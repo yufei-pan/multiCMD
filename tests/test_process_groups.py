@@ -192,3 +192,21 @@ def test_a_command_still_running_stays_registered():
 	finally:
 		multiCMD._live_procs.pop(proc, None)
 		multiCMD._kill_commands([(proc, pgid)], signal.SIGKILL)
+
+
+def test_a_poll_cut_short_holding_popens_lock_does_not_keep_the_command_from_being_reaped(launcher):
+	# ( seen on free-threaded 3.13t / 3.14t ) a Ctrl-C right after Popen.poll()'s acquire(False) of _waitpid_lock,
+	# before its try: the lock stays held, and every later poll() returned None
+	proc, pgid = multiCMD._spawn(['true'], subprocess.DEVNULL, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		assert proc._waitpid_lock.acquire(False)
+		deadline = time.monotonic() + 5
+		while proc.poll() is None and time.monotonic() < deadline:
+			time.sleep(0.01)
+		# before: None for good, and the command stayed registered
+		assert proc.poll() == 0
+		multiCMD._unregister(proc)
+		assert proc not in multiCMD._live_procs
+	finally:
+		multiCMD._live_procs.pop(proc, None)
