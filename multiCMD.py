@@ -7,6 +7,7 @@
 import argparse
 import atexit
 import collections
+import collections.abc
 import errno
 import io
 import itertools
@@ -47,19 +48,32 @@ _IS_POSIX = os.name == 'posix'
 # Popen(process_group=) exists from Python 3.11; older Pythons start commands through _PGROUP_EXEC
 _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
-# preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo
+# preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo.
+# It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
+# like included ) and gets the command's environment, when that differs, as NAME=VALUE entries separated by NUL
+# on the file descriptor given as its first argument ( '-' : inherit ); it adds nothing to it and, like
+# Python 3.11+'s Popen, looks the command up in that environment's PATH
 _PGROUP_EXEC = (
 	"import os,signal,sys\n"
 	# Python ignores SIGPIPE / SIGXFSZ at startup and an ignored signal survives exec; give the command the defaults
 	"for n in ('SIGPIPE','SIGXFZ','SIGXFSZ'):\n"
 	"\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
 	"os.setpgid(0,0)\n"
+	"a=sys.argv\n"
 	"try:\n"
-	"\tos.execvp(sys.argv[1],sys.argv[1:])\n"
+	"\tif a[1]=='-':os.execvp(a[2],a[2:])\n"
+	"\td=[]\n"
+	"\twhile 1:\n"
+	"\t\tb=os.read(int(a[1]),65536)\n"
+	"\t\tif not b:break\n"
+	"\t\td.append(b)\n"
+	"\tos.close(int(a[1]))\n"
+	"\td=b''.join(d)\n"
+	"\tos.execvpe(a[2],a[2:],dict(os.fsdecode(i).partition('=')[::2] for i in d.split(b'\\0')) if d else {})\n"
 	"except FileNotFoundError as e:\n"
-	"\tsys.stderr.write(str(e)+'\\n');sys.exit(127)\n"
+	"\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(127)\n"
 	"except OSError as e:\n"
-	"\tsys.stderr.write(str(e)+'\\n');sys.exit(126)\n"
+	"\tsys.stderr.write('%s: %r\\n'%(e,a[2]));sys.exit(126)\n"
 )
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
@@ -841,22 +855,49 @@ def _spawn(argv, stdout, stderr, env=None):
 	if not _IS_POSIX:
 		return subprocess.Popen(argv, **kwargs), None
 	grouped = True
+	read_fd = write_fd = None
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
 	elif sys.executable and not getattr(sys, 'frozen', False):
 		# ( a frozen app's sys.executable is the app itself, not a Python that can run the wrapper )
-		# the wrapper would only report a missing command through its exit code; fail like Popen does
-		search_path = (env if env is not None else os.environ).get('PATH')
-		if os.sep not in argv[0] and shutil.which(argv[0], path=search_path) is None:
+		# the wrapper would only report a missing command through its exit code; fail like Popen does, which
+		# looks in the PATH of the command's environment ( the default path when that has none )
+		if os.sep not in argv[0] and shutil.which(argv[0], path=os.pathsep.join(d or os.curdir for d in os.get_exec_path(env))) is None:
 			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), argv[0])
-		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC] + list(argv)
+		# the wrapper itself starts in this process's environment; the command's goes over a pipe
+		kwargs['env'] = None
+		if env is not None:
+			read_fd, write_fd = os.pipe()
+			kwargs['pass_fds'] = (read_fd,)
+		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, '-' if env is None else str(read_fd)] + list(argv)
 	else:
 		grouped = False
 	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
 	try:
 		proc = subprocess.Popen(argv, **kwargs)
+	except BaseException:
+		if write_fd is not None:
+			os.close(write_fd)
+		raise
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+		if read_fd is not None:
+			os.close(read_fd)
+	if write_fd is not None:
+		try:
+			data = memoryview(b'\0'.join(os.fsencode(k) + b'=' + os.fsencode(v) for k, v in env.items()))
+			while data:
+				data = data[os.write(write_fd, data):]
+		except BrokenPipeError:
+			# the wrapper is gone ( it could not start ): its exit status says so
+			pass
+		except BaseException:
+			# never let the command run with half an environment
+			proc.kill()
+			proc.wait()
+			raise
+		finally:
+			os.close(write_fd)
 	return proc, (proc.pid if grouped else None)
 
 def _stdout_isatty():
@@ -879,6 +920,21 @@ def _quote_command(command):
 	if isinstance(command, str):
 		return command
 	return ' '.join(shlex.quote(str(arg)) for arg in command)
+
+def _dry_run_line(task):
+	'''
+	The line a dry run shows for a task: the command, quoted, led by the environment it would start with ( internal )
+	An environment of its own shows as `env -i NAME=VALUE ...`, extra variables as `env [-u NAME] NAME=VALUE ...`.
+	'''
+	line = _quote_command(task.command)
+	if task._env is None and not task._extra_env:
+		return line
+	if task._env is not None:
+		words = ['-i'] + [shlex.quote(f'{k}={v}') for k, v in _child_env(task).items()]
+	else:
+		words = ['-u ' + shlex.quote(k) for k, v in task._extra_env.items() if v is None]
+		words += [shlex.quote(f'{k}={v}') for k, v in task._extra_env.items() if v is not None]
+	return f'env {" ".join(words)} {line}'
 
 def _last_output_line(task, limit=200):
 	'''
@@ -1176,56 +1232,113 @@ def _join_readers(readers, limit):
 	for reader in readers:
 		_join(reader, None if deadline is None else max(0, deadline - time.monotonic()))
 
+class _Env(dict):
+	'''A validated environment ( internal ): built once by _check_env, shared by every command of a call and never changed'''
+	__slots__ = ()
+
+def _snapshot(mapping):
+	'''
+	The ( key, value ) pairs of a mapping other threads may change, as os.environ ( internal )
+	Looking each key up after listing them fails for one deleted in between; that one is left out.
+	'''
+	items = []
+	for key in list(mapping):
+		try:
+			items.append((key, mapping[key]))
+		except KeyError:
+			pass
+	return items
+
+def _env_text(value, what):
+	'''
+	An environment name or value as str, from what subprocess accepts ( internal )
+	POSIX takes str, bytes and os.PathLike ( os.fsencode ); Windows only str.
+	'''
+	if isinstance(value, str):
+		return value
+	if os.name != 'nt' and isinstance(value, (bytes, os.PathLike)):
+		try:
+			return os.fsdecode(value)
+		except TypeError:
+			pass
+	raise TypeError(f'{what} must be a str{"" if os.name == "nt" else ", bytes or os.PathLike"}, not {type(value).__name__}')
+
 def _check_env(mapping, name, allow_none=False):
 	'''
 	Validate an environment mapping and take a snapshot of it, so the caller changing it later does not reach the command ( internal )
+	Names and values are what subprocess accepts: str, and on POSIX bytes and os.PathLike too ( stored as str ).
+	An already checked environment is returned as it is, so passing it on costs nothing.
 
 	@returns:
-		dict | None: The copy ( None when mapping is None )
+		_Env | None: The snapshot ( None when mapping is None, or is empty and allow_none: nothing to add )
 	'''
-	if mapping is None:
-		return None
-	try:
-		items = list(dict(mapping).items())
-	except (TypeError, ValueError):
-		raise TypeError(f'{name} must be a mapping of variable names to values, not {type(mapping).__name__}') from None
-	for key, value in items:
-		if not isinstance(key, str) or not key or '=' in key or '\0' in key:
+	if mapping is None or type(mapping) is _Env:
+		return mapping
+	if not isinstance(mapping, collections.abc.Mapping):
+		raise TypeError(f'{name} must be a mapping of variable names to values, not {type(mapping).__name__}')
+	env = _Env()
+	for key, value in _snapshot(mapping):
+		key = _env_text(key, f'{name}: variable name')
+		# Windows has hidden variables such as '=C:': its names may start with '='
+		if not key or '\0' in key or '=' in key[os.name == 'nt':]:
 			raise ValueError(f'{name}: invalid variable name {key!r}')
 		if value is None and allow_none:
+			env[key] = None
 			continue
-		if not isinstance(value, str) or '\0' in value:
-			raise TypeError(f'{name}[{key!r}] must be a str{" or None" if allow_none else ""}, not {type(value).__name__}')
-	return dict(items)
+		value = _env_text(value, f'{name}[{key!r}]' + (' ( or None )' if allow_none else ''))
+		if '\0' in value:
+			raise ValueError(f'{name}[{key!r}] holds a NUL character')
+		env[key] = value
+	return env if env or not allow_none else None
+
+def _apply_extra_env(env, extra_env):
+	'''
+	Add extra_env to env in place; a None value removes the variable ( internal )
+	Windows names are case-insensitive, so 'Path' replaces or removes PATH there.
+	'''
+	names = {key.upper(): key for key in env} if os.name == 'nt' else None
+	for key, value in extra_env.items():
+		if names is not None:
+			old = names.pop(key.upper(), None)
+			if old is not None:
+				del env[old]
+			if value is not None:
+				names[key.upper()] = key
+		if value is None:
+			env.pop(key, None)
+		else:
+			env[key] = value
 
 def _child_env(task, pager=False):
 	'''
 	The environment a task's command starts with ( internal )
 	Built per command and never written to os.environ, so concurrent commands cannot see each other's.
+	"Inherited" is os.environ as this process holds it when the command starts: variables set behind its
+	back ( os.putenv, os.unsetenv, C setenv ) reach a command started without env / extra_env / pager only.
 
 	@params:
 		task: The Task
 		pager: Whether to default PAGER / GIT_PAGER to cat ( for a pty ); a variable the caller set stays as it is
 
 	@returns:
-		dict | None: The environment, None to inherit the parent's untouched
+		dict | None: The environment ( do not change it ), None to inherit the parent's untouched
 	'''
-	if task._env is None and task._extra_env is None and not pager:
+	base, extra = task._env, task._extra_env
+	if base is None and extra is None and not pager:
 		return None
-	if task._env is not None:
-		env = dict(task._env)
+	if base is None:
+		env = dict(_snapshot(os.environ))
+		if pager:
+			env.update(PAGER='cat', GIT_PAGER='cat')
+	elif extra is None and not pager:
+		return base
+	else:
+		env = dict(base)
 		if pager:
 			env.setdefault('PAGER', 'cat')
 			env.setdefault('GIT_PAGER', 'cat')
-	elif pager:
-		env = dict(os.environ, PAGER='cat', GIT_PAGER='cat')
-	else:
-		env = dict(os.environ)
-	for key, value in (task._extra_env or {}).items():
-		if value is None:
-			env.pop(key, None)
-		else:
-			env[key] = value
+	if extra:
+		_apply_extra_env(env, extra)
 	return env
 
 def _execute(task, timeout, quiet, decor, use_pty=False):
@@ -1264,6 +1377,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	else:
 		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task))
 		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
+	# started: a long-lived executor keeps its tasks, not the environments they were started with
+	task._env = task._extra_env = None
 	task.start_time = time.time()
 	task._last_output = time.monotonic()
 	_register(proc, pgid)
@@ -1337,7 +1452,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		try:
 			if dry_run:
 				if not quiet:
-					_display.message(_quote_command(task.command))
+					_display.message(_dry_run_line(task))
 				return task.stdout + task.stderr if with_stdErr else task.stdout
 			if not quiet:
 				_display.message('Running command: ' + _quote_command(task.command), decor)
@@ -1496,6 +1611,7 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	env = _check_env(env, 'env')
 	extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
+	# one snapshot shared by every task of the call
 	tasks = [Task(command) for command in formatedCommands]
 	for task in tasks:
 		task._env = env
@@ -1669,7 +1785,9 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		shell: Whether to run the command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
 		env: The whole environment of the command ( the commands ), replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
-			Applied on top of env when both are given. Per call and per command: it never changes os.environ nor reaches other commands.
+			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
+			Names and values are str, on POSIX bytes and os.PathLike too; the command is looked up in the PATH of the environment it gets
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:
@@ -1709,7 +1827,9 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		shell: Whether to run each command through the system shell ( /bin/sh -c ), so pipes, ;, > and globs work
 		env: The whole environment of each command, replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
-			Applied on top of env when both are given. Per call and per command: it never changes os.environ nor reaches other commands.
+			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ).
+			Names and values are str, on POSIX bytes and os.PathLike too; the command is looked up in the PATH of the environment it gets
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
 	@returns:
@@ -1734,7 +1854,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		# nothing runs: show each command once, quoted so it can be pasted into a shell
 		if not quiet:
 			for task in tasks:
-				_display.message(_quote_command(task.command))
+				_display.message(_dry_run_line(task))
 	elif not wait_for_return:
 		__reap_finished_threads()
 		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,False,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]
@@ -1974,15 +2094,15 @@ def main():
 		parser.error('-a/--arg-file needs at least one command template')
 	if '-' in (args.file or []) and '-' in (args.arg_file or []):
 		parser.error('-f - and -a - cannot both read stdin')
-	# set_sudo() validates that sudo exists and that we are not already root
-	# before enabling it, and updates the USE_SUDO global accordingly.
-	set_sudo(args.sudo)
 	extra_env = {}
 	for assignment in args.env or []:
 		name, equals, value = assignment.partition('=')
 		if not name:
 			parser.error(f'-e/--env: invalid assignment {assignment!r}')
 		extra_env[name] = value if equals else None
+	# set_sudo() validates that sudo exists and that we are not already root
+	# before enabling it, and updates the USE_SUDO global accordingly.
+	set_sudo(args.sudo)
 	_install_cli_signal_handlers()
 	try:
 		commands = _cli_commands(args)

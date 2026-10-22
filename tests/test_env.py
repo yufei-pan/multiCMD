@@ -1,18 +1,45 @@
 import os
+import pathlib
 import subprocess
 import sys
+import threading
+from unittest import mock
 
 import pytest
 
 import multiCMD
 from multiCMD import AsyncExecutor, run_command, run_commands
 
+from conftest import PACKAGE_ROOT, run_cli
+
 ECHO = ['sh', '-c', 'echo "[$MCMD_T]"']
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
+def _clean(monkeypatch, launcher):
+	# every test here runs with Popen(process_group=) ( 3.11+ ) and with the exec wrapper
 	monkeypatch.delenv('MCMD_T', raising=False)
+
+
+def _tool(tmp_path):
+	'''An executable script in tmp_path; skips on a noexec filesystem'''
+	tool = tmp_path / 'mcmd-env-tool'
+	tool.write_text('#!/bin/sh\necho found\n')
+	tool.chmod(0o755)
+	try:
+		subprocess.run([str(tool)], stdout=subprocess.PIPE, check=True)
+	except PermissionError:
+		pytest.skip(f'{tmp_path} does not allow executing files')
+	return tool
+
+
+def _clean_parent(code, launcher):
+	'''Run code in a Python that has only PATH in its environment ( no locale, so PEP 538 coercion applies ) with multiCMD imported'''
+	script = ('import sys; sys.path.insert(0, %r); import multiCMD; multiCMD._HAS_PROCESS_GROUP = %r\n' % (str(PACKAGE_ROOT), launcher == 'native')) + code
+	proc = subprocess.run([sys.executable, '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+		env={'PATH': os.environ['PATH']}, timeout=60)
+	assert proc.returncode == 0, proc.stderr
+	return proc.stdout
 
 
 def test_extra_env_reaches_the_child():
@@ -66,11 +93,26 @@ def test_extra_env_applies_on_top_of_env():
 
 
 def test_path_lookup_follows_env(tmp_path):
-	tool = tmp_path / 'mcmd-env-tool'
-	tool.write_text('#!/bin/sh\necho found\n')
-	tool.chmod(0o755)
+	_tool(tmp_path)
 	assert run_command(['mcmd-env-tool'], quiet=True, return_code_only=True) == 127
 	assert run_command(['mcmd-env-tool'], quiet=True, extra_env={'PATH': str(tmp_path) + os.pathsep + os.environ['PATH']}) == ['found']
+
+
+def test_env_without_path_searches_the_default_path_not_the_parents(tmp_path, monkeypatch, capsys):
+	_tool(tmp_path)
+	monkeypatch.setenv('PATH', str(tmp_path) + os.pathsep + os.environ['PATH'])
+	assert run_command(['mcmd-env-tool'], quiet=True) == ['found']
+	# the parent's PATH is not the command's: the lookup fails by name, the same way on every Python
+	for kwargs in ({'env': {'HOME': '/tmp'}}, {'extra_env': {'PATH': None}}):
+		task = run_command(['mcmd-env-tool'], quiet=True, return_object=True, **kwargs)
+		assert task.returncode == 127
+		assert 'mcmd-env-tool' in capsys.readouterr().err
+		assert 'mcmd-env-tool' in ' '.join(task.stderr)
+	# and the default path finds the system tools
+	assert run_command(['ls', '/'], quiet=True, return_code_only=True, env={'HOME': '/tmp'}) == 0
+	monkeypatch.setenv('PATH', str(tmp_path))
+	assert run_command(['ls', '/'], quiet=True, return_code_only=True, env={'HOME': '/tmp'}) == 0
+	assert run_command(['ls', '/'], quiet=True, return_code_only=True, extra_env={'PATH': None}) == 0
 
 
 def test_error_still_names_the_command(capsys):
@@ -86,9 +128,17 @@ def test_return_codes_and_timeout_with_env():
 	assert task.returncode == 124
 
 
-def test_dry_run_shows_the_command_only(capsys):
-	assert run_command(ECHO, dry_run=True, extra_env={'MCMD_T': 'secret'}) == []
-	assert 'secret' not in capsys.readouterr().out
+def test_dry_run_shows_the_environment(capsys):
+	assert run_command(['xfs_info', '/data'], dry_run=True, extra_env={'LC_ALL': 'C'}) == []
+	assert capsys.readouterr().out.strip() == 'env LC_ALL=C xfs_info /data'
+	run_command(['ls'], dry_run=True, extra_env={'A B': 'x y', 'GONE': None})
+	assert capsys.readouterr().out.strip() == "env -u GONE 'A B=x y' ls"
+	run_command(['ls'], dry_run=True, env={'PATH': '/bin'}, extra_env={'A': '1'})
+	assert capsys.readouterr().out.strip() == 'env -i PATH=/bin A=1 ls'
+	run_command(['ls'], dry_run=True)
+	assert capsys.readouterr().out.strip() == 'ls'
+	run_command(['ls'], dry_run=True, extra_env={})
+	assert capsys.readouterr().out.strip() == 'ls'
 
 
 def test_concurrent_commands_each_see_their_own_value():
@@ -156,9 +206,151 @@ def test_pty_gets_the_env_and_keeps_the_pager_default(monkeypatch):
 
 
 def test_cli_env_option():
-	proc = subprocess.run([sys.executable, 'multiCMD.py', '-q', '--no-pty', '-e', 'MCMD_T=cli', '-e', 'MCMD_GONE', 'echo hi'],
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=dict(os.environ, MCMD_GONE='1'))
+	parent = dict(os.environ, MCMD_GONE='1')
+	proc = run_cli(['-q', '--no-pty', '-e', 'MCMD_T=cli', '-e', 'MCMD_GONE', 'echo hi'], env=parent)
 	assert proc.returncode == 0
-	proc = subprocess.run([sys.executable, 'multiCMD.py', '--no-pty', '--shell', '-e', 'MCMD_T=cli', '-e', 'MCMD_GONE', 'echo "[$MCMD_T][$MCMD_GONE]"'],
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=dict(os.environ, MCMD_GONE='1'))
+	proc = run_cli(['--no-pty', '--shell', '-e', 'MCMD_T=cli', '-e', 'MCMD_GONE', 'echo "[$MCMD_T][$MCMD_GONE]"'], env=parent)
 	assert '[cli][]' in proc.stdout
+	proc = run_cli(['-n', '-e', 'LC_ALL=C', '-e', 'GONE', 'xfs_info /data'])
+	assert proc.stdout.strip() == 'env -u GONE LC_ALL=C xfs_info /data'
+
+
+def test_cli_rejects_a_bad_assignment_before_the_sudo_check(monkeypatch, capsys):
+	monkeypatch.setattr(multiCMD, 'SUDO_PATH', None)
+	monkeypatch.setattr(os, 'geteuid', lambda: 1000)
+	monkeypatch.setattr(sys, 'argv', ['mcmd', '--sudo', '-e', '=X', 'ls'])
+	with pytest.raises(SystemExit) as raised:
+		multiCMD.main()
+	assert raised.value.code == 2
+	err = capsys.readouterr().err
+	assert 'invalid assignment' in err
+	assert 'ignoring it' not in err
+
+
+def test_exec_is_exactly_the_requested_environment(launcher):
+	# a Python that starts without a locale ( 3.7-3.10 ) sets LC_CTYPE for itself; the command must not get it
+	out = _clean_parent("""
+for kwargs in ({'env': {'A': '1', 'PATH': '/usr/bin:/bin'}}, {'env': {}}, {'env': {'PATH': '/usr/bin:/bin'}, 'extra_env': {'LC_CTYPE': None}}):
+	print(sorted(multiCMD.run_command(['/usr/bin/env'], quiet=True, **kwargs)))
+print(sorted(multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'LC_CTYPE': None, 'A': '1'})))
+""", launcher).splitlines()
+	assert out[0] == "['A=1', 'PATH=/usr/bin:/bin']"
+	assert out[1] == '[]'
+	assert out[2] == "['PATH=/usr/bin:/bin']"
+	# removing a variable the parent was given, by its own coercion or not, works
+	assert 'A=1' in out[3] and 'LC_CTYPE' not in out[3]
+
+
+def test_wrapper_starts_in_the_parents_environment_and_gets_the_target_one_separately(launcher, monkeypatch):
+	if launcher == 'native':
+		pytest.skip('only the exec wrapper starts a Python first')
+	real_popen = subprocess.Popen
+	seen = []
+	def popen(argv, **kwargs):
+		seen.append(kwargs.get('env', 'unset'))
+		return real_popen(argv, **kwargs)
+	monkeypatch.setattr(subprocess, 'Popen', popen)
+	# the interpreter running the wrapper must not be starved of what the parent's environment gives it ( LD_LIBRARY_PATH, ... )
+	assert run_command(['sh', '-c', 'echo "[$A]"'], quiet=True, env={'A': 'x', 'PATH': os.environ['PATH']}) == ['[x]']
+	assert run_command(ECHO, quiet=True, extra_env={'MCMD_T': 'y', 'LD_LIBRARY_PATH': None}) == ['[y]']
+	assert seen == [None, None]
+
+
+def test_child_env_survives_other_threads_changing_os_environ():
+	names = ['MCMD_RACE_%d' % i for i in range(40)]
+	stop = threading.Event()
+	def churn():
+		while not stop.is_set():
+			for name in names:
+				os.environ[name] = '1'
+			for name in names:
+				os.environ.pop(name, None)
+	task = multiCMD.Task(['true'])
+	task._extra_env = multiCMD._check_env({'A': '1'}, 'extra_env', allow_none=True)
+	thread = threading.Thread(target=churn)
+	thread.start()
+	try:
+		for _ in range(20000):
+			env = multiCMD._child_env(task)
+			assert env['A'] == '1'
+	finally:
+		stop.set()
+		thread.join()
+		for name in names:
+			os.environ.pop(name, None)
+
+
+def test_empty_extra_env_is_no_extra_env():
+	assert multiCMD._check_env({}, 'extra_env', allow_none=True) is None
+	assert multiCMD._check_env({}, 'env') == {}
+	tasks, _ = multiCMD._build_tasks([['true']], extra_env={})
+	assert tasks[0]._extra_env is None
+	assert multiCMD._child_env(tasks[0]) is None
+
+
+def test_the_inherited_environment_is_os_environ_at_spawn_time(monkeypatch):
+	monkeypatch.setenv('MCMD_T', 'first')
+	assert run_command(ECHO, quiet=True, extra_env={'A': '1'}) == ['[first]']
+	monkeypatch.setenv('MCMD_T', 'second')
+	assert run_command(ECHO, quiet=True, extra_env={'A': '1'}) == ['[second]']
+
+
+def test_names_and_values_are_what_subprocess_accepts(tmp_path):
+	env = multiCMD._check_env({b'A': b'1', 'B': pathlib.Path('/tmp'), os.fsencode('C'): 'x'}, 'env')
+	assert env == {'A': '1', 'B': '/tmp', 'C': 'x'}
+	assert multiCMD._check_env(os.environb, 'env') == dict(os.environ)
+	assert run_command(['sh', '-c', 'echo "$H"'], quiet=True, extra_env={'H': pathlib.Path('/tmp')}) == ['/tmp']
+	assert run_command(['sh', '-c', 'echo "$H"'], quiet=True, env={b'H': b'bytes', b'PATH': os.fsencode(os.environ['PATH'])}) == ['bytes']
+	for bad in (['AB'], [], set(), [('A', 'B')], 'AB', 5):
+		with pytest.raises(TypeError):
+			multiCMD._check_env(bad, 'extra_env', allow_none=True)
+		with pytest.raises(TypeError):
+			multiCMD._check_env(bad, 'env')
+	with pytest.raises(TypeError):
+		multiCMD._check_env({1: 'x'}, 'env')
+	with pytest.raises(TypeError):
+		multiCMD._check_env({'A': 1.5}, 'env')
+	with pytest.raises(ValueError):
+		multiCMD._check_env({'': 'x'}, 'env')
+	with pytest.raises(ValueError):
+		multiCMD._check_env({'A': 'x\0y'}, 'env')
+	with pytest.raises(ValueError):
+		multiCMD._check_env({b'A=B': 'x'}, 'env')
+
+
+def test_windows_names_are_case_insensitive_and_may_start_with_equals():
+	with mock.patch.object(os, 'name', 'nt'):
+		task = multiCMD.Task(['x'])
+		task._env = multiCMD._check_env({'PATH': 'x', 'HOME': 'h', '=C:': 'C:\\dir'}, 'env')
+		task._extra_env = multiCMD._check_env({'Path': 'y'}, 'extra_env', allow_none=True)
+		replaced = multiCMD._child_env(task)
+		task._extra_env = multiCMD._check_env({'path': None}, 'extra_env', allow_none=True)
+		removed = multiCMD._child_env(task)
+		with pytest.raises(ValueError):
+			multiCMD._check_env({'A=B': 'x'}, 'env')
+		with pytest.raises(TypeError):
+			multiCMD._check_env({b'A': 'x'}, 'env')
+	assert replaced == {'Path': 'y', 'HOME': 'h', '=C:': 'C:\\dir'}
+	assert removed == {'HOME': 'h', '=C:': 'C:\\dir'}
+	# POSIX names may not start with '='
+	with pytest.raises(ValueError):
+		multiCMD._check_env({'=C:': 'x'}, 'env')
+
+
+def test_an_environment_is_checked_and_copied_once():
+	ex = AsyncExecutor(quiet=True, env={'PATH': os.environ['PATH']}, extra_env={'MCMD_T': 'd'})
+	assert multiCMD._check_env(ex.env, 'env') is ex.env
+	tasks, _ = multiCMD._build_tasks([['true'], ['true']], env=ex.env, extra_env=ex.extra_env)
+	assert tasks[0]._env is ex.env and tasks[1]._env is ex.env
+	assert tasks[0]._extra_env is ex.extra_env
+	# nothing to add: the command gets the validated snapshot itself
+	tasks[0]._extra_env = None
+	assert multiCMD._child_env(tasks[0]) is ex.env
+
+
+def test_tasks_do_not_keep_their_environment_once_started():
+	ex = AsyncExecutor(quiet=True)
+	task = ex.run_command(ECHO, env={'PATH': os.environ['PATH']}, extra_env={'MCMD_T': 'k'})
+	ex.wait(timeout=5)
+	assert task.stdout == ['[k]']
+	assert task._env is None and task._extra_env is None

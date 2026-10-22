@@ -22,7 +22,7 @@ def restore_module_globals():
 	multiCMD.join_threads(timeout=2)
 
 
-def run_cli(args, timeout=30, check=False):
+def run_cli(args, timeout=30, check=False, env=None):
 	return subprocess.run(
 		[sys.executable, str(MULTICMD_PY), *args],
 		stdout=subprocess.PIPE,
@@ -30,6 +30,7 @@ def run_cli(args, timeout=30, check=False):
 		universal_newlines=True,
 		timeout=timeout,
 		check=check,
+		env=env,
 	)
 
 
