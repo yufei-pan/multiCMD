@@ -929,7 +929,10 @@ def test_every_failure_message_shows_only_when_not_quiet(tmp_path, capfd, quiet)
 	if quiet:
 		assert err == ''
 	else:
-		assert 'Command path not found: mcmd-no-such-command-xyz' in err and f'Command cannot be executed: {script}' in err
+		assert 'Command path not found: mcmd-no-such-command-xyz' in err
+		# through the exec wrapper ( Python < 3.11 ) the wrapper's exec is refused and it exits 126 itself: the
+		# reason is the command's stderr, and multiCMD has nothing of its own to say
+		assert (f'Command cannot be executed: {script}' in err) != multiCMD._uses_wrapper()
 
 
 class _BrokenStderr:
