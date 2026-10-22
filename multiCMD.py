@@ -1086,8 +1086,9 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	  PermissionError, ENOEXEC and the like _ExecRefused ); without one, or without any such file, the command is
 	  not found, named as given. This is os.execvpe()'s rule, which reports the last error when no other decides,
 	  but for the files it skips; it is not exactly any shell's: dash reports the last error other than ENOENT,
-	  bash searches nothing for an empty PATH, and both run a file that fails with ENOEXEC as a shell script,
-	  which multiCMD does not ( subprocess never did ): such a file cannot be executed ( 126 ).
+	  and both dash and bash run a file that fails with ENOEXEC as a shell script, which multiCMD does not
+	  ( subprocess never did ): such a file cannot be executed ( 126 ). Like multiCMD, both search the current
+	  directory for an empty PATH ( bash 5.2 and dash: `PATH= bash -c tool` runs ./tool ).
 	  E2BIG ( the arguments and environment are too big ) does not depend on the file: it decides at once;
 	- any other failure to exec the command ( ENOEXEC, E2BIG, ELOOP of its path, ... ) is _ExecRefused ( 126 );
 	- a failure to start multiCMD's own launcher ( the exec wrapper's interpreter, fork, pipes ) is never the
