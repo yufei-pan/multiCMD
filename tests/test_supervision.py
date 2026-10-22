@@ -222,3 +222,30 @@ def test_exit_leaves_alone_what_a_finished_fire_and_forget_command_started(tmp_p
 		assert not pid_gone(child, wait=0.5)
 	finally:
 		os.kill(child, signal.SIGKILL)
+
+
+@pytest.mark.parametrize('exc', [KeyboardInterrupt, RuntimeError], ids=['ctrl-c', 'cannot-start'])
+def test_a_reader_start_that_fails_still_stops_the_command(monkeypatch, exc):
+	real_start = multiCMD._Thread.start
+	count = [0]
+	def start(self):
+		if getattr(self, '_target', None) is multiCMD._read_stream:
+			count[0] += 1
+			if count[0] == 2:
+				raise exc("can't start new thread")
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	procs = []
+	real_register = multiCMD._register
+	monkeypatch.setattr(multiCMD, '_register', lambda proc, pgid: (procs.append(proc), real_register(proc, pgid)))
+	try:
+		if exc is KeyboardInterrupt:
+			with pytest.raises(KeyboardInterrupt):
+				run_command(['sleep', '30'], quiet=True)
+		else:
+			task = run_command(['sleep', '30'], quiet=True, return_object=True)
+			assert task.returncode == -1 and task._error and "can't start new thread" in task.stderr[0]
+		assert not multiCMD._live_procs
+		assert procs and procs[0].poll() is not None
+	finally:
+		multiCMD.kill_all(signal.SIGKILL)

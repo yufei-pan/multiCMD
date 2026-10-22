@@ -1616,12 +1616,24 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	task._last_output = time.monotonic()
 	_register(proc, pgid)
 	readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
-	for reader in readers:
-		reader.start()
 	interrupted = False
+	started = []
 	try:
+		# started where a Ctrl-C or a reader that cannot start still stops the command, which already runs
+		for reader in readers:
+			reader.start()
+			started.append(reader)
 		reason = _watch(task, proc, timeout)
-	except KeyboardInterrupt:
+	except BaseException as e:
+		# a stream no reader reads is closed here ( a reader closes its own )
+		for reader, (stream, _) in zip(readers, streams):
+			if reader not in started and reader._abandon():
+				stream.close()
+		if not isinstance(e, KeyboardInterrupt):
+			_kill_commands([(proc, pgid)], signal.SIGINT)
+			_unregister(proc)
+			_join_readers(readers, 1)
+			raise
 		reason, interrupted = 'stop', True
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
