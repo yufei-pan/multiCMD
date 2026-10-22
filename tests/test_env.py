@@ -442,8 +442,10 @@ def test_an_interrupt_between_the_spawn_and_the_registration_leaves_no_half_star
 	# the environment travels with the exec itself: whenever the spawn is cut short, the command either never ran or has all of it
 	marker = tmp_path / 'env'
 	real_register = multiCMD._register
+	procs = []
 	def interrupt(proc, pgid):
 		real_register(proc, pgid)
+		procs.append(proc)
 		raise KeyboardInterrupt
 	monkeypatch.setattr(multiCMD, '_register', interrupt)
 	try:
@@ -452,8 +454,14 @@ def test_an_interrupt_between_the_spawn_and_the_registration_leaves_no_half_star
 		multiCMD.kill_all()
 		multiCMD.join_threads(timeout=5)
 	finally:
-		# the interrupt came before the command was reaped: do not leave it registered for the next test
-		multiCMD._live_procs.clear()
+		# the interrupt came before the command was reaped: reap this test's own and unregister it, nothing else
+		for proc in procs:
+			with multiCMD._live_procs_lock:
+				multiCMD._live_procs.pop(proc, None)
+			proc.kill()
+			proc.wait(timeout=10)
+			proc.stdout.close()
+			proc.stderr.close()
 	assert not marker.exists() or marker.read_text() == '[a][b]\n'
 
 
