@@ -45,8 +45,8 @@ You can also just drop `multiCMD.py` into your project and import it directly.
 ```bash
 $ mcmd -h
 usage: mcmd [-h] [-p] [-t SECONDS] [-m max_threads] [--sudo] [-q] [-n]
-            [--shell] [-f FILE] [-a FILE] [--summary | --no-summary]
-            [--no-prefix] [--no-color] [--pty | --no-pty] [-V]
+            [--shell] [-e NAME=VALUE] [-f FILE] [-a FILE] [--summary |
+            --no-summary] [--no-prefix] [--no-color] [--pty | --no-pty] [-V]
             [command ...]
 
 Run multiple commands in parallel
@@ -277,11 +277,19 @@ multiCMD.run_command(["env"], extra_env={"HTTP_PROXY": None})               # No
 multiCMD.run_command(["env"], env={"PATH": "/usr/bin", "HOME": "/tmp"})     # the whole environment, as subprocess's env
 ```
 
-`extra_env` is applied on top of the inherited environment ( and on top of `env` when both are
-given ). Both are per command: they never change `os.environ` and never reach another command,
-so concurrent commands each see their own. `AsyncExecutor` takes them too, as defaults it
-overrides per call. `sudo` resets the environment by default, so with `use_sudo` they may not
-reach the command. On the command line: `mcmd -e LC_ALL=C -e UNSET_ME "cmd"`.
+`env` is the whole environment of the command, as `subprocess`'s `env` ( names and values
+are `str`; on POSIX `bytes` and `os.PathLike` work too ). `extra_env` is applied on top of the
+inherited environment, or of `env` when both are given; a `None` value removes the variable,
+and an empty `extra_env` is the same as none. "Inherited" is `os.environ` as the process holds
+it when the command starts: a variable set behind Python's back ( `os.putenv`, `os.unsetenv`, a
+C library's `setenv` ) reaches commands started without `env` / `extra_env`, not the ones
+given them. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
+there. A command is looked up in the `PATH` of the environment it gets, on every Python version.
+Both are per command: they never change `os.environ` and never reach another command, so
+concurrent commands each see their own. `AsyncExecutor` takes them too, as defaults a call
+overrides. `sudo` resets the environment by default, so with `use_sudo` they may not reach the
+command. On the command line: `mcmd -e LC_ALL=C -e UNSET_ME "cmd"`; `-n` shows them as
+`env LC_ALL=C cmd` ( `env -i ...` for a whole environment ).
 
 `raise_error=True` raises `multiCMD.CommandError`; its `.tasks` holds the failed `Task`
 objects and its message lists each one with its return code and last error line.
@@ -382,12 +390,13 @@ arrives), can call `multiCMD.kill_all()` from its handler.
 run_command(command, timeout=0, max_threads=1, quiet=False, dry_run=False,
             with_stdErr=False, return_code_only=False, return_object=False,
             wait_for_return=True, sem=None, use_sudo=..., raise_error=False,
-            prefix=False, color=None, pty=False, shell=False)
+            prefix=False, color=None, pty=False, shell=False, env=None, extra_env=None)
 
 run_commands(commands, timeout=0, max_threads=1, quiet=False, dry_run=False,
              with_stdErr=False, return_code_only=False, return_object=False,
              parse=False, wait_for_return=True, sem=None, use_sudo=...,
-             raise_error=False, prefix=False, color=None, pty=False, shell=False)
+             raise_error=False, prefix=False, color=None, pty=False, shell=False,
+             env=None, extra_env=None)
 
 ping(hosts, timeout=1, max_threads=0, ...)   # returns True/False reachability
 join_threads(threads=..., timeout=None)      # join fire-and-forget threads
@@ -396,7 +405,8 @@ set_sudo(use_sudo)                           # enable/disable sudo globally
 
 class Task:          # command, returncode, stdout, stderr, start_time, end_time, duration
 class CommandError:  # raised by raise_error=True; .tasks = the failed Tasks
-class AsyncExecutor: # run_command(s), wait, join, stop, cleanup, get_results, get_return_codes
+class AsyncExecutor: # run_command(s), wait, join, stop, cleanup, get_results, get_return_codes;
+                     # takes the options above, env / extra_env as defaults a call overrides
 ```
 
 The module also bundles a few terminal/formatting helpers used internally and
