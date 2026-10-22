@@ -387,7 +387,9 @@ every command inherits through any shell.
 
 Because the commands are not in your program's process group, signals sent to that
 group do not reach them. multiCMD handles this for you: a call waiting on the main
-thread that gets Ctrl-C stops its commands before re-raising, `mcmd` stops them on
+thread that gets Ctrl-C (`join_threads()` and `AsyncExecutor.wait()` included) stops its
+commands before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
+for them at once), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
 commands still running when the interpreter exits are killed. A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never

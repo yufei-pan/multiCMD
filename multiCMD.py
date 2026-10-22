@@ -590,28 +590,36 @@ class AsyncExecutor:
 				including the ones the dispatcher starts while waiting
 		@returns:
 			list[threading.Thread]: The threads that are still running
+		A Ctrl-C while it waits stops every command of the executor, waits up to 5 s for them ( a second Ctrl-C
+		ends that wait at once ) and re-raises.
 		'''
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
 		try:
-			joined = set()
-			while True:
-				pending = self.runningThreads if threads is ... else list(threads)
-				for thread in pending:
-					_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
-				# once a pass finishes every thread, look again for commands the dispatcher started meanwhile;
-				# stop when nothing new showed up ( a stale entry for a dead thread must not keep this looping ) or time is up
-				if threads is not ... or not pending or any(thread.is_alive() for thread in pending) \
-					or all(thread in joined for thread in pending) or (deadline is not None and time.monotonic() >= deadline):
-					break
-				joined.update(pending)
+			self._wait_until(deadline, threads)
 		except KeyboardInterrupt:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			for task in self.tasks:
 				task.stop = True
-			# ( the interrupted wait was on a _Thread's own report, which a Ctrl-C cannot falsify, see _Thread )
-			self.wait(timeout=5)
+			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its __context__ )
+			self._wait_until(time.monotonic() + 5)
 			raise
 		return [thread for thread in self.runningThreads if thread.is_alive()]
+
+	def _wait_until(self, deadline, threads=...):
+		'''
+		Wait for the threads ( default: the executor's, including the ones the dispatcher starts meanwhile ) until deadline ( internal )
+		'''
+		joined = set()
+		while True:
+			pending = self.runningThreads if threads is ... else list(threads)
+			for thread in pending:
+				_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
+			# once a pass finishes every thread, look again for commands the dispatcher started meanwhile;
+			# stop when nothing new showed up ( a stale entry for a dead thread must not keep this looping ) or time is up
+			if threads is not ... or not pending or any(thread.is_alive() for thread in pending) \
+				or all(thread in joined for thread in pending) or (deadline is not None and time.monotonic() >= deadline):
+				return
+			joined.update(pending)
 	
 	def stop(self,timeout=None):
 		'''
@@ -2214,6 +2222,10 @@ def join_threads(threads=...,timeout=None):
 	'''
 	Join threads
 
+	A Ctrl-C while it waits stops the commands of the multiCMD threads it waits for ( they run in process groups
+	of their own, so the terminal's Ctrl-C did not reach them ), waits up to 5 s in all for them ( a second
+	Ctrl-C ends that wait at once ) and re-raises, as a waiting run_commands() does.
+
 	@params:
 		threads: The threads to join ( default: every fire-and-forget thread still running )
 		timeout: The longest to wait for each thread, in seconds ( None: until it ends )
@@ -2224,8 +2236,15 @@ def join_threads(threads=...,timeout=None):
 	if threads is ...:
 		with __running_threads_lock:
 			threads = list(__running_threads)
-	for thread in threads:
-		_join(thread, timeout)
+	else:
+		threads = list(threads)
+	try:
+		for thread in threads:
+			_join(thread, timeout)
+	except KeyboardInterrupt:
+		ours = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
+		_stop_and_wait([thread.task for thread in ours], ours)
+		raise
 	__reap_finished_threads()
 
 _EXIT_STATUS_HELP = '''exit status:

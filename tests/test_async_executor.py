@@ -415,14 +415,55 @@ def test_wait_and_stop_after_an_interrupted_join_still_wait_for_the_command():
 
 
 @pytest.mark.slow
-def test_join_threads_after_an_interrupted_one_still_waits():
-	task = multiCMD.run_command(['sleep', '1'], quiet=True, wait_for_return=False, return_object=True)
-	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
+def test_ctrl_c_in_join_threads_stops_the_commands_and_waits_for_them():
+	# the command dies only to SIGKILL, a second after the stop: on 3.9.8 - 3.12 a wait that trusted Thread.join() would not wait
+	task = multiCMD.run_command(['sh', '-c', 'trap "" INT TERM; sleep 30'], quiet=True, wait_for_return=False, return_object=True)
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
 		multiCMD.join_threads()
-	assert task.is_alive() and task.returncode is None
+	assert task.stop and task.returncode is not None and not task.is_alive()
+	assert not multiCMD._live_procs
 	multiCMD.join_threads()
-	assert task.returncode == 0 and not task.is_alive()
 	assert task.thread not in _global_threads()
+
+
+def _slow_kill(monkeypatch):
+	'''Make every kill of a stopped command wait until the returned event is set ( at most 10 s )'''
+	release = threading.Event()
+	real = multiCMD._kill_commands
+	def slow_kill(commands, first_signal):
+		release.wait(10)
+		real(commands, first_signal)
+	monkeypatch.setattr(multiCMD, '_kill_commands', slow_kill)
+	return release
+
+
+@pytest.mark.parametrize('how', ['executor', 'join_threads', 'pool'])
+def test_a_second_ctrl_c_during_the_stop_gets_out_at_once(monkeypatch, how):
+	release = _slow_kill(monkeypatch)
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	try:
+		start = time.monotonic()
+		with pytest.raises(KeyboardInterrupt) as info, sigint_main_after(0.3, 0.8):
+			if how == 'executor':
+				ex.run_commands([['sleep', '30']] * 2)
+				ex.wait()
+			elif how == 'join_threads':
+				multiCMD.run_commands([['sleep', '30']] * 2, max_threads=2, quiet=True, wait_for_return=False)
+				multiCMD.join_threads()
+			else:
+				multiCMD.run_commands([['sleep', '30']] * 2, max_threads=2, quiet=True)
+		# not after the 5 s the stop may take ( nor 5 s more per press )
+		assert time.monotonic() - start < 3
+		assert isinstance(info.value.__context__, KeyboardInterrupt)
+	finally:
+		release.set()
+		ex.stop(timeout=10)
+		multiCMD.join_threads(timeout=10)
+	# the pool's workers, which nothing here can join, finish the stop once released
+	deadline = time.monotonic() + 10
+	while multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.02)
+	assert not multiCMD._live_procs
 
 
 # ---- a _Thread counts as running from its creation until it is done or abandoned, and its join() joins it
