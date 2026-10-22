@@ -185,6 +185,15 @@ def test_a_pool_without_any_worker_fails_every_command(monkeypatch):
 	assert all("cannot start a thread to run it: can't start new thread" in task.stderr[0] and task._finalized for task in tasks)
 
 
+def test_a_pool_short_of_workers_says_so_unless_quiet(monkeypatch, capfd):
+	# a listener and its client need both workers: with one, the client waits behind the listener for good
+	_fail_worker_start(monkeypatch, {2}, RuntimeError("can't start new thread"))
+	assert run_commands([['true']] * 3, max_threads=2, return_code_only=True) == [0] * 3
+	assert "multiCMD: started 1 of 2 threads: can't start new thread" in capfd.readouterr().err
+	assert run_commands([['true']] * 3, max_threads=2, quiet=True, return_code_only=True) == [0] * 3
+	assert capfd.readouterr().err == ''
+
+
 def test_a_second_ctrl_c_while_the_pool_starts_still_stops_every_command(monkeypatch):
 	tasks = _record_tasks(monkeypatch)
 	_fail_worker_start(monkeypatch, {2}, KeyboardInterrupt())

@@ -2174,6 +2174,9 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			for task in tasks:
 				_fail_task(task, f'cannot start a thread to run it: {errors[0]}', errors[0], quiet)
 			return
+		if len(running) < wanted and not quiet:
+			# commands that must run at the same time may then wait on each other for good: say so
+			_show_error(f'multiCMD: started {len(running)} of {wanted} threads: {errors[0]}')
 		for thread in running:
 			_join(thread)
 	except BaseException:
