@@ -2422,22 +2422,29 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 				task.thread = None
 	wanted = min(max_threads, len(tasks))
 	workers = []
-	errors = []
+	# a worker that could not start -> the error
+	failed = {}
+	def fail(thread, error):
+		# that worker leaves its share of the commands to the others ( only without any do they fail ). One failed
+		# start may be passing ( EAGAIN ): the next worker is tried; two in a row end the starts, as the next would
+		# most likely fail the same way
+		failed[thread] = error
+		index = workers.index(thread)
+		return index > 0 and workers[index - 1] in failed
 	starting = True
 	try:
 		workers.extend(_Thread(worker) for _ in range(wanted))
-		# a worker that cannot start leaves the commands to the others ( only without any do they fail ); a Ctrl-C
-		# while they start stops every task, so the workers already started do not run them unsupervised,
+		# a Ctrl-C while they start stops every task, so the workers already started do not run them unsupervised,
 		# and waits for those ( see _start_threads: a second Ctrl-C ends that wait )
-		# ( after the first failure the next starts would fail the same way: True ends them there )
-		running = _start_threads(workers, fail=lambda thread, error: errors.append(error) or True, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5))
+		running = _start_threads(workers, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5))
 		starting = False
+		error = next(iter(failed.values()), None)
 		if not running:
-			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {errors[0]}', errors[0], quiet) for task in tasks])
+			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet) for task in tasks])
 			return
 		if len(running) < wanted and not quiet:
 			# commands that must run at the same time may then wait on each other for good: say so
-			_show_error(f'multiCMD: started {len(running)} of {wanted} threads: {errors[0]}')
+			_show_error(f'multiCMD: started {len(running)} of {wanted} threads: {error}')
 		for thread in running:
 			_join(thread)
 	except BaseException:

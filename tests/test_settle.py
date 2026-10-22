@@ -415,23 +415,46 @@ def test_a_missing_command_cut_short_while_it_is_recorded_still_gets_127(monkeyp
 	assert tasks[0].returncode == 127 and len(tasks[0].stderr) == 1
 
 
-# ---- the pool: one failed start is enough, and failing every task is settled
+# ---- the pool: a failed start leaves the tasks to the workers that start, and failing every task is settled
 
-def test_the_pool_stops_starting_workers_after_the_first_that_cannot_start(monkeypatch, capfd):
+def _failing_worker_starts(monkeypatch, failing):
+	'''Make the pool's worker starts whose 1-based number is in failing raise; returns the list of starts tried'''
 	calls = []
 	real_start = multiCMD._Thread.start
 	def start(self):
 		if getattr(self, '_target', None) is not None and self._target.__name__ == 'worker':
 			calls.append(self)
-			if len(calls) == 2:
+			if len(calls) in failing:
 				raise RuntimeError("can't start new thread")
 		real_start(self)
 	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	return calls
+
+
+def test_the_pool_runs_the_tasks_on_the_workers_that_start_when_the_first_cannot(monkeypatch, capfd):
+	# ( review round 8, finding 2 ) a passing failure ( EAGAIN ) of the very first start
+	calls = _failing_worker_starts(monkeypatch, {1})
+	tasks = run_commands([['true']] * 4, max_threads=4, quiet=False, return_object=True)
+	# before ( a96b922 ): no other worker was tried, and every task failed with -1
+	assert len(calls) == 4
+	assert [task.returncode for task in tasks] == [0] * 4
+	assert "multiCMD: started 3 of 4 threads: can't start new thread" in capfd.readouterr().err
+
+
+def test_the_pool_stops_starting_workers_after_two_in_a_row_cannot_start(monkeypatch, capfd):
+	calls = _failing_worker_starts(monkeypatch, {2, 3, 4, 5})
 	tasks = run_commands([['true']] * 6, max_threads=5, quiet=False, return_object=True)
-	# before: every one of the 5 workers was tried
-	assert len(calls) == 2
+	# before ( 5f7468d ): every one of the 5 workers was tried
+	assert len(calls) == 3
 	assert [task.returncode for task in tasks] == [0] * 6
 	assert "multiCMD: started 1 of 5 threads: can't start new thread" in capfd.readouterr().err
+
+
+def test_a_pool_that_cannot_start_two_workers_in_a_row_fails_every_task(monkeypatch):
+	calls = _failing_worker_starts(monkeypatch, set(range(1, 10)))
+	tasks = run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
+	assert len(calls) == 2
+	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._error for task in tasks)
 
 
 def test_a_pool_whose_workers_cannot_start_fails_every_task_whatever_cuts_it_short(monkeypatch):
@@ -705,6 +728,25 @@ def test_a_ctrl_c_while_a_missing_command_is_recorded_is_raised_once_it_is(monke
 		multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=True)
 	assert tasks[0].returncode == 127 and len(tasks[0].stderr) == 1 and tasks[0]._finalized
 	assert isinstance(raised.value.__context__, FileNotFoundError)
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_ctrl_c_while_a_pool_fails_its_tasks_is_raised_once_every_one_is_recorded(monkeypatch, another_thread):
+	_failing_worker_starts(monkeypatch, set(range(1, 10)))
+	real_fail = multiCMD._fail_task
+	count = [0]
+	def fail(*args, **kwargs):
+		count[0] += 1
+		if count[0] == 2:
+			_ctrl_c()
+		real_fail(*args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_fail_task', fail)
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['true']] * 4, max_threads=2, quiet=True)
+	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
 
 
 # ---- review round 8: a handler installed during a hold stays, and gets the held Ctrl-C
