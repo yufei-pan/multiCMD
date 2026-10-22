@@ -800,7 +800,7 @@ def _left_running(before, wait=3.0):
 @pytest.mark.parametrize('ctrl_cs', [1, 2])
 def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch, ctrl_cs):
 	# ( review of round 9, blockers 1 and 2; probe rv9/orphan.py ) a real SIGINT from another thread lands
-	# anywhere in the start: as _fork_exec / posix_spawn returned ( before Popen stored the pid ), Popen lost the
+	# anywhere in the start ( 0-0.5 ms after it begins ): as _fork_exec / posix_spawn returned ( before Popen stored the pid ), Popen lost the
 	# command, which ran on in its own process group ( 14 of 16 such Ctrl-Cs on 3.13 at 0e4d015 ). A second one
 	# right after, while the first is dealt with, ended the wait without stopping the command, and when it was
 	# pending as that began, left the command unregistered too
@@ -824,13 +824,23 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 			else:
 				real_hook(unraisable)
 		monkeypatch.setattr(sys, 'unraisablehook', hook)
+	spawning = threading.Event()
+	real_spawn = multiCMD._spawn
+	def spawn(*args, **kwargs):
+		spawning.set()
+		return real_spawn(*args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
 	before = _children()
 	lost = []
 	returned = 0
 	for _ in range(100):
-		first = random.uniform(0, 0.004)
+		# ( a spawn takes some 50 us: the timer's own wake-up takes about as long )
+		first = random.choice([0, random.uniform(0, 0.0005)])
 		delays = [first] + ([first + random.uniform(0, 0.002)] if ctrl_cs == 2 else [])
+		spawning.clear()
 		def send():
+			# from the moment the spawn begins ( however long getting there took, under load )
+			spawning.wait(1)
 			start = time.monotonic()
 			for delay in delays:
 				time.sleep(max(0, start + delay - time.monotonic()))
