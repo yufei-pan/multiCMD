@@ -186,6 +186,25 @@ def test_failed_thread_start_keeps_executor_usable(monkeypatch):
 	assert [task.returncode for task in tasks] == [0, 0]
 
 
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_command_whose_thread_cannot_start_is_finalized_as_failed(monkeypatch, capsys):
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	real = ex._start_thread
+	def broken(target, args, task=None):
+		if task is None:
+			return real(target, args)
+		raise RuntimeError("can't start new thread")
+	monkeypatch.setattr(ex, '_start_thread', broken)
+	task = ex.run_command(['true'])
+	assert ex.wait(timeout=5) == []
+	assert task.returncode == -1 and task._error and task._finalized and task.thread is None
+	assert "cannot start its thread: can't start new thread" in task.stderr[0]
+	ex.join()
+	out = capsys.readouterr().out
+	assert "Command: ['true'] failed with return code: -1" in out
+	assert 'still running' not in out
+
+
 @pytest.mark.slow
 def test_join_waits_by_default(capsys):
 	ex = AsyncExecutor(max_threads=2)

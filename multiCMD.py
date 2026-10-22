@@ -411,9 +411,16 @@ class AsyncExecutor:
 				self._reap()
 				try:
 					self._start_thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished, decor, use_pty), task)
-				except BaseException:
+				except BaseException as e:
 					sem.release()
+					# it is off the queue and will never run: it failed, as a command multiCMD cannot start does
+					import traceback
 					task._env = task._extra_env = None
+					task.stderr.extend(f'Error running command: cannot start its thread: {e}'.split('\n'))
+					task.stderr.extend(traceback.format_exc().split('\n'))
+					task.returncode = -1
+					task._error = True
+					task._finalized = True
 					raise
 		except BaseException:
 			# let the next run_commands() start a new dispatcher for what is still queued
