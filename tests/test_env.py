@@ -1,8 +1,11 @@
+import copy
 import os
 import pathlib
+import pickle
 import subprocess
 import sys
 import threading
+import time
 import types
 from unittest import mock
 
@@ -487,17 +490,30 @@ task = multiCMD.run_command(['/no/such/cmd'], quiet=True, extra_env={'A': 'x'}, 
 print(task.returncode)
 task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': None}, return_object=True)
 print(task.returncode, '=weird' in task.stdout)
+# the common idiom copies the inherited variable with the empty name into env
+copied = dict(os.environ, A='x')
+assert '' in copied
+task = multiCMD.run_command(['/usr/bin/env'], quiet=True, env=copied, return_object=True)
+print(task.returncode, '=weird' in task.stdout, 'A=x' in task.stdout)
+ex = multiCMD.AsyncExecutor(quiet=True, env=copied)
+ex.run_command(['/usr/bin/env'])
+ex.wait(timeout=30)
+print(ex.tasks[0].returncode, '=weird' in ex.tasks[0].stdout, 'A=x' in ex.tasks[0].stdout)
 """, launcher, prefix=('env', '=weird'))
 	assert proc.returncode == 0, proc.stderr
-	first, second, third, fourth = proc.stdout.splitlines()
+	first, second, third, fourth, fifth, sixth = proc.stdout.splitlines()
+	assert fifth == '0 False True' and sixth == '0 False True'
 	assert first.startswith('0 ') and "'=weird'" not in first and "'A=x'" in first
 	assert second == '0 False'
 	assert third == '127'
 	assert fourth == '0 False'
-	# an explicit empty name is an error
-	for kwargs in ({'extra_env': {'': 'x'}}, {'env': {'': 'x'}}):
+	# an empty name in extra_env is an error, as are names holding '=' or NUL in both
+	for kwargs in ({'extra_env': {'': 'x'}}, {'env': {'a=b': 'x'}}, {'env': {'a\0b': 'x'}}, {'extra_env': {'a=b': 'x'}}):
 		with pytest.raises(ValueError):
 			run_command(['true'], quiet=True, **kwargs)
+	# env drops the empty name ( only an inherited variable can have one )
+	assert multiCMD._check_env({'': 'x', 'A': '1'}, 'env', drop_empty=True) == {'A': '1'}
+	assert run_command(['true'], quiet=True, env={'': 'x', 'PATH': os.environ['PATH']}, return_object=True).returncode == 0
 
 
 def test_bytes_that_are_not_text_reach_the_command_unchanged(launcher):
@@ -634,7 +650,9 @@ def test_e2big_is_126(launcher, kwargs):
 
 
 def test_an_internal_oserror_is_still_an_error_with_a_traceback(launcher, monkeypatch):
+	started = []
 	def broken(proc, pgid):
+		started.append(proc)
 		raise OSError(5, 'Input/output error', 'somefile')
 	monkeypatch.setattr(multiCMD, '_register', broken)
 	try:
@@ -642,13 +660,19 @@ def test_an_internal_oserror_is_still_an_error_with_a_traceback(launcher, monkey
 		assert task.returncode == -1 and task._error
 		assert any('Traceback' in line for line in task.stderr)
 	finally:
-		multiCMD.kill_all()
+		# the process was never registered: nothing else will reap it or close its pipes
+		for proc in started:
+			proc.kill()
+			proc.wait()
+			proc.stdout.close()
+			proc.stderr.close()
 
 
 def test_the_wrapper_does_not_unset_each_variable_it_reads():
 	# unsetting one is a scan of the whole environment: N variables would cost N**2
 	assert 'SIGXFZ' not in multiCMD._PGROUP_EXEC and '.pop(' not in multiCMD._PGROUP_EXEC
-	code = ("import os, sys\nos.environb.unsetenv = lambda *a: sys.exit(99)\n"
+	# ( Python before 3.9 calls os.environb.unsetenv, 3.9+ the module's os.unsetenv )
+	code = ("import os, sys\nos.environb.unsetenv = os.unsetenv = lambda *a: sys.exit(99)\n"
 		"os.execvpe = lambda f, a, e: print(sorted(e.items()))\nexec(%r)" % multiCMD._PGROUP_EXEC)
 	env = {'PATH': os.environ['PATH'], '_MULTICMD_ENV_0': 'A=1', '_MULTICMD_ENV_1': 'B=x=y'}
 	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, '2', 'true'], env=env,
@@ -678,3 +702,122 @@ def test_an_executors_empty_extra_env_can_be_added_to():
 	ex.wait(timeout=10)
 	assert ex.tasks[-1].stdout == ['[1]']
 	assert AsyncExecutor().extra_env is None
+
+
+# ---- a bare command name is not found unless a PATH entry holds a file by that name that cannot be run, on both launchers
+
+def _path_cases(tmp_path):
+	'''PATH values with no command in them, by the errno a lookup in them ends with'''
+	afile = tmp_path / 'afile'
+	afile.write_text('x')
+	loop = tmp_path / 'loop'
+	loop.symlink_to('loop')
+	return {
+		'ENOTDIR': ('/usr/bin:' + str(afile), 'no_such_cmd'),
+		'ELOOP': (str(loop), 'no_such_cmd'),
+		'ENAMETOOLONG': ('/usr/bin', 'x' * 300),
+	}
+
+
+@pytest.mark.parametrize('case', ['ENOTDIR', 'ELOOP', 'ENAMETOOLONG'])
+@pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
+def test_a_lookup_that_ends_in_an_errno_other_than_enoent_is_still_not_found(launcher, tmp_path, monkeypatch, case, how):
+	path, command = _path_cases(tmp_path)[case]
+	kwargs = {}
+	if how == 'plain':
+		monkeypatch.setenv('PATH', path)
+	elif how == 'extra_env':
+		kwargs['extra_env'] = {'PATH': path}
+	else:
+		kwargs['env'] = {'PATH': path}
+	task = run_command([command], quiet=True, return_object=True, **kwargs)
+	assert task.returncode == 127 and not task._error, task.stderr
+	assert 'No such file or directory' in ' '.join(task.stderr)
+
+
+@pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
+def test_a_file_in_path_that_cannot_be_run_is_126(launcher, tmp_path, monkeypatch, how):
+	_noshebang(tmp_path)
+	plain = tmp_path / 'plain'
+	plain.write_text('#!/bin/sh\necho hi\n')
+	plain.chmod(0o644)
+	for name, reason in (('plain', 'Permission denied'), ('nsb', 'Exec format error')):
+		path = '/usr/bin:' + str(tmp_path)
+		kwargs = {}
+		if how == 'plain':
+			monkeypatch.setenv('PATH', path)
+		elif how == 'extra_env':
+			kwargs['extra_env'] = {'PATH': path}
+		else:
+			kwargs['env'] = {'PATH': path}
+		task = run_command([name], quiet=True, return_object=True, **kwargs)
+		assert task.returncode == 126 and not task._error, task.stderr
+		assert reason in ' '.join(task.stderr)
+
+
+# ---- a launcher that cannot start is an internal error, not the command's 126
+
+@pytest.mark.parametrize('kind', ['ENOEXEC', 'EACCES', 'ENOENT', 'ELOOP'])
+def test_an_interpreter_that_cannot_run_is_an_internal_error(launcher, tmp_path, monkeypatch, kind):
+	if launcher == 'native':
+		pytest.skip('only the exec wrapper starts the interpreter')
+	if kind == 'ENOEXEC':
+		fake = _noshebang(tmp_path)
+	elif kind == 'EACCES':
+		fake = tmp_path / 'noexec'
+		fake.write_text('x')
+		fake.chmod(0o644)
+	elif kind == 'ENOENT':
+		fake = tmp_path / 'missing'
+	else:
+		fake = tmp_path / 'loop'
+		fake.symlink_to('loop')
+	monkeypatch.setattr(sys, 'executable', str(fake))
+	for kwargs in ({}, {'extra_env': {'A': '1'}}):
+		task = run_command(['true'], quiet=True, return_object=True, **kwargs)
+		assert task.returncode == -1 and task._error, (task.returncode, task.stderr)
+		assert any('Traceback' in line for line in task.stderr)
+		assert not any('Command cannot be executed' in line for line in task.stderr)
+
+
+# ---- a snapshot can be copied and pickled
+
+def test_a_task_still_holding_its_snapshot_can_be_copied_and_pickled():
+	tasks, _ = multiCMD._build_tasks([['true']], env={'PATH': '/bin'}, extra_env={'A': None, 'B': '1'})
+	for clone in (copy.deepcopy(tasks[0]), pickle.loads(pickle.dumps(tasks[0])), copy.copy(tasks[0])):
+		assert clone._env == {'PATH': '/bin'} and clone._extra_env == {'A': None, 'B': '1'}
+		with pytest.raises(TypeError):
+			clone._env['X'] = 'y'
+		assert type(multiCMD._child_env(clone)) is dict
+	clone = pickle.loads(pickle.dumps(tasks[0]))
+	with pytest.raises(TypeError):
+		multiCMD._check_env(clone._extra_env, 'env')
+
+
+# ---- an executor that is cleaned up keeps no environments of what never started
+
+def test_cleanup_drops_the_snapshots_of_what_is_still_queued():
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	tasks = ex.run_commands([['sleep', '1']] * 4, extra_env={'MCMD_SECRET': 'x'}, env={'PATH': os.environ['PATH']})
+	ex.cleanup(timeout=0)
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline and any(t._extra_env is not None for t in tasks):
+		time.sleep(0.02)
+	assert all(t._env is None and t._extra_env is None for t in tasks)
+	multiCMD.kill_all()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_a_task_whose_thread_cannot_start_drops_its_snapshot(monkeypatch):
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	real = ex._start_thread
+	def broken(target, args, task=None):
+		if task is None:
+			return real(target, args)
+		raise RuntimeError("can't start new thread")
+	monkeypatch.setattr(ex, '_start_thread', broken)
+	task = ex.run_commands([['true']], extra_env={'MCMD_SECRET': 'x'})[0]
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline and ex._dispatching:
+		time.sleep(0.02)
+	assert task._extra_env is None and task._env is None

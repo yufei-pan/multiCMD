@@ -283,12 +283,13 @@ inherited environment, or of `env` when both are given; a `None` value removes t
 and an empty `extra_env` is the same as none. "Inherited" is `os.environ` as the process holds
 it when the command starts: a variable set behind Python's back ( `os.putenv`, `os.unsetenv`, a
 C library's `setenv` ) reaches commands started without `env` / `extra_env`, not the ones
-given them. An inherited variable with an empty name ( a corrupt `environ` entry such as `=x` ) is left out of the environment of a command given `env` / `extra_env`; an empty name in them is a `ValueError`. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
+given them. An inherited variable with an empty name ( a corrupt `environ` entry such as `=x` ) is left out of the environment of a command given `env` / `extra_env`, and out of an `env` copied from `os.environ`; an empty name in `extra_env` is a `ValueError`. Names are case-insensitive on Windows, so `extra_env={"Path": ...}` replaces `PATH`
 there. On POSIX a command is looked up in the `PATH` of the environment it gets, on every Python
 version; Windows searches the calling process's `PATH` whatever the command's environment says.
 Before Python 3.11 the launcher starts in this process's environment and is handed the command's on
 top of it, so the two together must fit the system's argument limit ( `getconf ARG_MAX`; 2 MiB on Linux
-with the default stack, 128 KiB for one `NAME=VALUE` entry ); one that does not fit fails with return
+with the default stack, 128 KiB for one string: before Python 3.11 an entry travels as `_MULTICMD_ENV_<i>=NAME=VALUE`, 15 bytes
+plus the digits of `i` more than its `NAME=VALUE` ); one that does not fit fails with return
 code 126, `Argument list too long`, on every Python.
 On Python 3.7-3.10 a command started with
 neither `env` nor `extra_env` still gets the `LC_CTYPE=C.UTF-8` that interpreter's locale coercion
