@@ -64,17 +64,33 @@ _PGROUP_EXEC = (
 	"\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
 	"os.setpgid(0,0)\n"
 	"a=sys.argv\n"
-	"try:\n"
-	"\tif a[1]=='-':os.execvp(a[2],a[2:])\n"
+	"c=a[2]\n"
+	"v=None\n"
+	"if a[1]!='-':\n"
 	"\ttry:\n"
 	# read, not pop: the command is started with exactly the environment built here, and every removal is a scan of the whole environment
 	"\t\tv=dict(os.environb[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n"
 	"\texcept(KeyError,ValueError):\n"
-	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%a[2]);sys.exit(126)\n"
-	"\tos.execvpe(a[2],a[2:],v)\n"
+	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\n"
+	"def x(f):\n"
+	"\tif v is None:os.execv(f,a[2:])\n"
+	"\tos.execve(f,a[2:],v)\n"
+	"try:\n"
+	"\tif os.sep in c:x(c)\n"
+	# a bare name: try the regular files by that name in PATH in turn, as sh does ( see _spawn ); the first failure
+	# other than ENOENT / ENOTDIR says why it cannot run, and without one it is not found
+	"\tp=os.environ.get('PATH') if v is None else v.get(b'PATH')\n"
+	"\tr=None\n"
+	"\tfor d in os.fsdecode(os.defpath if p is None else p).split(os.pathsep):\n"
+	"\t\tf=os.path.join(d or os.curdir,c)\n"
+	"\t\tif os.path.isfile(f):\n"
+	"\t\t\ttry:x(f)\n"
+	"\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n"
+	"\t\t\texcept OSError as e:r=r or e\n"
+	"\traise r or FileNotFoundError(2,os.strerror(2),c)\n"
 	# a plain command reports as it always has; one with an environment as Popen does ( Python 3.11+: the error with the command as given )
 	"except OSError as e:\n"
-	"\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,a[2])))+'\\n')\n"
+	"\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n"
 	"\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 )
 # blocked while a command starts and inherited by it: reading the terminal from a background
@@ -891,10 +907,6 @@ def set_sudo(use_sudo):
 class _ExecRefused(OSError):
 	'''The system refused to execute the command ( ENOEXEC, E2BIG, ELOOP, ... ), as opposed to not finding it or not being allowed to ( internal )'''
 
-# what looking a bare command name up in PATH can fail with that still means "no such command": os.execvpe and shells
-# treat ENOTDIR like ENOENT, and a name too long or a directory looping is no command either
-_NOT_FOUND_ERRNOS = {errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP}
-
 def _uses_wrapper():
 	'''Whether commands start through the exec wrapper _PGROUP_EXEC ( internal )'''
 	# ( a frozen app's sys.executable is the app itself, not a Python that can run the wrapper )
@@ -908,9 +920,9 @@ def _search_dirs(env, explicit):
 	path = (env if env is not None else os.environ).get('PATH')
 	return os.defpath.split(os.pathsep) if path is None else path.split(os.pathsep) if path else []
 
-def _candidate_exists(command, dirs):
-	'''Whether some directory holds a file by that name, whether or not it can be executed ( internal )'''
-	return any(os.path.isfile(os.path.join(d or os.curdir, command)) for d in dirs)
+def _candidates(command, dirs):
+	'''The regular files by that name in dirs, in order: what sh tries to run for a bare command name ( internal )'''
+	return [path for path in (os.path.join(d or os.curdir, command) for d in dirs) if os.path.isfile(path)]
 
 def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	'''
@@ -918,21 +930,24 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 
 	This is where a failure to start is told apart, as a shell does:
 	- a command that is not found is FileNotFoundError ( 127 ), one that may not be executed PermissionError ( 126 );
-	- a bare name ( no '/' ) looked up in PATH is not found unless some directory holds a file by that name that
-	  could not be executed ( os.execvpe's rule: a PATH entry that is not a directory, a name too long, or a loop, is no command );
+	- a bare name ( no '/' ) is looked up in PATH as sh does ( and os.execvpe, but for what is not a regular file ): each
+	  regular file by that name is tried in turn ( a directory, a FIFO, or an entry that cannot be searched holds none ),
+	  and the first failure other than ENOENT / ENOTDIR decides ( EACCES is PermissionError, ENOEXEC and the like
+	  _ExecRefused ); without one, or without any such file, the command is not found, wherever the PATH search ended;
 	- any other failure to exec the command ( ENOEXEC, E2BIG, ELOOP of its path, ... ) is _ExecRefused ( 126 );
 	- a failure to start multiCMD's own launcher ( the exec wrapper's interpreter, fork, pipes ) is never the
 	  command's: it stays an internal error whose message and traceback say what went wrong. Only E2BIG is the
 	  command's even then, as its arguments and environment travel in the wrapper's.
+	The exec wrapper applies the same rule in the command's process ( see _PGROUP_EXEC ); Popen ( Python 3.11+, or a
+	frozen app ) tries every PATH entry and reports one error from any of them, so a bare name it cannot start is
+	tried again here, one regular file at a time.
 	'''
 	command = argv[0]
 	wrapped = _uses_wrapper()
 	bare = _IS_POSIX and os.sep not in command
-	dirs = _search_dirs(env, explicit) if bare else None
-	if wrapped and bare:
+	if wrapped and bare and not _candidates(command, _search_dirs(env, explicit)):
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
-		if shutil.which(command, path=os.pathsep.join(dirs)) is None and not _candidate_exists(command, dirs):
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	try:
 		return _spawn_process(argv, stdout, stderr, env, explicit)
 	except OSError as e:
@@ -943,13 +958,30 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 				# it is the interpreter that is missing or may not run, not the command
 				raise RuntimeError('cannot start the exec wrapper %r: %s' % (sys.executable, e)) from e
 			raise
-		if bare and e.errno in _NOT_FOUND_ERRNOS and not _candidate_exists(command, dirs):
-			raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command) from None
-		if isinstance(e, (FileNotFoundError, PermissionError)) or e.filename is None:
+		if e.filename is None:
+			# not the command's exec that failed ( fork, pipes, ... )
 			raise
-		raise _ExecRefused(e.errno, e.strerror, e.filename) from None
+		if not bare:
+			if isinstance(e, (FileNotFoundError, PermissionError)):
+				raise
+			raise _ExecRefused(e.errno, e.strerror, e.filename) from None
+	failure = None
+	for path in _candidates(command, _search_dirs(env, True)):
+		try:
+			# ( one that can run by now just runs, as it would have a moment ago )
+			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path)
+		except OSError as e:
+			if e.filename is None:
+				raise
+			if failure is None and not isinstance(e, (FileNotFoundError, NotADirectoryError)):
+				failure = e
+	if failure is None:
+		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
+	if isinstance(failure, PermissionError):
+		raise PermissionError(failure.errno, failure.strerror, command)
+	raise _ExecRefused(failure.errno, failure.strerror, command)
 
-def _spawn_process(argv, stdout, stderr, env=None, explicit=False):
+def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None):
 	'''
 	Start a command in a process group of its own ( internal )
 
@@ -976,11 +1008,14 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False):
 		explicit: Whether env comes from the caller's env / extra_env ( the exec wrapper then looks the
 			command up in env's PATH and hands env over whole ); otherwise env, if any, only adds to what
 			is inherited and the wrapper just runs with it, as it always has
+		executable: The file to run as the command, instead of looking argv[0] up ( Popen's executable; not with the wrapper )
 
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
 	kwargs = {'stdin': subprocess.DEVNULL, 'stdout': stdout, 'stderr': stderr, 'env': env}
+	if executable is not None:
+		kwargs['executable'] = executable
 	if not _IS_POSIX:
 		return subprocess.Popen(argv, **kwargs), None
 	grouped = True

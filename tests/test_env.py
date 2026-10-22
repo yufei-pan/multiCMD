@@ -673,7 +673,8 @@ def test_the_wrapper_does_not_unset_each_variable_it_reads():
 	assert 'SIGXFZ' not in multiCMD._PGROUP_EXEC and '.pop(' not in multiCMD._PGROUP_EXEC
 	# ( Python before 3.9 calls os.environb.unsetenv, 3.9+ the module's os.unsetenv )
 	code = ("import os, sys\nos.environb.unsetenv = os.unsetenv = lambda *a: sys.exit(99)\n"
-		"os.execvpe = lambda f, a, e: print(sorted(e.items()))\nexec(%r)" % multiCMD._PGROUP_EXEC)
+		"def execve(f, a, e):\n\tprint(sorted(e.items()))\n\tsys.exit(0)\n"
+		"os.execve = execve\nexec(%r)" % multiCMD._PGROUP_EXEC)
 	env = {'PATH': os.environ['PATH'], '_MULTICMD_ENV_0': 'A=1', '_MULTICMD_ENV_1': 'B=x=y'}
 	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, '2', 'true'], env=env,
 		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
@@ -753,6 +754,85 @@ def test_a_file_in_path_that_cannot_be_run_is_126(launcher, tmp_path, monkeypatc
 		task = run_command([name], quiet=True, return_object=True, **kwargs)
 		assert task.returncode == 126 and not task._error, task.stderr
 		assert reason in ' '.join(task.stderr)
+
+
+# ---- a bare name is looked up as sh does: only regular files count, and the first real failure to run one decides
+
+def _run_in_path(monkeypatch, how, path, command):
+	kwargs = {}
+	if how == 'plain':
+		monkeypatch.setenv('PATH', path)
+	elif how == 'extra_env':
+		kwargs['extra_env'] = {'PATH': path}
+	else:
+		kwargs['env'] = {'PATH': path}
+	return run_command([command], quiet=True, return_object=True, **kwargs)
+
+
+def _sh_status(path, command):
+	return subprocess.run(['/bin/sh', '-c', command], env={'PATH': path}, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode
+
+
+@pytest.mark.parametrize('kind', ['directory', 'fifo', 'unsearchable'])
+@pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
+def test_a_path_entry_without_a_regular_file_by_that_name_is_not_found(launcher, tmp_path, monkeypatch, kind, how):
+	command = 'mcmd_' + kind
+	where = tmp_path
+	if kind == 'directory':
+		(tmp_path / command).mkdir()
+	elif kind == 'fifo':
+		os.mkfifo(str(tmp_path / command))
+	else:
+		if os.geteuid() == 0:
+			pytest.skip('root may search any directory')
+		where = tmp_path / 'noperm'
+		where.mkdir()
+		where.chmod(0)
+	try:
+		path = str(where) + ':/usr/bin:/bin'
+		task = _run_in_path(monkeypatch, how, path, command)
+		assert task.returncode == 127 and not task._error, task.stderr
+		assert "No such file or directory: '%s'" % command in ' '.join(task.stderr)
+		assert _sh_status(path, command) == 127
+	finally:
+		where.chmod(0o755)
+
+
+@pytest.mark.parametrize('rest', ['enoent', 'enotdir'])
+@pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
+def test_a_script_whose_interpreter_is_missing_is_not_found_whatever_path_follows(launcher, tmp_path, monkeypatch, rest, how):
+	_noshebang(tmp_path)
+	script = tmp_path / 'badinterp'
+	script.write_text('#!/nonexistent/interp\n')
+	script.chmod(0o755)
+	afile = tmp_path / 'afile'
+	afile.write_text('x')
+	path = str(tmp_path) + ':' + (str(tmp_path / 'missing') if rest == 'enoent' else str(afile))
+	task = _run_in_path(monkeypatch, how, path, 'badinterp')
+	assert task.returncode == 127 and not task._error, task.stderr
+	assert "No such file or directory: 'badinterp'" in ' '.join(task.stderr)
+	assert _sh_status(path, 'badinterp') == 127
+
+
+@pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
+def test_the_first_file_that_cannot_run_decides_and_one_that_can_runs(launcher, tmp_path, monkeypatch, how):
+	_noshebang(tmp_path)
+	dirs = {}
+	for name, (mode, body) in {'denied': (0o644, '#!/bin/sh\necho denied\n'), 'enoexec': (0o755, 'echo enoexec\n'),
+			'runs': (0o755, '#!/bin/sh\necho ran\n')}.items():
+		dirs[name] = tmp_path / name
+		dirs[name].mkdir()
+		tool = dirs[name] / 'mcmd-tool'
+		tool.write_text(body)
+		tool.chmod(mode)
+	for order, code, reason in ((('denied', 'enoexec'), 126, 'Permission denied'), (('enoexec', 'denied'), 126, 'Exec format error'),
+			(('denied', 'enoexec', 'runs'), 0, None)):
+		task = _run_in_path(monkeypatch, how, ':'.join(str(dirs[name]) for name in order), 'mcmd-tool')
+		assert task.returncode == code and not task._error, (order, task.stderr)
+		if reason:
+			assert reason in ' '.join(task.stderr)
+		else:
+			assert task.stdout == ['ran']
 
 
 # ---- a launcher that cannot start is an internal error, not the command's 126
