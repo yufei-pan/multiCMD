@@ -879,3 +879,29 @@ def test_a_second_ctrl_c_while_a_serial_run_deals_with_the_first_still_stops_the
 		for proc in procs:
 			proc.wait(5)
 			multiCMD._unregister(proc)
+
+
+@pytest.mark.parametrize('mode', ['fire-and-forget', 'pool'])
+def test_a_ctrl_c_right_after_the_starts_is_a_first_one_and_is_waited_for(monkeypatch, mode):
+	# ( review of round 9, finding 7 ) one that lands as _start_threads() returns, before the caller knows the
+	# starts are over, was taken for one the starts had dealt with: the commands were not waited for
+	real_start_threads = multiCMD._start_threads
+	def start_threads(threads, *args, **kwargs):
+		running = real_start_threads(threads, *args, **kwargs)
+		# ( the workers' own, of their output readers, are left alone )
+		if threading.current_thread() is threading.main_thread():
+			deadline = time.monotonic() + 5
+			while len(multiCMD._live_procs) < 2 and time.monotonic() < deadline:
+				time.sleep(0.01)
+			raise KeyboardInterrupt
+		return running
+	monkeypatch.setattr(multiCMD, '_start_threads', start_threads)
+	with pytest.raises(KeyboardInterrupt):
+		if mode == 'fire-and-forget':
+			run_commands([['sleep', '30']] * 2, max_threads=0, quiet=True, wait_for_return=False)
+		else:
+			run_commands([['sleep', '30']] * 2, max_threads=2, quiet=True)
+	# before ( 0e4d015 ): returned at once, the commands still being stopped by their threads
+	assert not multiCMD._live_procs
+	monkeypatch.undo()
+	assert _join_threads_returns_within(5)

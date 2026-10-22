@@ -385,7 +385,7 @@ def _abandon_all(threads, forget=None):
 		if thread._abandon() and forget is not None:
 			forget(thread)
 
-def _start_threads(threads, register=None, forget=None, fail=None, abort=None, wait=None):
+def _start_threads(threads, register=None, forget=None, fail=None, abort=None, wait=None, early=None):
 	'''
 	Start _Threads so that every one either runs or is abandoned, none left tracked that never runs ( internal )
 
@@ -405,6 +405,8 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None, w
 		fail: Called with a thread that cannot start and the error; True ends the starts ( None: the error ends them early )
 		abort: Called once the starts end early ( None: nothing to do )
 		wait: Called after abort, to wait for the threads that run ( None: nothing to do )
+		early: A list True is appended to as soon as the starts end early, before abort and wait: the caller's own
+			handling of the exception then knows the wait was done, or skipped by a second interrupt ( None: none )
 	@returns:
 		list: The threads that run ( or may yet get to their target )
 	'''
@@ -437,6 +439,8 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None, w
 					_settle(lambda: _abandon_all(threads[ended[0]:], forget))
 					break
 	except BaseException as e:
+		if early is not None:
+			early.append(True)
 		def settle():
 			_abandon_all(threads, forget)
 			for thread, error in failing.items():
@@ -2469,13 +2473,13 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 		failed[thread] = error
 		index = workers.index(thread)
 		return index > 0 and workers[index - 1] in failed
-	starting = True
+	# whether the starts ended early: _start_threads has then waited, or a second interrupt ended that
+	early = []
 	try:
 		workers.extend(_Thread(worker) for _ in range(wanted))
 		# a Ctrl-C while they start stops every task, so the workers already started do not run them unsupervised,
 		# and waits for those ( see _start_threads: a second Ctrl-C ends that wait )
-		running = _start_threads(workers, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5))
-		starting = False
+		running = _start_threads(workers, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5), early=early)
 		error = next(iter(failed.values()), None)
 		if not running:
 			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet) for task in tasks])
@@ -2487,9 +2491,11 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			_join(thread)
 	except BaseException:
 		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will,
-		# nor do workers made but not started yet ( _start_threads settles the ones it was given, and has waited for
-		# the ones that run: here that is only done again, in case its own settling was cut short )
-		_stop_and_wait(tasks, workers, 0 if starting else 5)
+		# nor do workers made but not started yet. When the starts ended early, _start_threads settled the ones it
+		# was given and waited for the ones that run, unless a second interrupt ended that: it is only done again
+		# here, without the wait, in case its own settling was cut short. Anywhere else ( right after the starts
+		# included ) this is the first interrupt, and the commands are waited for
+		_stop_and_wait(tasks, workers, 0 if early else 5)
 		raise
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
@@ -2595,6 +2601,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	elif not wait_for_return:
 		__reap_finished_threads()
 		threads = []
+		early = []
 		def forget(thread):
 			# it never runs: untracked, as it never reports itself finished, and its task keeps it ( done, so
 			# task.thread.join() returns at once ) but not its environment
@@ -2615,11 +2622,12 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 				__running_threads.update(threads)
 			# a Ctrl-C while they start: the commands not started yet never will ( skipped ), the others are stopped
 			# and waited for ( see _start_threads: a second Ctrl-C ends that wait )
-			_start_threads(threads, forget=forget, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(threads, 5))
+			_start_threads(threads, forget=forget, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(threads, 5), early=early)
 		except BaseException:
-			# ( also when the starts' own settling was cut short: no thread that never runs stays tracked; the wait was
-			# _start_threads' own, and before it nothing started )
-			_stop_and_wait(tasks, threads, 0, forget)
+			# ( also when the starts' own settling was cut short: no thread that never runs stays tracked. When the
+			# starts ended early the wait was _start_threads' own; one that lands as they return is the first, and
+			# the commands are waited for )
+			_stop_and_wait(tasks, threads, 0 if early else 5, forget)
 			raise
 	elif max_threads > 1:
 		_run_pool(tasks, decors, sem, timeout, quiet, False, max_threads, use_pty)
