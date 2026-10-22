@@ -545,6 +545,9 @@ except KeyboardInterrupt:
 	interrupted = True
 dump.flush()
 print(json.dumps({'before': before, 'after': after, 'interrupted': interrupted}))
+sys.stdout.flush()
+# ( CPython 3.6 crashes at exit after a Ctrl-C that faulthandler chained, with or without multiCMD )
+os._exit(0)
 '''
 
 
