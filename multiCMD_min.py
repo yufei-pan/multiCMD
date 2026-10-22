@@ -68,7 +68,10 @@ class _Thread(threading.Thread):
 	def __init__(self,target,args=(),task=None):super().__init__(target=target,args=args,daemon=True);self.task=task;self.done=_Done();self._pid=os.getpid();self._claim={}
 	def start(self):
 		try:super().start()
-		except BaseException:self._abandon();raise
+		except BaseException as e:
+			self._abandon();interrupt=_interrupt_in(e)
+			if interrupt is not None and interrupt is not e:raise interrupt
+			raise
 	def _abandon(self):
 		if self._claim.setdefault('by','abandon')!='abandon':return False
 		self.done.set();return True
@@ -87,6 +90,11 @@ class _Thread(threading.Thread):
 			left=None if deadline is None else max(0,deadline-time.monotonic())
 			if _JOIN_MAY_HANG:left=1 if left is None else min(left,1)
 			super().join(left)
+def _interrupt_in(error):
+	seen=set()
+	while error is not None and id(error)not in seen:
+		if isinstance(error,_INTERRUPTS):return error
+		seen.add(id(error));error=error.__context__
 _INTERRUPTS=KeyboardInterrupt,SystemExit
 _settling=threading.local()
 def _settle(step):
@@ -400,7 +408,7 @@ def _spawn(argv,stdout,stderr,env=None,explicit=False):
 def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None):
 	kwargs={'stdin':subprocess.DEVNULL,'stdout':stdout,'stderr':stderr,'env':env}
 	if executable is not None:kwargs['executable']=executable
-	if not _IS_POSIX:return subprocess.Popen(argv,**kwargs),None
+	if not _IS_POSIX:return _reentrant_waitpid_lock(subprocess.Popen(argv,**kwargs)),None
 	grouped=True
 	if _HAS_PROCESS_GROUP:kwargs['process_group']=0
 	elif _uses_wrapper():
@@ -409,9 +417,13 @@ def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None):
 		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count]+list(argv)
 	else:grouped=False
 	old_mask=signal.pthread_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS)
-	try:proc=subprocess.Popen(argv,**kwargs)
+	try:proc=_reentrant_waitpid_lock(subprocess.Popen(argv,**kwargs))
 	finally:signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
 	return proc,proc.pid if grouped else None
+_LOCK_TYPE=type(threading.Lock())
+def _reentrant_waitpid_lock(proc):
+	if isinstance(getattr(proc,'_waitpid_lock',None),_LOCK_TYPE):proc._waitpid_lock=threading.RLock()
+	return proc
 def _stdout_isatty():
 	try:return sys.stdout.isatty()
 	except Exception:return False
@@ -436,11 +448,10 @@ def _decor(index,width,prefix,color):
 def _resolve_color(color,concurrent):
 	if color is not None:return bool(color)
 	return concurrent and _stdout_isatty()and not os.environ.get('NO_COLOR')
-def _register(proc,pgid):
-	with _live_procs_lock:_live_procs[proc]=pgid
+def _register(proc,pgid):_live_procs[proc]=pgid
 def _unregister(proc):
 	if proc.poll()is None:return
-	with _live_procs_lock:_live_procs.pop(proc,None)
+	_live_procs.pop(proc,None)
 def _send(proc,pgid,sig):
 	try:
 		if pgid is not None:
@@ -481,12 +492,8 @@ def _kill_commands(commands,first_signal):
 	_wait_all(commands,1);leftovers=[(proc,pgid)for(proc,pgid)in commands if _group_alive(proc,pgid)]
 	for(proc,pgid)in leftovers:_send(proc,pgid,signal.SIGKILL)
 	_wait_all(leftovers,1)
-def kill_all(sig=None):
-	with _live_procs_lock:commands=list(_live_procs.items())+list(_draining.items())
-	_kill_commands(commands,signal.SIGTERM if sig is None else sig)
-def _kill_running_at_exit():
-	with _live_procs_lock:commands=list(_live_procs.items())
-	_kill_commands(commands,signal.SIGTERM)
+def kill_all(sig=None):commands=list(_live_procs.copy().items())+list(_draining.copy().items());_kill_commands(commands,signal.SIGTERM if sig is None else sig)
+def _kill_running_at_exit():_kill_commands(list(_live_procs.copy().items()),signal.SIGTERM)
 atexit.register(_kill_running_at_exit)
 def _resolve_pty(pty):
 	global _PTY_WARNED
@@ -605,33 +612,33 @@ class _Handoff:
 	def take(self):
 		if self.started and not self._waited:self._waited=True;self.done.wait(1)
 		if self._claim.setdefault('by','abandoned')=='returned':return self.result
-def _start_command(task,use_pty,decor,explicit,handoff):
-	master=slave=None
+def _start_command(task,use_pty,decor,quiet,explicit,handoff):
+	master=slave=None;readers=[]
 	if use_pty:master,slave=_open_pty(len(decor[0]))
-	if master is None:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit);handoff.result=proc,pgid,[(proc.stdout,task.stdout),(proc.stderr,task.stderr)]
+	if master is None:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit);streams=[(proc.stdout,task.stdout),(proc.stderr,task.stderr)];handoff.result=proc,pgid,streams,readers
 	else:
 		try:reader=io.open(master,'rb')
 		except BaseException:os.close(master);os.close(slave);raise
 		try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True),explicit)
 		except BaseException:os.close(slave);reader.close();raise
-		handoff.result=proc,pgid,[(reader,task.stdout)];os.close(slave);task._pty=True
-	_register(proc,pgid)
+		streams=[(reader,task.stdout)];handoff.result=proc,pgid,streams,readers;os.close(slave);task._pty=True
+	_register(proc,pgid);task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers)
 def _undo_start(started):
-	proc,pgid,streams=started;_kill_commands([(proc,pgid)],signal.SIGINT);_unregister(proc)
-	for(stream,_)in streams:stream.close()
+	proc,pgid,streams,readers=started;_kill_commands([(proc,pgid)],signal.SIGINT);_unregister(proc)
+	for(i,(stream,_))in enumerate(streams):
+		if i>=len(readers)or readers[i]._abandon():stream.close()
 def _stop_command(proc,pgid):
 	try:_kill_commands([(proc,pgid)],signal.SIGINT)
 	except _INTERRUPTS:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT);raise
 def _execute(task,timeout,quiet,decor,use_pty=False):
 	explicit=task._env is not None or task._extra_env is not None;proc=pgid=None;streams=[];readers=[];interrupted=False;handoff=_Handoff()
-	try:proc,pgid,streams=handoff.run(lambda handoff:_start_command(task,use_pty,decor,explicit,handoff),_undo_start);task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);reason=_watch(task,proc,timeout)
+	try:proc,pgid,streams,readers=handoff.run(lambda handoff:_start_command(task,use_pty,decor,quiet,explicit,handoff),_undo_start);reason=_watch(task,proc,timeout)
 	except BaseException as e:
 		first=e;cut=None
 		def settle():
-			nonlocal proc,pgid,streams;started=handoff.take()
+			nonlocal proc,pgid,streams,readers;started=handoff.take()
 			if started is None:return
-			proc,pgid,streams=started
-			with _live_procs_lock:_live_procs[proc]=pgid
+			proc,pgid,streams,readers=started;_live_procs[proc]=pgid
 			for(i,(stream,_))in enumerate(streams):
 				if i>=len(readers)or readers[i]._abandon():stream.close()
 			if cut is not None and isinstance(first,_INTERRUPTS):_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT)
@@ -654,11 +661,10 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	if reason is not None:_stop_command(proc,pgid)
 	_unregister(proc);task.returncode=proc.poll()
 	if reason is None:
-		with _live_procs_lock:_draining[proc]=pgid
+		_draining[proc]=pgid
 		try:reason=_drain(task,readers,timeout)
 		except KeyboardInterrupt:reason,interrupted='stop',True
-		finally:
-			with _live_procs_lock:_draining.pop(proc,None)
+		finally:_draining.pop(proc,None)
 		if reason=='timeout':task.stderr.append('Timeout!')
 		if reason is not None:_stop_command(proc,pgid)
 	_join_all(readers,None if reason is None else 1)
