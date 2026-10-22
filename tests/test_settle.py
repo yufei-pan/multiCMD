@@ -512,6 +512,96 @@ def test_the_programs_handler_gets_every_ctrl_c(another_thread):
 	assert multiCMD._join(thread, 5)
 
 
+def _in_frames(predicate, depth=6):
+	frame = sys._getframe(2)
+	for _ in range(depth):
+		if frame is None:
+			return False
+		if predicate(frame.f_code):
+			return True
+		frame = frame.f_back
+	return False
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+@pytest.mark.parametrize('mode', ['fire-and-forget', 'pool'])
+def test_a_second_ctrl_c_while_the_starts_are_settled_ends_the_wait(monkeypatch, mode, another_thread):
+	# ( finding 4, review probe p_lost2.py ) the first Ctrl-C as the second thread starts, the second while
+	# _start_threads() settles: the wait for the command already running must end at once
+	target = getattr(multiCMD, '__run_tracked_command') if mode == 'fire-and-forget' else None
+	real_start = multiCMD._Thread.start
+	starts = []
+	first = KeyboardInterrupt('first')
+	def start(self):
+		mine = getattr(self, '_target', None)
+		if mine is not None and (mine is target or (target is None and mine.__name__ == 'worker')):
+			starts.append(time.monotonic())
+			if len(starts) == 2:
+				deadline = time.monotonic() + 5
+				while not multiCMD._live_procs and time.monotonic() < deadline:
+					time.sleep(0.01)
+				starts.append(time.monotonic())
+				raise first
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	real_abandon = multiCMD._Thread._abandon
+	sent = []
+	def abandon(self):
+		if not sent and threading.current_thread() is threading.main_thread() \
+			and _in_frames(lambda code: code.co_name == 'settle' and 'failing' in code.co_freevars):
+			sent.append(1)
+			_ctrl_c()
+		return real_abandon(self)
+	monkeypatch.setattr(multiCMD._Thread, '_abandon', abandon)
+	# a command that only SIGKILL ends: stopping it takes over 1 s
+	command = ['sh', '-c', 'trap "" INT TERM; sleep 30']
+	with pytest.raises(KeyboardInterrupt) as raised:
+		if mode == 'fire-and-forget':
+			run_commands([command] * 3, max_threads=0, quiet=True, wait_for_return=False)
+		else:
+			run_commands([command] * 3, max_threads=3, quiet=True)
+	elapsed = time.monotonic() - starts[2]
+	assert sent and raised.value is not first and raised.value.__context__ is first
+	# before ( a96b922 ): the second Ctrl-C was taken, and the wait went on until the command was dead ( > 1 s )
+	assert elapsed < 0.9
+	monkeypatch.undo()
+	# the command is still stopped, by its thread
+	deadline = time.monotonic() + 5
+	while multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.05)
+	assert not multiCMD._live_procs
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_second_ctrl_c_while_a_serial_run_deals_with_the_first_ends_the_wait_for_the_command(monkeypatch):
+	# ( finding 5 ) the first Ctrl-C while the command runs, the second while _execute() settles: no wait for the kill
+	real_abandon = multiCMD._Thread._abandon
+	sent = []
+	def abandon(self):
+		if not sent and threading.current_thread() is threading.main_thread() \
+			and _in_frames(lambda code: code.co_name == 'settle' and 'readers' in code.co_freevars):
+			sent.append(time.monotonic())
+			_ctrl_c()
+		return real_abandon(self)
+	monkeypatch.setattr(multiCMD._Thread, '_abandon', abandon)
+	procs = []
+	real_register = multiCMD._register
+	monkeypatch.setattr(multiCMD, '_register', lambda proc, pgid: (procs.append(proc), real_register(proc, pgid)))
+	try:
+		with pytest.raises(KeyboardInterrupt) as raised, sigint_main_after(0.3):
+			multiCMD.run_command(['sh', '-c', 'trap "" INT TERM; sleep 30'], quiet=True)
+		# before ( a96b922 ): the second Ctrl-C was taken, and the kill waited over 1 s for the command to die
+		assert sent and time.monotonic() - sent[0] < 0.9
+		assert isinstance(raised.value.__context__, KeyboardInterrupt)
+		# left registered, for kill_all() and the exit hook
+		assert procs and procs[0] in multiCMD._live_procs
+	finally:
+		multiCMD.kill_all()
+		for proc in procs:
+			proc.wait(5)
+			multiCMD._unregister(proc)
+
+
 # ---- review round 8: a handler installed during a hold stays, and gets the held Ctrl-C
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
