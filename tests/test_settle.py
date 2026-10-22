@@ -299,6 +299,47 @@ def test_a_second_ctrl_c_while_join_threads_stops_its_commands_ends_the_wait():
 	assert multiCMD._join(thread, 5)
 
 
+# ---- fire-and-forget: the whole batch is tracked before any starts, and none is left tracked that never runs
+
+def test_a_join_threads_meanwhile_sees_the_whole_fire_and_forget_batch(monkeypatch):
+	seen = []
+	real_start = multiCMD._Thread.start
+	def start(self):
+		if getattr(self, '_target', None) is getattr(multiCMD, '__run_tracked_command') and not seen:
+			seen.append(set(_global_threads()))
+		real_start(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	tasks = run_commands([['true']] * 3, quiet=True, wait_for_return=False, return_object=True)
+	# before: only the thread about to start was registered, and a join_threads() could return before the rest
+	assert seen and {task.thread for task in tasks} <= seen[0]
+	multiCMD.join_threads()
+	assert [task.returncode for task in tasks] == [0, 0, 0]
+
+
+def test_a_second_ctrl_c_before_the_starts_settle_leaves_no_thread_tracked(monkeypatch):
+	# ( review probe ff_escape.py ) the first Ctrl-C as the second thread starts, the second as _start_threads()
+	# begins to settle: before the fix a registered thread that never started stayed alive, and join_threads() hung
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	_fail_nth_start(monkeypatch, getattr(multiCMD, '__run_tracked_command'), 2, KeyboardInterrupt())
+	real_settle = multiCMD._settle
+	armed = [True]
+	def settle(step):
+		if armed[0] and step.__qualname__ == '_start_threads.<locals>.settle':
+			armed[0] = False
+			raise KeyboardInterrupt('second Ctrl-C')
+		return real_settle(step)
+	monkeypatch.setattr(multiCMD, '_settle', settle)
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sleep', '30']] * 3, max_threads=0, quiet=True, wait_for_return=False)
+	assert not armed[0]
+	assert _join_threads_returns_within(3)
+	assert not any(thread.is_alive() for thread in _global_threads())
+	assert all(task.stop and not task.thread.is_alive() for task in tasks) and not _runs(tasks[2].thread)
+	assert not multiCMD._live_procs
+
+
 # ---- the pool: one failed start is enough, and failing every task is settled
 
 def test_the_pool_stops_starting_workers_after_the_first_that_cannot_start(monkeypatch, capfd):

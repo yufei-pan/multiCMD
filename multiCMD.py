@@ -2311,14 +2311,22 @@ def _stop_tasks(tasks):
 			task.stop = True
 	return _settle(stop)
 
-def _stop_and_wait(tasks, threads, limit=5):
+def _stop_and_wait(tasks, threads, limit=5, forget=None):
 	'''
-	After a Ctrl-C: stop the tasks' commands, then wait for their threads, up to limit seconds in all ( internal )
-	The commands run in process groups of their own, so the terminal's Ctrl-C did not reach them. A second
-	Ctrl-C ends the wait at once ( raised while the first is handled, it has the first as its __context__ ); one
-	that lands while the tasks are stopped skips it.
+	After a Ctrl-C ( or a failure ): stop the tasks' commands, then wait for their threads, up to limit seconds in all ( internal )
+	The threads that never got to their target are abandoned first, and forgotten ( forget(thread), see
+	_start_threads ), in the same settled step, so the wait never waits for one that does not run. The commands
+	run in process groups of their own, so the terminal's Ctrl-C did not reach them. A second Ctrl-C ends the wait
+	at once ( raised while the first is handled, it has the first as its __context__ ); one that lands while the
+	tasks are stopped skips it.
 	'''
-	if not _stop_tasks(tasks):
+	def stop():
+		for thread in threads:
+			if thread._abandon() and forget is not None:
+				forget(thread)
+		for task in tasks:
+			task.stop = True
+	if not _settle(stop):
 		_join_all(threads, limit)
 
 def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=False):
@@ -2363,7 +2371,6 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 	except BaseException:
 		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will,
 		# nor do workers made but not started yet ( _start_threads settles the ones it was given )
-		_settle(lambda: [thread._abandon() for thread in workers])
 		_stop_and_wait(tasks, workers)
 		raise
 
@@ -2469,13 +2476,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task._env = task._extra_env = None
 	elif not wait_for_return:
 		__reap_finished_threads()
-		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors)]
-		def register(thread):
-			# tracked before it starts, so a thread is always registered before it reports itself finished
-			# ( and a join_threads() meanwhile waits for it, see _Thread )
-			with __running_threads_lock:
-				__running_threads.add(thread)
-			thread.task.thread = thread
+		threads = []
 		def forget(thread):
 			# it never runs: untracked, as it never reports itself finished, and its task keeps it ( done, so
 			# task.thread.join() returns at once ) but not its environment
@@ -2487,10 +2488,18 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			# that command fails, the others run
 			_fail_task(thread.task, f'cannot start its thread: {error}', error, quiet)
 		try:
+			threads.extend(_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors))
+			for thread in threads:
+				thread.task.thread = thread
+			# the whole batch is tracked before any starts, so a thread is registered before it reports itself finished
+			# and a join_threads() from another thread meanwhile waits for all of it ( see _Thread )
+			with __running_threads_lock:
+				__running_threads.update(threads)
 			# a Ctrl-C while they start: the commands not started yet never will ( skipped ), the others are stopped
-			_start_threads(threads, register, forget, fail, abort=lambda: _stop_tasks(tasks))
+			_start_threads(threads, forget=forget, fail=fail, abort=lambda: _stop_tasks(tasks))
 		except BaseException:
-			_stop_and_wait(tasks, threads)
+			# ( also when the starts' own settling was cut short: no thread that never runs stays tracked )
+			_stop_and_wait(tasks, threads, forget=forget)
 			raise
 	elif max_threads > 1:
 		_run_pool(tasks, decors, sem, timeout, quiet, False, max_threads, use_pty)
