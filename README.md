@@ -397,12 +397,15 @@ Because the commands are not in your program's process group, signals sent to th
 group do not reach them. multiCMD handles this for you: a call waiting on the main
 thread that gets Ctrl-C (`join_threads()` and `AsyncExecutor.wait()` included) stops its
 commands before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
-for them at once; one that lands while multiCMD stops them or forgets the threads that never ran ends
+for them at once, a serial run's command still sent SIGTERM; one that lands while multiCMD stops them or forgets the threads that never ran ends
 it too), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
 commands still running when the interpreter exits are killed. A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
-arrives), can call `multiCMD.kill_all()` from its handler.
+arrives), can call `multiCMD.kill_all()` from its handler. A Ctrl-C (or a signal handler's
+exception) that lands while a command starts never loses it: on the main thread, where Python
+raises those, each command is started from a short-lived helper thread that registers it before
+handing it back (about 15-100 µs per command), so it is always stopped with the others.
 
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). A Ctrl-C that lands while multiCMD does its bookkeeping on the rare paths (a thread that

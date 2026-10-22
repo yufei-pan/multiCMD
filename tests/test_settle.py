@@ -751,24 +751,131 @@ def test_a_ctrl_c_while_a_pool_fails_its_tasks_is_raised_once_every_one_is_recor
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
 
 
-# ---- review round 8: a command whose Popen is cut short after the fork is still stopped
+# ---- review of round 9: a Ctrl-C while the command starts never loses it, and a second one still stops it
+
+def _children():
+	'''The pids of this process's children, whichever of its threads started them'''
+	pids = set()
+	for tid in os.listdir('/proc/self/task'):
+		try:
+			with open(f'/proc/self/task/{tid}/children') as f:
+				pids.update(int(pid) for pid in f.read().split())
+		except OSError:
+			pass
+	return pids
+
+
+def _zombie(pid):
+	try:
+		with open(f'/proc/{pid}/stat') as f:
+			return f.read().rsplit(')', 1)[1].split()[0] == 'Z'
+	except OSError:
+		return True
+
+
+def _left_running(before, wait=3.0):
+	'''
+	The children started since before that still run after up to wait seconds, or that are dead but neither
+	reaped nor registered ( kill_all() and the exit hook reap what is registered )
+	'''
+	deadline = time.monotonic() + wait
+	while True:
+		with multiCMD._live_procs_lock:
+			registered = {proc.pid for proc in multiCMD._live_procs}
+		left = {pid for pid in _children() - before if not _zombie(pid) or pid not in registered}
+		if not left or time.monotonic() > deadline:
+			return left
+		time.sleep(0.02)
+
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
-@pytest.mark.parametrize('error', [SystemExit(143), KeyboardInterrupt()], ids=['SystemExit', 'KeyboardInterrupt'])
-def test_a_command_whose_popen_is_cut_short_after_the_fork_is_still_stopped(monkeypatch, error):
-	# ( finding 11 ) mcmd's SIGTERM handler ( SystemExit ), or a Ctrl-C, while Popen waits for the exec: the
-	# Popen object never got back, and the command ran on in its own process group, unknown to kill_all()
-	import subprocess
-	pids = []
-	real = subprocess.Popen._execute_child
-	def execute_child(self, *args, **kwargs):
-		real(self, *args, **kwargs)
-		pids.append(self.pid)
-		raise error
-	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
-	with pytest.raises(type(error)):
-		multiCMD.run_command(['sleep', '30'], quiet=True)
-	monkeypatch.undo()
-	# before ( a96b922 ): still running
-	assert pids and pid_gone(pids[0])
-	assert not multiCMD._live_procs
+@pytest.mark.parametrize('ctrl_cs', [1, 2])
+def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch, ctrl_cs):
+	# ( review of round 9, blockers 1 and 2; probe rv9/orphan.py ) a real SIGINT from another thread lands
+	# anywhere in the start: as _fork_exec / posix_spawn returned ( before Popen stored the pid ), Popen lost the
+	# command, which ran on in its own process group ( 14 of 16 such Ctrl-Cs on 3.13 at 0e4d015 ). A second one
+	# right after, while the first is dealt with, ended the wait without stopping the command, and when it was
+	# pending as that began, left the command unregistered too
+	import random
+	main = threading.main_thread().ident
+	inside = []
+	if hasattr(multiCMD, '_Handoff'):
+		real_take = multiCMD._Handoff.take
+		def take(self):
+			if not self._waited:
+				# whether the Ctrl-C landed while the main thread waited for the start
+				inside.append(not self.done.flag)
+			return real_take(self)
+		monkeypatch.setattr(multiCMD._Handoff, 'take', take)
+	before = _children()
+	lost = []
+	for _ in range(100):
+		first = random.uniform(0, 0.004)
+		delays = [first] + ([first + random.uniform(0, 0.002)] if ctrl_cs == 2 else [])
+		def send():
+			start = time.monotonic()
+			for delay in delays:
+				time.sleep(max(0, start + delay - time.monotonic()))
+				signal.pthread_kill(main, signal.SIGINT)
+		timer = threading.Thread(target=send)
+		timer.start()
+		try:
+			try:
+				multiCMD.run_command(['sleep', '30'], quiet=True)
+			finally:
+				while True:
+					try:
+						timer.join()
+						break
+					except KeyboardInterrupt:
+						pass
+		except KeyboardInterrupt:
+			pass
+		else:
+			pytest.fail('the command ran to its end')
+		lost.extend(_left_running(before))
+		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
+		with multiCMD._live_procs_lock:
+			left = list(multiCMD._live_procs)
+		assert ctrl_cs == 2 or not left
+		for proc in left:
+			proc.wait(5)
+			multiCMD._unregister(proc)
+		if lost:
+			break
+	for pid in lost:
+		os.killpg(pid, signal.SIGKILL)
+	# before ( 0e4d015 ): a command started, unknown to kill_all(), left running
+	assert lost == []
+	if hasattr(multiCMD, '_Handoff'):
+		assert any(inside), 'no Ctrl-C landed while the command started'
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
+def test_a_second_ctrl_c_while_a_serial_run_deals_with_the_first_still_stops_the_command(monkeypatch, tmp_path):
+	# ( review of round 9, blocker 2 ) it ends the wait, but the command is sent SIGTERM before it is re-raised
+	marker = tmp_path / 'term'
+	real_abandon = multiCMD._Thread._abandon
+	sent = []
+	def abandon(self):
+		if not sent and threading.current_thread() is threading.main_thread() \
+			and _in_frames(lambda code: code.co_name == 'settle' and 'readers' in code.co_freevars):
+			sent.append(time.monotonic())
+			_ctrl_c()
+		return real_abandon(self)
+	monkeypatch.setattr(multiCMD._Thread, '_abandon', abandon)
+	procs = []
+	real_register = multiCMD._register
+	monkeypatch.setattr(multiCMD, '_register', lambda proc, pgid: (procs.append(proc), real_register(proc, pgid)))
+	try:
+		with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+			multiCMD.run_command(['sh', '-c', f'trap "" INT; trap "echo term > {marker}; exit 0" TERM; sleep 30 & wait'], quiet=True)
+		assert sent and time.monotonic() - sent[0] < 0.9
+		# before ( 0e4d015 ): never signalled, it ran on until kill_all() or the exit hook
+		assert procs and procs[0] in multiCMD._live_procs
+		assert procs[0].wait(5) == 0 and marker.read_text().strip() == 'term'
+	finally:
+		multiCMD.kill_all()
+		for proc in procs:
+			proc.wait(5)
+			multiCMD._unregister(proc)
