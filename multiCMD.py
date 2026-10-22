@@ -337,12 +337,16 @@ class AsyncExecutor:
 				thread, task = self._finished.popleft()
 			except IndexError:
 				return
-			thread.join()
-			with self._lock:
-				self._threads.pop(thread, None)
-				# a finished Thread object costs ~2 KB, and the task outlives it in self.tasks
-				if task is not None and task.thread is thread:
-					task.thread = None
+			try:
+				thread.join()
+			finally:
+				# also when the join is interrupted ( Ctrl-C ): the item is already off _finished, and
+				# a finished thread needs no join to be forgotten, joining only frees its stack
+				with self._lock:
+					self._threads.pop(thread, None)
+					# a finished Thread object costs ~2 KB, and the task outlives it in self.tasks
+					if task is not None and task.thread is thread:
+						task.thread = None
 
 	def _start_thread(self, target, args, task=None):
 		thread = threading.Thread(target=target, args=args, daemon=True)
@@ -491,20 +495,24 @@ class AsyncExecutor:
 		'''
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
 		try:
+			joined = set()
 			while True:
 				pending = self.runningThreads if threads is ... else list(threads)
 				for thread in pending:
 					_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
-				# once a pass finishes every thread, look again for commands the dispatcher started meanwhile
-				if threads is not ... or not pending or any(thread.is_alive() for thread in pending):
+				# once a pass finishes every thread, look again for commands the dispatcher started meanwhile;
+				# stop when nothing new showed up ( a stale entry for a dead thread must not keep this looping ) or time is up
+				if threads is not ... or not pending or any(thread.is_alive() for thread in pending) \
+					or all(thread in joined for thread in pending) or (deadline is not None and time.monotonic() >= deadline):
 					break
+				joined.update(pending)
 		except KeyboardInterrupt:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			for task in self.tasks:
 				task.stop = True
 			self.wait(timeout=5)
 			raise
-		return self.runningThreads
+		return [thread for thread in self.runningThreads if thread.is_alive()]
 	
 	def stop(self,timeout=None):
 		'''
@@ -1569,9 +1577,12 @@ def __reap_finished_threads():
 			thread = __finished_threads.popleft()
 		except IndexError:
 			return
-		thread.join()
-		with __running_threads_lock:
-			__running_threads.discard(thread)
+		try:
+			thread.join()
+		finally:
+			# also when the join is interrupted ( Ctrl-C ): the thread is already off __finished_threads
+			with __running_threads_lock:
+				__running_threads.discard(thread)
 
 def _split_command(command):
 	'''

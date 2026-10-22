@@ -249,3 +249,70 @@ def test_executor_dry_run_prints_the_quoted_command(capsys):
 	ex.run_command(['echo', 'a b'])
 	ex.wait()
 	assert capsys.readouterr().out == "echo 'a b'\n"
+
+
+def _interrupt_join(thread):
+	'''Make the next thread.join() raise KeyboardInterrupt, as a Ctrl-C landing in it would'''
+	real_join = thread.join
+	def interrupted_join(*args, **kwargs):
+		thread.join = real_join
+		raise KeyboardInterrupt
+	thread.join = interrupted_join
+
+
+def _wait_in_thread(ex, timeout):
+	done = threading.Event()
+	def waiter():
+		ex.wait(timeout=timeout)
+		done.set()
+	threading.Thread(target=waiter, daemon=True).start()
+	return done
+
+
+def test_interrupted_reap_leaves_no_dead_thread_behind():
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	task = ex.run_command(['true'])
+	deadline = time.monotonic() + 5
+	while not ex._finished and time.monotonic() < deadline:
+		time.sleep(0.01)
+	thread = ex._finished[0][0]
+	_interrupt_join(thread)
+	with pytest.raises(KeyboardInterrupt):
+		ex.runningThreads
+	assert thread not in ex.runningThreads
+	assert task.thread is None
+	done = _wait_in_thread(ex, 1)
+	assert done.wait(2)
+
+
+def test_wait_deadline_returns_despite_stale_bookkeeping():
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	dead = threading.Thread(target=lambda: None)
+	dead.start()
+	dead.join()
+	ex._threads[dead] = None
+	done = _wait_in_thread(ex, 1)
+	assert done.wait(2)
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	ex._threads[dead] = None
+	assert not ex.wait()
+
+
+def test_interrupted_module_reap_forgets_the_thread():
+	reap = getattr(multiCMD, '__reap_finished_threads')
+	finished = getattr(multiCMD, '__finished_threads')
+	thread = threading.Thread(target=lambda: None)
+	thread.start()
+	thread.join()
+	_global_threads().add(thread)
+	finished.append(thread)
+	_interrupt_join(thread)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			reap()
+		assert thread not in _global_threads()
+		assert thread not in finished
+	finally:
+		_global_threads().discard(thread)
+		if thread in finished:
+			finished.remove(thread)
