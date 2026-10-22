@@ -790,7 +790,7 @@ def _left_running(before, wait=3.0):
 	deadline = time.monotonic() + wait
 	while True:
 		with multiCMD._live_procs_lock:
-			registered = {proc.pid for proc in multiCMD._live_procs}
+			registered = {proc.pid for proc in multiCMD._live_procs.copy()}
 		left = {pid for pid in _children() - before if not _zombie(pid) or pid not in registered}
 		if not left or time.monotonic() > deadline:
 			return left
@@ -880,7 +880,7 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		lost.extend(_left_running(before))
 		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
 		with multiCMD._live_procs_lock:
-			left = list(multiCMD._live_procs)
+			left = list(multiCMD._live_procs.copy())
 		assert ctrl_cs == 2 or not left
 		for proc in left:
 			proc.wait(5)
