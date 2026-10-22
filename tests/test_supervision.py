@@ -249,3 +249,27 @@ def test_a_reader_start_that_fails_still_stops_the_command(monkeypatch, exc):
 		assert procs and procs[0].poll() is not None
 	finally:
 		multiCMD.kill_all(signal.SIGKILL)
+
+
+def test_a_command_that_exits_just_past_the_inactivity_timeout_keeps_its_exit_code(monkeypatch):
+	# it exits after the threshold but before _watch() looks again: its output ends a moment later
+	real_watch, real_read, real_join = multiCMD._watch, multiCMD._read_stream, multiCMD._join
+	go = threading.Event()
+	def watch(task, proc, timeout):
+		reason = real_watch(task, proc, 0)
+		task._last_output -= timeout + 1
+		return reason
+	def held_read(stream, target, task, *args):
+		real_read(stream, target, task, *args)
+		go.wait(10)
+	def join(thread, timeout=None):
+		# the drain's first step: the output ends now, within it
+		if timeout == 0.05 and not go.is_set():
+			go.set()
+			timeout = 10
+		return real_join(thread, timeout)
+	monkeypatch.setattr(multiCMD, '_watch', watch)
+	monkeypatch.setattr(multiCMD, '_read_stream', held_read)
+	monkeypatch.setattr(multiCMD, '_join', join)
+	task = run_command(['sh', '-c', 'echo hi; exit 3'], timeout=1, quiet=True, return_object=True)
+	assert (task.returncode, task.stdout, task.stderr) == (3, ['hi'], [])

@@ -1435,10 +1435,12 @@ def _drain(task, readers, timeout):
 	while any(reader.is_alive() for reader in readers):
 		if task.stop:
 			return 'stop'
-		if timeout > 0 and time.monotonic() - task._last_output > timeout:
-			return 'timeout'
 		for reader in readers:
 			_join(reader, 0.05)
+		# tested after a step, not on entry: a command that exits just past the threshold, before _watch() looked
+		# again, has its output end a moment later, and is not a timeout
+		if timeout > 0 and time.monotonic() - task._last_output > timeout and any(reader.is_alive() for reader in readers):
+			return 'timeout'
 	return None
 
 def _join_readers(readers, limit):
