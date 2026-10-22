@@ -1981,7 +1981,7 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 		env: The whole environment of the command ( the commands ), replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
-			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); a variable with an empty name ( a corrupt os.environ entry, copied by `env=dict(os.environ)` ) is left out of env and of the inherited environment. An empty name in extra_env is a ValueError.
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name ( a corrupt os.environ entry ) is left out of the environment of a command given env / extra_env, and out of an env copied from os.environ ( `env=dict(os.environ)` ); a command given neither, with or without pty, inherits it as before. An empty name in extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
@@ -2023,7 +2023,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		env: The whole environment of each command, replacing the one inherited from this process, as subprocess's env ( Mapping[str, str] | None: inherit it )
 		extra_env: Variables added to the environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable.
 			Applied on top of env when both are given ( empty: nothing ). Per call and per command: it never changes os.environ nor reaches other commands.
-			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); a variable with an empty name ( a corrupt os.environ entry, copied by `env=dict(os.environ)` ) is left out of env and of the inherited environment. An empty name in extra_env is a ValueError.
+			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name ( a corrupt os.environ entry ) is left out of the environment of a command given env / extra_env, and out of an env copied from os.environ ( `env=dict(os.environ)` ); a command given neither, with or without pty, inherits it as before. An empty name in extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
 
