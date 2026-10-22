@@ -505,7 +505,12 @@ class AsyncExecutor:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			for task in self.tasks:
 				task.stop = True
-			self.wait(timeout=5)
+			# Not wait(): on Python 3.10 - 3.12 a join() the Ctrl-C interrupted leaves the thread flagged as stopped
+			# while it still runs ( CPython bpo-45274 ), so is_alive() says it is done and wait() would return at once.
+			# Each thread tells when it is really done by reporting to _finished, which _reap() turns into an empty _threads.
+			deadline = time.monotonic() + 5
+			while self.runningThreads and time.monotonic() < deadline:
+				time.sleep(0.01)
 			raise
 		return [thread for thread in self.runningThreads if thread.is_alive()]
 	
