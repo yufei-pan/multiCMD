@@ -5,7 +5,8 @@ import time
 
 import pytest
 
-from conftest import pid_gone
+import multiCMD
+from conftest import pid_gone, sigint_main_after
 from multiCMD import run_commands
 
 
@@ -68,3 +69,23 @@ def test_ctrl_c_stops_every_running_command_in_the_pool(tmp_path):
 	assert time.monotonic() - start < 5
 	for path in pidfiles:
 		assert pid_gone(int(path.read_text()))
+
+
+@pytest.mark.slow
+def test_ctrl_c_in_a_pool_waits_for_a_command_slow_to_die(monkeypatch):
+	# a real SIGINT lands in the wait for the first worker; on 3.9.8 - 3.12 Thread.join() then takes it for finished
+	tasks = []
+	real = multiCMD._build_tasks
+	def build(*args, **kwargs):
+		built = real(*args, **kwargs)
+		tasks.extend(built[0])
+		return built
+	monkeypatch.setattr(multiCMD, '_build_tasks', build)
+	sigint_main_after(0.7)
+	start = time.monotonic()
+	with pytest.raises(KeyboardInterrupt):
+		run_commands([['sh', '-c', 'trap "" INT TERM; sleep 30'], ['sleep', '30']], max_threads=2, quiet=True)
+	# the first one dies only to SIGKILL, a second after the stop
+	assert time.monotonic() - start >= 1.5
+	assert all(task.returncode is not None for task in tasks), [task.returncode for task in tasks]
+	assert not multiCMD._live_procs

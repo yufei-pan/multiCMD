@@ -6,6 +6,7 @@ import time
 import pytest
 
 import multiCMD
+from conftest import sigint_main_after
 from multiCMD import AsyncExecutor, run_commands
 
 
@@ -321,3 +322,63 @@ def test_interrupted_module_reap_forgets_the_thread():
 		_global_threads().discard(thread)
 		if thread in finished:
 			finished.remove(thread)
+
+
+# ---- an interrupted join ( Ctrl-C ) never makes a running thread look finished: CPython bpo-45274, 3.9.8 - 3.12
+
+def _started_thread(task):
+	deadline = time.monotonic() + 5
+	while task.thread is None and time.monotonic() < deadline:
+		time.sleep(0.01)
+	return task.thread
+
+
+def test_an_interrupted_join_does_not_make_a_running_thread_look_finished():
+	release = threading.Event()
+	thread = multiCMD._Thread(release.wait, (10,))
+	thread.start()
+	sigint_main_after(0.2)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			thread.join()
+		assert thread.is_alive()
+		assert not multiCMD._join(thread, 0.2)
+	finally:
+		release.set()
+	assert multiCMD._join(thread, 5)
+	assert not thread.is_alive()
+
+
+@pytest.mark.slow
+def test_wait_and_stop_after_an_interrupted_join_still_wait_for_the_command():
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	task = ex.run_command(['sleep', '1'])
+	thread = _started_thread(task)
+	sigint_main_after(0.2)
+	with pytest.raises(KeyboardInterrupt):
+		thread.join()
+	assert thread in ex.wait(timeout=0.1)
+	assert task.is_alive() and task.returncode is None
+	assert ex.wait() == []
+	assert task.returncode == 0 and not task.is_alive()
+	task = ex.run_command(['sleep', '30'])
+	thread = _started_thread(task)
+	sigint_main_after(0.2)
+	with pytest.raises(KeyboardInterrupt):
+		thread.join()
+	ex.stop()
+	assert task.returncode is not None and not task.is_alive()
+	ex.cleanup()
+	assert not thread.is_alive()
+
+
+@pytest.mark.slow
+def test_join_threads_after_an_interrupted_one_still_waits():
+	task = multiCMD.run_command(['sleep', '1'], quiet=True, wait_for_return=False, return_object=True)
+	sigint_main_after(0.2)
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD.join_threads()
+	assert task.is_alive() and task.returncode is None
+	multiCMD.join_threads()
+	assert task.returncode == 0 and not task.is_alive()
+	assert task.thread not in _global_threads()

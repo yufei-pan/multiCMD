@@ -10,7 +10,7 @@ import time
 import pytest
 
 import multiCMD
-from conftest import PACKAGE_ROOT, pid_gone
+from conftest import PACKAGE_ROOT, pid_gone, sigint_main_after
 from multiCMD import AsyncExecutor, run_command, run_commands
 
 linux_only = pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
@@ -98,6 +98,24 @@ def test_ctrl_c_kills_the_running_command_and_reraises(tmp_path):
 		run_command(['sh', '-c', f'sleep 30 & echo $! > {pidfile}; wait'], quiet=True)
 	assert time.monotonic() - start < 3.5
 	assert pid_gone(int(pidfile.read_text()))
+
+
+@linux_only
+def test_ctrl_c_while_draining_keeps_the_output_already_read(monkeypatch):
+	# the command exits, a background job holds its stdout ( stderr is closed ): the wait on the stdout reader takes the SIGINT
+	real = multiCMD._read_stream
+	seen = []
+	def late_reader(stream, target, task, *args):
+		seen.append(task)
+		got = []
+		real(stream, got, task, *args)
+		time.sleep(0.3)
+		target.extend(got)
+	monkeypatch.setattr(multiCMD, '_read_stream', late_reader)
+	sigint_main_after(0.5)
+	with pytest.raises(KeyboardInterrupt):
+		run_command(['sh', '-c', 'echo out; exec 2>&-; sleep 30 & exit 0'], quiet=True)
+	assert seen[0].stdout == ['out']
 
 
 def test_missing_command_is_127(launcher):

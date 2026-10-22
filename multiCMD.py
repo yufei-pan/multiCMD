@@ -181,6 +181,35 @@ class _HeldPermit:
 		self.semaphore.release()
 		return False
 
+class _Thread(threading.Thread):
+	'''
+	A daemon thread that reports itself done, for every thread multiCMD starts and waits for ( internal )
+
+	On Python 3.9.8 through 3.12 a join() that a KeyboardInterrupt interrupts leaves the thread flagged as
+	stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and join() returns at
+	once, for good. done is set by the thread itself once its target has returned or raised, so is_alive()
+	here ( as documented: from the start until run() ends ) and _join(), which waits on done, stay right on
+	every Python, whatever join was interrupted before.
+	'''
+	def __init__(self, target, args=()):
+		super().__init__(target=target, args=args, daemon=True)
+		self.done = threading.Event()
+		self._pid = None
+
+	def start(self):
+		self._pid = os.getpid()
+		super().start()
+
+	def run(self):
+		try:
+			super().run()
+		finally:
+			self.done.set()
+
+	def is_alive(self):
+		# ( in a child forked meanwhile only the forking thread exists )
+		return self.ident is not None and not self.done.is_set() and self._pid == os.getpid()
+
 class _Display:
 	'''
 	Writes multiCMD's live output to sys.stdout, one write per call under one lock ( internal )
@@ -341,7 +370,7 @@ class AsyncExecutor:
 						task.thread = None
 
 	def _start_thread(self, target, args, task=None):
-		thread = threading.Thread(target=target, args=args, daemon=True)
+		thread = _Thread(target, args)
 		# registered before it starts, so it is tracked before it can report itself finished
 		with self._lock:
 			self._threads[thread] = None
@@ -505,12 +534,8 @@ class AsyncExecutor:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			for task in self.tasks:
 				task.stop = True
-			# Not wait(): on Python 3.10 - 3.12 a join() the Ctrl-C interrupted leaves the thread flagged as stopped
-			# while it still runs ( CPython bpo-45274 ), so is_alive() says it is done and wait() would return at once.
-			# Each thread tells when it is really done by reporting to _finished, which _reap() turns into an empty _threads.
-			deadline = time.monotonic() + 5
-			while self.runningThreads and time.monotonic() < deadline:
-				time.sleep(0.01)
+			# ( the interrupted wait was on a _Thread's own report, which a Ctrl-C cannot falsify, see _Thread )
+			self.wait(timeout=5)
 			raise
 		return [thread for thread in self.runningThreads if thread.is_alive()]
 	
@@ -1260,19 +1285,27 @@ def _watch(task, proc, timeout):
 
 def _join(thread, timeout=None):
 	'''
-	Join a thread in short steps ( internal )
+	Wait for a thread to finish, in short steps ( internal )
 	A plain join() blocks in C, where a KeyboardInterrupt only arrives if the signal happens to
 	land on this very thread; short steps let the waiting thread see it within 0.1s.
+	A _Thread is waited for through its own report ( done ), not Thread.join(), which an earlier
+	interrupted join can leave lying ( see _Thread ); an interrupted wait on done harms nothing.
 	@params:
-		thread: The thread to join
+		thread: The thread to wait for
 		timeout: The longest to wait, in seconds ( None: until it ends )
+	@returns:
+		bool: Whether it finished
 	'''
 	deadline = None if timeout is None else time.monotonic() + timeout
 	while thread.is_alive():
 		step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
 		if step <= 0:
-			return
-		thread.join(step)
+			return False
+		if isinstance(thread, _Thread):
+			thread.done.wait(step)
+		else:
+			thread.join(step)
+	return True
 
 def _drain(task, readers, timeout):
 	'''
@@ -1290,7 +1323,7 @@ def _drain(task, readers, timeout):
 		if timeout > 0 and time.monotonic() - task._last_output > timeout:
 			return 'timeout'
 		for reader in readers:
-			reader.join(0.05)
+			_join(reader, 0.05)
 	return None
 
 def _join_readers(readers, limit):
@@ -1491,7 +1524,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	task.start_time = time.time()
 	task._last_output = time.monotonic()
 	_register(proc, pgid)
-	readers = [threading.Thread(target=_read_stream, args=(stream, target, task, decor, quiet), daemon=True) for stream, target in streams]
+	readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
 	for reader in readers:
 		reader.start()
 	interrupted = False
@@ -1863,7 +1896,7 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 					return
 			task.thread = threading.current_thread()
 			__run_command(task, sem, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
-	workers = [threading.Thread(target=worker, daemon=True) for _ in range(min(max_threads, len(tasks)))]
+	workers = [_Thread(worker) for _ in range(min(max_threads, len(tasks)))]
 	for thread in workers:
 		thread.start()
 	try:
@@ -1979,7 +2012,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task._env = task._extra_env = None
 	elif not wait_for_return:
 		__reap_finished_threads()
-		threads = [threading.Thread(target=__run_tracked_command, args=(task,sem,timeout,quiet,False,decor,use_pty),daemon=True) for task, decor in zip(tasks, decors)]
+		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty)) for task, decor in zip(tasks, decors)]
 		# tracked before they start, so a thread is always registered before it reports itself finished
 		with __running_threads_lock:
 			__running_threads.update(threads)
@@ -2015,8 +2048,8 @@ def join_threads(threads=...,timeout=None):
 	Join threads
 
 	@params:
-		threads: The threads to join
-		timeout: The timeout
+		threads: The threads to join ( default: every fire-and-forget thread still running )
+		timeout: The longest to wait for each thread, in seconds ( None: until it ends )
 
 	@returns:
 		None
@@ -2025,7 +2058,7 @@ def join_threads(threads=...,timeout=None):
 		with __running_threads_lock:
 			threads = list(__running_threads)
 	for thread in threads:
-		thread.join(timeout=timeout)
+		_join(thread, timeout)
 	__reap_finished_threads()
 
 _EXIT_STATUS_HELP = '''exit status:

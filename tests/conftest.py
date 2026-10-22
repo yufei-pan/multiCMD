@@ -1,6 +1,8 @@
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -61,6 +63,14 @@ def launcher(request, monkeypatch):
 	else:
 		monkeypatch.setattr(multiCMD, '_HAS_PROCESS_GROUP', False)
 	return request.param
+
+
+def sigint_main_after(delay):
+	'''Send SIGINT to the main thread after delay seconds: a real Ctrl-C, which interrupts a join() blocked in C ( _thread.interrupt_main() does not )'''
+	timer = threading.Timer(delay, signal.pthread_kill, (threading.main_thread().ident, signal.SIGINT))
+	timer.daemon = True
+	timer.start()
+	return timer
 
 
 def pid_gone(pid, wait=3.0):
