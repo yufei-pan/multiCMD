@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 import time
+# ( imported here, not when a failure is recorded: that runs while a Ctrl-C is held, see _settle )
+import traceback
 from pprint import pformat
 
 #%% global vars
@@ -281,6 +283,12 @@ class _HoldCtrlC:
 	'''
 	Hold a Ctrl-C that lands while a block runs, and hand it on once the block is done ( internal )
 
+	Only multiCMD's rare paths hold one: a thread that cannot start, stopping commands, cancelling or abandoning a
+	batch, failing tasks after an error ( see _settle ). Nothing a normal run goes through does, so a normal run
+	never touches SIGINT's handler. A hold swaps it with signal.signal(), which also puts back CPython's own
+	C-level handler: one installed from C after startup ( faulthandler.register(SIGINT), an embedding runtime ) and
+	signal.siginterrupt(SIGINT, False) do not survive a hold.
+
 	Python runs signal handlers only on the main thread, so only there can a Ctrl-C ( SIGINT ) raise
 	KeyboardInterrupt. There, for as long as the block runs, SIGINT's handler is this object, which only notes the
 	Ctrl-C. Once the block is done the previous handler is put back, unless something installed another meanwhile
@@ -401,7 +409,7 @@ def _settle(step):
 	'''
 	Run step() to its end, whatever Ctrl-C lands meanwhile ( internal )
 
-	On the main thread a Ctrl-C is held while step runs and
+	For multiCMD's rare paths only ( see _HoldCtrlC ). On the main thread a Ctrl-C is held while step runs and
 	always handed on right after it: it is raised from here ( by the default handler ), so a wait the caller would
 	start next is skipped, as a second Ctrl-C during it would end it. A KeyboardInterrupt that cuts step short all
 	the same ( not a Ctrl-C: raised by another signal's handler, or injected; or on another thread ) makes it run
@@ -1248,7 +1256,7 @@ def _files_named(command, dirs):
 		if os.path.isfile(path):
 			yield path
 
-def _spawn(argv, stdout, stderr, env=None, explicit=False):
+def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	'''
 	Start a command in a process group of its own ( internal ); see _spawn_process for the arguments
 
@@ -1280,7 +1288,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	try:
-		return _spawn_process(argv, stdout, stderr, env, explicit)
+		return _spawn_process(argv, stdout, stderr, env, explicit, started=started)
 	except OSError as e:
 		if wrapped:
 			if e.errno == errno.E2BIG:
@@ -1300,7 +1308,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	for path in _files_named(command, _search_dirs(env, True)):
 		try:
 			# ( one that can run by now just runs, as it would have a moment ago )
-			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path)
+			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path, started=started)
 		except OSError as e:
 			if e.filename is None:
 				raise
@@ -1314,7 +1322,36 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 		raise PermissionError(failure.errno, failure.strerror, command)
 	raise _ExecRefused(failure.errno, failure.strerror, command)
 
-def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None):
+class _Popen(subprocess.Popen):
+	'''
+	subprocess.Popen that hands itself over as soon as it has a child that may run ( internal )
+
+	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands after the fork, while Popen waits for
+	the exec or anywhere before the Popen object is back with its caller, would lose the only handle on a command
+	that runs on in a process group of its own, which the terminal's Ctrl-C does not reach. Once the child exists
+	the Popen, with its process group id, is appended to started however Popen ends, unless the child is known to
+	be gone ( an exec that failed, already reaped ): the caller then still registers and stops it ( see _execute ).
+	'''
+	def __init__(self, args, started=None, grouped=False, **kwargs):
+		try:
+			super().__init__(args, **kwargs)
+		finally:
+			if started is not None and self._child_created and getattr(self, 'returncode', None) is None:
+				started.append((self, self.pid if grouped else None))
+
+def _popen(argv, started=None, grouped=False, **kwargs):
+	'''
+	Start a process with _Popen ( internal ); see _Popen for started and grouped
+	A subprocess.Popen replaced since multiCMD was imported ( a test double ) is called instead, and handed over once it returns.
+	'''
+	if subprocess.Popen is _Popen.__base__:
+		return _Popen(argv, started=started, grouped=grouped, **kwargs)
+	proc = subprocess.Popen(argv, **kwargs)
+	if started is not None:
+		started.append((proc, proc.pid if grouped else None))
+	return proc
+
+def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None, started=None):
 	'''
 	Start a command in a process group of its own ( internal )
 
@@ -1342,6 +1379,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 			command up in env's PATH and hands env over whole ); otherwise env, if any, only adds to what
 			is inherited and the wrapper just runs with it, as it always has
 		executable: The file to run as the command, instead of looking argv[0] up ( Popen's executable; not with the wrapper )
+		started: A list the ( Popen, process group id ) is appended to as soon as the command may run ( see _Popen )
 
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
@@ -1350,7 +1388,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	if executable is not None:
 		kwargs['executable'] = executable
 	if not _IS_POSIX:
-		return subprocess.Popen(argv, **kwargs), None
+		return _popen(argv, started=started, **kwargs), None
 	grouped = True
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
@@ -1367,7 +1405,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		grouped = False
 	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
 	try:
-		proc = subprocess.Popen(argv, **kwargs)
+		proc = _popen(argv, started=started, grouped=grouped, **kwargs)
 	finally:
 		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
@@ -1881,26 +1919,25 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	if use_pty:
 		master, slave = _open_pty(len(decor[0]))
 	proc = pgid = None
+	# the command as soon as it may run, before _spawn returns ( see _Popen )
+	started = []
 	streams = []
 	readers = []
 	interrupted = False
 	# from the spawn on, a Ctrl-C or any failure still stops the command, which runs in a process group of its own
 	try:
-		# a Ctrl-C while it starts is held until it is registered, so it is never left running unknown to kill_all()
-		# ( see _HoldCtrlC; Popen and the PATH lookup do not block for long )
-		with _HoldCtrlC():
-			if master is not None:
-				try:
-					proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit)
-				finally:
-					# only the command keeps the terminal side open, so the master sees EIO once it is gone
-					os.close(slave)
-				task._pty = True
-				streams.append((io.open(master, 'rb'), task.stdout))
-			else:
-				proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
-				streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
-			_register(proc, pgid)
+		if master is not None:
+			try:
+				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit, started)
+			finally:
+				# only the command keeps the terminal side open, so the master sees EIO once it is gone
+				os.close(slave)
+			task._pty = True
+			streams.append((io.open(master, 'rb'), task.stdout))
+		else:
+			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
+			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
+		_register(proc, pgid)
 		# started: a long-lived executor keeps its tasks, not the environments they were started with
 		task._env = task._extra_env = None
 		task.start_time = time.time()
@@ -1909,23 +1946,28 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		_start_threads(readers)
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
-		def settle():
-			if proc is not None:
-				# ( a Ctrl-C that came right after the spawn came before the registration: it is killed below, and a
-				# second Ctrl-C meanwhile leaves it to kill_all() and the exit hook )
-				with _live_procs_lock:
-					_live_procs[proc] = pgid
-			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
-			pending = streams or ([] if proc is None or master is not None else [(proc.stdout, None), (proc.stderr, None)])
-			for i, (stream, _) in enumerate(pending):
-				if i >= len(readers) or readers[i]._abandon():
-					stream.close()
+		if proc is None and started:
+			# it runs, but what cut its start short came before _spawn returned ( see _Popen )
+			proc, pgid = started[-1]
 		if master is not None and not streams:
 			# the pty's side of the command, never handed to a stream
 			try:
 				os.close(master)
 			except OSError:
 				pass
+		if proc is None:
+			# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
+			raise
+		def settle():
+			# what cut it short may have come before _register() ( right after the spawn, or inside Popen ): it is
+			# registered here, so kill_all() and the exit hook still reach it should a second Ctrl-C cut the kill short
+			with _live_procs_lock:
+				_live_procs[proc] = pgid
+			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
+			pending = streams or ([] if master is not None else [(proc.stdout, None), (proc.stderr, None)])
+			for i, (stream, _) in enumerate(pending):
+				if i >= len(readers) or readers[i]._abandon():
+					stream.close()
 		try:
 			_settle(settle)
 		except KeyboardInterrupt as ctrl_c:
@@ -1935,9 +1977,6 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				raise
 			# the first Ctrl-C, held while a failure was dealt with: from here on it is handled as any Ctrl-C
 			e = ctrl_c
-		if proc is None:
-			# it never started ( or _spawn raised )
-			raise e
 		if not isinstance(e, KeyboardInterrupt):
 			_kill_commands([(proc, pgid)], signal.SIGINT)
 			_unregister(proc)
@@ -2080,7 +2119,6 @@ def _fail_task(task, message, error, quiet=False):
 		error: The exception that says so ( its traceback goes into stderr )
 		quiet: Whether to skip showing the message
 	'''
-	import traceback
 	lines = message.split('\n')
 	record = lines + ''.join(traceback.format_exception(type(error), error, error.__traceback__)).split('\n')
 	if task.stderr[-len(record):] != record:
@@ -2332,12 +2370,17 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 def _stop_tasks(tasks):
 	'''
 	Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )
-	Every task is asked, whatever Ctrl-C lands meanwhile ( see _settle; a Ctrl-C held is raised after it ).
+	Every task is asked, whatever Ctrl-C lands meanwhile ( see _settle; a Ctrl-C held is raised after it ). With
+	every task finished or asked already ( AsyncExecutor.cleanup() after wait() ) there is nothing to stop, and
+	nothing is held.
 	'''
 	def stop():
 		for task in tasks:
 			task.stop = True
-	_settle(stop)
+	if all(task._finalized or task.stop for task in tasks):
+		stop()
+	else:
+		_settle(stop)
 
 def _stop_and_wait(tasks, threads, limit=5, forget=None):
 	'''

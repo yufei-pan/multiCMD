@@ -159,8 +159,10 @@ def test_commands_started_while_a_ctrl_c_is_held_do_not_inherit_a_blocked_or_ign
 	# the hold changes SIGINT's Python handler, never the signal mask: a caught signal is reset by exec
 	command = ['sh', '-c', 'grep -E "^Sig(Blk|Ign)" /proc/$$/status']
 	if where == 'the main thread':
-		# the spawn itself is held ( see _execute )
-		out = multiCMD.run_command(command, quiet=True)
+		# ( round 8 held the spawn itself; a normal run no longer holds anything: started inside a hold here )
+		result = []
+		multiCMD._settle(lambda: result.append(multiCMD.run_command(command, quiet=True)) if not result else None)
+		out = result[0]
 	else:
 		result = []
 		started = threading.Event()
@@ -374,16 +376,16 @@ def test_a_ctrl_c_while_the_command_starts_still_stops_it(monkeypatch, tmp_path)
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
 		result = real_spawn(*args, **kwargs)
-		# lands before the spawn has even returned
+		deadline = time.monotonic() + 5
+		while not pidfile.exists() and time.monotonic() < deadline:
+			time.sleep(0.01)
+		# lands once the command runs, before the spawn has even returned
 		_ctrl_c()
 		return result
 	monkeypatch.setattr(multiCMD, '_spawn', spawn)
 	with pytest.raises(KeyboardInterrupt):
-		multiCMD.run_command(['sh', '-c', f'echo $$ > {pidfile}; exec sleep 30'], quiet=True)
-	# before: the Ctrl-C lost the command, which ran on in its own process group, unknown to kill_all()
-	deadline = time.monotonic() + 5
-	while not pidfile.exists() and time.monotonic() < deadline:
-		time.sleep(0.01)
+		multiCMD.run_command(['sh', '-c', f'echo $$ > {pidfile}.tmp; mv {pidfile}.tmp {pidfile}; exec sleep 30'], quiet=True)
+	# before ( 5f7468d ): the Ctrl-C lost the command, which ran on in its own process group, unknown to kill_all()
 	assert pid_gone(int(pidfile.read_text()))
 	assert not multiCMD._live_procs
 
@@ -454,6 +456,90 @@ def test_a_pool_whose_workers_cannot_start_fails_every_task_whatever_cuts_it_sho
 		run_commands([['true']] * 4, max_threads=2, quiet=True)
 	# before: the tasks after the interrupted one were left with return code None
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
+
+
+# ---- review round 8: a normal run touches no signal state
+
+def _normal_runs():
+	'''A successful run through every API, the failure-free paths only'''
+	assert multiCMD.run_command(['echo', 'a'], quiet=True) == ['a']
+	assert multiCMD.run_command(['sh', '-c', 'echo $MCMD_X'], quiet=True, extra_env={'MCMD_X': 'x'}) == ['x']
+	assert multiCMD.run_command('echo b | cat', quiet=True, shell=True) == ['b']
+	if os.name != 'nt':
+		assert multiCMD.run_command(['echo', 'c'], quiet=True, pty=True) == ['c']
+	assert run_commands([['true']] * 4, max_threads=2, quiet=True, return_code_only=True) == [0] * 4
+	assert run_commands([['true']] * 3, max_threads=0, quiet=True, return_code_only=True) == [0] * 3
+	tasks = run_commands([['true']] * 3, quiet=True, wait_for_return=False, return_object=True)
+	multiCMD.join_threads()
+	assert [task.returncode for task in tasks] == [0] * 3
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	ex.run_commands([['true']] * 3)
+	ex.wait()
+	assert [task.returncode for task in ex.tasks] == [0] * 3
+	ex.cleanup()
+	# a timeout kills the command: still no hold
+	assert multiCMD.run_command(['sleep', '5'], quiet=True, timeout=0.3, return_code_only=True) == 124
+
+
+def test_a_normal_run_never_sets_a_signal_handler(monkeypatch):
+	# ( review round 8, finding 1 ) round 8 held a Ctrl-C around every spawn, swapping SIGINT's handler each time
+	calls = []
+	real = signal.signal
+	def record(signum, handler):
+		calls.append((signum, handler))
+		return real(signum, handler)
+	monkeypatch.setattr(signal, 'signal', record)
+	before = signal.getsignal(signal.SIGINT)
+	_normal_runs()
+	assert calls == []
+	assert signal.getsignal(signal.SIGINT) is before
+
+
+_C_LEVEL_PROBE = r'''
+import ctypes, faulthandler, json, os, platform, signal, struct, sys, time
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+import multiCMD
+from test_settle import _normal_runs
+def sigaction():
+	# glibc x86_64 / aarch64: sa_handler ( 8 bytes ), sa_mask ( 128 ), sa_flags ( int )
+	buf = ctypes.create_string_buffer(256)
+	assert ctypes.CDLL(None, use_errno=True).sigaction(signal.SIGINT, None, buf) == 0
+	return struct.unpack_from('Q', buf.raw, 0)[0], struct.unpack_from('i', buf.raw, 8 + 128)[0]
+dump = open(sys.argv[3], 'w')
+faulthandler.register(signal.SIGINT, file=dump, chain=True)
+signal.siginterrupt(signal.SIGINT, False)
+before = sigaction()
+_normal_runs()
+after = sigaction()
+try:
+	os.kill(os.getpid(), signal.SIGINT)
+	deadline = time.monotonic() + 2
+	while time.monotonic() < deadline:
+		pass
+	interrupted = False
+except KeyboardInterrupt:
+	interrupted = True
+dump.flush()
+print(json.dumps({'before': before, 'after': after, 'interrupted': interrupted}))
+'''
+
+
+def test_a_normal_run_leaves_a_c_level_sigint_handler_and_siginterrupt_in_place(tmp_path):
+	# ( review round 8, finding 1 ) each signal.signal() put CPython's own C handler back: faulthandler's was dropped,
+	# and SA_RESTART with it, by the first serial run_command
+	import json
+	import subprocess
+	dump = tmp_path / 'dump'
+	out = subprocess.run([sys.executable, '-c', _C_LEVEL_PROBE, os.path.dirname(multiCMD.__file__), os.path.dirname(__file__), str(dump)],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, universal_newlines=True)
+	assert out.returncode == 0, out.stderr
+	result = json.loads(out.stdout.strip().splitlines()[-1])
+	SA_RESTART = 0x10000000
+	assert result['before'][1] & SA_RESTART
+	assert result['after'] == result['before']
+	# faulthandler still dumps on a Ctrl-C, then chains to Python's handler
+	assert result['interrupted'] and 'most recent call first' in dump.read_text()
 
 
 # ---- review round 8: a held Ctrl-C is always handed on, never absorbed
@@ -602,6 +688,25 @@ def test_a_second_ctrl_c_while_a_serial_run_deals_with_the_first_ends_the_wait_f
 			multiCMD._unregister(proc)
 
 
+# ---- review round 8: what a hold records comes before the Ctrl-C it hands on
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_ctrl_c_while_a_missing_command_is_recorded_is_raised_once_it_is(monkeypatch, another_thread):
+	# ( finding 7 ) the command could not be run ( 127 ), and a Ctrl-C lands as that is recorded
+	real_cannot = multiCMD._cannot_run
+	def cannot(*args, **kwargs):
+		_ctrl_c()
+		return real_cannot(*args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_cannot_run', cannot)
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	with pytest.raises(KeyboardInterrupt) as raised:
+		multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=True)
+	assert tasks[0].returncode == 127 and len(tasks[0].stderr) == 1 and tasks[0]._finalized
+	assert isinstance(raised.value.__context__, FileNotFoundError)
+
+
 # ---- review round 8: a handler installed during a hold stays, and gets the held Ctrl-C
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
@@ -653,3 +758,26 @@ def test_a_hold_hands_the_ctrl_c_on_from_its_holder_and_keeps_nothing(another_th
 		assert signal.getsignal(signal.SIGINT) is handler
 	finally:
 		signal.signal(signal.SIGINT, previous)
+
+
+# ---- review round 8: a command whose Popen is cut short after the fork is still stopped
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
+@pytest.mark.parametrize('error', [SystemExit(143), KeyboardInterrupt()], ids=['SystemExit', 'KeyboardInterrupt'])
+def test_a_command_whose_popen_is_cut_short_after_the_fork_is_still_stopped(monkeypatch, error):
+	# ( finding 11 ) mcmd's SIGTERM handler ( SystemExit ), or a Ctrl-C, while Popen waits for the exec: the
+	# Popen object never got back, and the command ran on in its own process group, unknown to kill_all()
+	import subprocess
+	pids = []
+	real = subprocess.Popen._execute_child
+	def execute_child(self, *args, **kwargs):
+		real(self, *args, **kwargs)
+		pids.append(self.pid)
+		raise error
+	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
+	with pytest.raises(type(error)):
+		multiCMD.run_command(['sleep', '30'], quiet=True)
+	monkeypatch.undo()
+	# before ( a96b922 ): still running
+	assert pids and pid_gone(pids[0])
+	assert not multiCMD._live_procs
