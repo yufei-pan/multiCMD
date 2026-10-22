@@ -83,10 +83,11 @@ class AsyncExecutor:
 		while True:
 			try:thread,task=self._finished.popleft()
 			except IndexError:return
-			thread.join()
-			with self._lock:
-				self._threads.pop(thread,None)
-				if task is not None and task.thread is thread:task.thread=None
+			try:thread.join()
+			finally:
+				with self._lock:
+					self._threads.pop(thread,None)
+					if task is not None and task.thread is thread:task.thread=None
 	def _start_thread(self,target,args,task=None):
 		thread=threading.Thread(target=target,args=args,daemon=True)
 		with self._lock:
@@ -146,14 +147,16 @@ class AsyncExecutor:
 	def wait(self,timeout=None,threads=...):
 		deadline=None if timeout is None or timeout<0 else time.monotonic()+timeout
 		try:
+			joined=set()
 			while True:
 				pending=self.runningThreads if threads is...else list(threads)
 				for thread in pending:_join(thread,None if deadline is None else max(0,deadline-time.monotonic()))
-				if threads is not...or not pending or any(thread.is_alive()for thread in pending):break
+				if threads is not...or not pending or any(thread.is_alive()for thread in pending)or all(thread in joined for thread in pending)or deadline is not None and time.monotonic()>=deadline:break
+				joined.update(pending)
 		except KeyboardInterrupt:
 			for task in self.tasks:task.stop=True
 			self.wait(timeout=5);raise
-		return self.runningThreads
+		return[thread for thread in self.runningThreads if thread.is_alive()]
 	def stop(self,timeout=None):
 		for task in self.tasks:task.stop=True
 		self.wait(timeout);return self.tasks
@@ -512,8 +515,9 @@ def __reap_finished_threads():
 	while True:
 		try:thread=__finished_threads.popleft()
 		except IndexError:return
-		thread.join()
-		with __running_threads_lock:__running_threads.discard(thread)
+		try:thread.join()
+		finally:
+			with __running_threads_lock:__running_threads.discard(thread)
 def _split_command(command):
 	try:return shlex.split(command)
 	except ValueError as e:raise ValueError(f"cannot parse command {command!r}: {e}")from None
