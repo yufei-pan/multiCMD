@@ -581,16 +581,57 @@ def test_the_pty_pager_defaults_alone_do_not_use_the_environment_hand_over(launc
 	assert not [k for k in env if k.startswith('_MULTICMD_ENV_')]
 
 
-def test_a_command_without_env_or_extra_env_is_looked_up_in_the_parents_path_only(launcher, monkeypatch, tmp_path):
-	if launcher == 'native':
-		pytest.skip('Popen decides this on 3.11+')
+def test_an_empty_path_is_the_current_directory_for_every_call(launcher, monkeypatch, tmp_path):
+	# as os.get_exec_path() gives it ( and os.execvp, 1.54's wrapper and Popen use it ): [''], the current directory
 	_tool(tmp_path)
 	monkeypatch.chdir(tmp_path)
 	monkeypatch.setenv('PATH', '')
-	# an empty PATH finds nothing, as before; the current directory is not searched
+	assert os.get_exec_path() == ['']
 	for pty in (False, True):
-		task = run_command(['mcmd-env-tool'], quiet=True, pty=pty, return_object=True)
-		assert task.returncode == 127
+		for kwargs in ({}, {'extra_env': {'A': '1'}}, {'env': {'PATH': ''}}):
+			task = run_command(['mcmd-env-tool'], quiet=True, pty=pty, return_object=True, **kwargs)
+			assert (task.returncode, task.stdout) == (0, ['found']), (pty, kwargs, task.stderr)
+	(tmp_path / 'mcmd-env-tool').unlink()
+	assert run_command(['mcmd-env-tool'], quiet=True, return_code_only=True) == 127
+
+
+def test_the_wrapper_pre_check_stops_at_the_first_file(launcher, monkeypatch, tmp_path):
+	if launcher == 'native':
+		pytest.skip("the pre-check is the exec wrapper's")
+	dirs = [tmp_path / f'd{i}' for i in range(30)]
+	for d in dirs:
+		d.mkdir()
+		_tool(d)
+	monkeypatch.setenv('PATH', os.pathsep.join(map(str, dirs)))
+	real_isfile = os.path.isfile
+	looked = []
+	def isfile(path):
+		if os.path.basename(path) == 'mcmd-env-tool':
+			looked.append(path)
+		return real_isfile(path)
+	monkeypatch.setattr(os.path, 'isfile', isfile)
+	assert run_command(['mcmd-env-tool'], quiet=True) == ['found']
+	assert looked == [str(dirs[0] / 'mcmd-env-tool')]
+
+
+@pytest.mark.skipif(sys.platform != 'linux', reason='MAX_ARG_STRLEN is Linux')
+def test_a_bare_name_too_big_to_exec_is_not_tried_again_per_path_entry(launcher, monkeypatch, tmp_path):
+	# E2BIG does not depend on which file runs: every other one in PATH would fail the same way
+	dirs = [tmp_path / f'd{i}' for i in range(5)]
+	for d in dirs:
+		d.mkdir()
+		_tool(d)
+	monkeypatch.setenv('PATH', os.pathsep.join(map(str, dirs)))
+	real = multiCMD._spawn_process
+	calls = []
+	def spawn(*args, **kwargs):
+		calls.append(kwargs.get('executable'))
+		return real(*args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_spawn_process', spawn)
+	# one argument longer than MAX_ARG_STRLEN ( 128 KiB )
+	task = run_command(['mcmd-env-tool', 'x' * 200000], quiet=True, return_object=True)
+	assert task.returncode == 126 and not task._error and 'Argument list too long' in task.stderr[0]
+	assert calls == [None]
 
 
 def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, monkeypatch):

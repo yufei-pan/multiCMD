@@ -77,8 +77,8 @@ _PGROUP_EXEC = (
 	"\tos.execve(f,a[2:],v)\n"
 	"try:\n"
 	"\tif os.sep in c:x(c)\n"
-	# a bare name: try the regular files by that name in PATH in turn, as sh does ( see _spawn ); the first failure
-	# other than ENOENT / ENOTDIR says why it cannot run, and without one it is not found
+	# a bare name: try the regular files by that name in the PATH directories in turn ( see _spawn ); the first
+	# failure other than ENOENT / ENOTDIR says why it cannot run, and without one it is not found
 	"\tp=os.environ.get('PATH') if v is None else v.get(b'PATH')\n"
 	"\tr=None\n"
 	"\tfor d in os.fsdecode(os.defpath if p is None else p).split(os.pathsep):\n"
@@ -972,16 +972,24 @@ def _uses_wrapper():
 	return _IS_POSIX and not _HAS_PROCESS_GROUP and bool(sys.executable) and not getattr(sys, 'frozen', False)
 
 def _search_dirs(env, explicit):
-	'''The directories a bare command name is looked up in ( internal )'''
+	'''
+	The directories a bare command name is looked up in, as os.get_exec_path() gives them ( internal ):
+	the PATH of the command's environment split on os.pathsep, os.defpath when it has none; an empty
+	entry, and so an empty PATH, is the current directory ( see _files_named )
+	'''
 	if explicit:
-		# Popen looks in the PATH of the command's environment ( the default path when that has none )
-		return [d or os.curdir for d in os.get_exec_path(env)]
+		# ( env may hold bytes names, which os.get_exec_path() handles )
+		return os.get_exec_path(env)
+	# without its warnings.catch_warnings(), which is not thread-safe: env is os.environ, or a copy of it
 	path = (env if env is not None else os.environ).get('PATH')
-	return os.defpath.split(os.pathsep) if path is None else path.split(os.pathsep) if path else []
+	return (os.defpath if path is None else path).split(os.pathsep)
 
-def _candidates(command, dirs):
-	'''The regular files by that name in dirs, in order: what sh tries to run for a bare command name ( internal )'''
-	return [path for path in (os.path.join(d or os.curdir, command) for d in dirs) if os.path.isfile(path)]
+def _files_named(command, dirs):
+	'''The regular files by that name in dirs, in order and one at a time ( internal ); '' is the current directory'''
+	for d in dirs:
+		path = os.path.join(d or os.curdir, command)
+		if os.path.isfile(path):
+			yield path
 
 def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	'''
@@ -989,10 +997,16 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 
 	This is where a failure to start is told apart, as a shell does:
 	- a command that is not found is FileNotFoundError ( 127 ), one that may not be executed PermissionError ( 126 );
-	- a bare name ( no '/' ) is looked up in PATH as sh does ( and os.execvpe, but for what is not a regular file ): each
-	  regular file by that name is tried in turn ( a directory, a FIFO, or an entry that cannot be searched holds none ),
-	  and the first failure other than ENOENT / ENOTDIR decides ( EACCES is PermissionError, ENOEXEC and the like
-	  _ExecRefused ); without one, or without any such file, the command is not found, wherever the PATH search ended;
+	- a bare name ( no '/' ) is looked up in the directories of the PATH of the environment the command gets, as
+	  os.get_exec_path() gives them ( no PATH: os.defpath; an empty entry, or an empty PATH, is the current
+	  directory ), in order, trying only the regular files by that name ( a directory, a FIFO, or an entry that
+	  cannot be searched holds none ). The first failure other than ENOENT / ENOTDIR decides ( EACCES is
+	  PermissionError, ENOEXEC and the like _ExecRefused ); without one, or without any such file, the command is
+	  not found, named as given. This is os.execvpe()'s rule, which reports the last error when no other decides,
+	  but for the files it skips; it is not exactly any shell's: dash reports the last error other than ENOENT,
+	  bash searches nothing for an empty PATH, and both run a file that fails with ENOEXEC as a shell script,
+	  which multiCMD does not ( subprocess never did ): such a file cannot be executed ( 126 ).
+	  E2BIG ( the arguments and environment are too big ) does not depend on the file: it decides at once;
 	- any other failure to exec the command ( ENOEXEC, E2BIG, ELOOP of its path, ... ) is _ExecRefused ( 126 );
 	- a failure to start multiCMD's own launcher ( the exec wrapper's interpreter, fork, pipes ) is never the
 	  command's: it stays an internal error whose message and traceback say what went wrong. Only E2BIG is the
@@ -1004,7 +1018,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 	command = argv[0]
 	wrapped = _uses_wrapper()
 	bare = _IS_POSIX and os.sep not in command
-	if wrapped and bare and not _candidates(command, _search_dirs(env, explicit)):
+	if wrapped and bare and next(_files_named(command, _search_dirs(env, explicit)), None) is None:
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	try:
@@ -1020,18 +1034,20 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False):
 		if e.filename is None:
 			# not the command's exec that failed ( fork, pipes, ... )
 			raise
-		if not bare:
+		if not bare or e.errno == errno.E2BIG:
 			if isinstance(e, (FileNotFoundError, PermissionError)):
 				raise
 			raise _ExecRefused(e.errno, e.strerror, e.filename) from None
 	failure = None
-	for path in _candidates(command, _search_dirs(env, True)):
+	for path in _files_named(command, _search_dirs(env, True)):
 		try:
 			# ( one that can run by now just runs, as it would have a moment ago )
 			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path)
 		except OSError as e:
 			if e.filename is None:
 				raise
+			if e.errno == errno.E2BIG:
+				raise _ExecRefused(e.errno, e.strerror, command) from None
 			if failure is None and not isinstance(e, (FileNotFoundError, NotADirectoryError)):
 				failure = e
 	if failure is None:
