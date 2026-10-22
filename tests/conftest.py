@@ -1,3 +1,4 @@
+import contextlib
 import os
 import signal
 import subprocess
@@ -65,12 +66,54 @@ def launcher(request, monkeypatch):
 	return request.param
 
 
-def sigint_main_after(delay):
-	'''Send SIGINT to the main thread after delay seconds: a real Ctrl-C, which interrupts a join() blocked in C ( _thread.interrupt_main() does not )'''
-	timer = threading.Timer(delay, signal.pthread_kill, (threading.main_thread().ident, signal.SIGINT))
-	timer.daemon = True
+@contextlib.contextmanager
+def sigint_main_after(*delays):
+	'''
+	Send SIGINT to the main thread after each delay, in seconds from now: a real Ctrl-C, which interrupts a join()
+	blocked in C ( _thread.interrupt_main() does not ). The body must end with the KeyboardInterrupt, raised on:
+	on the way out no further SIGINT is sent ( one sent meanwhile is taken here, not by a later test or pytest ),
+	and the test fails if the body returned first or ended before every SIGINT was sent.
+	'''
+	main = threading.main_thread().ident
+	lock = threading.Lock()
+	state = {'cancelled': False, 'sent': 0}
+	cancelled = threading.Event()
+
+	def send():
+		start = time.monotonic()
+		for delay in delays:
+			if cancelled.wait(max(0, start + delay - time.monotonic())):
+				return
+			with lock:
+				if state['cancelled']:
+					return
+				state['sent'] += 1
+				signal.pthread_kill(main, signal.SIGINT)
+
+	timer = threading.Thread(target=send, daemon=True)
 	timer.start()
-	return timer
+	outcome = 'returned'
+	try:
+		yield
+	except KeyboardInterrupt:
+		outcome = 'interrupted'
+		raise
+	finally:
+		sent_by_then, stray = state['sent'], 0
+		while True:
+			try:
+				with lock:
+					state['cancelled'] = True
+				cancelled.set()
+				timer.join()
+				break
+			except KeyboardInterrupt:
+				# sent while the body was ending: it is taken here
+				stray += 1
+		if outcome == 'returned':
+			pytest.fail(f'the call returned before the SIGINT at {delays[sent_by_then] if sent_by_then < len(delays) else delays[-1]}s')
+		if sent_by_then < len(delays) or stray:
+			pytest.fail(f'the call ended after {sent_by_then} of the {len(delays)} SIGINTs ( at {delays}s )')
 
 
 def pid_gone(pid, wait=3.0):

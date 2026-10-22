@@ -352,13 +352,40 @@ def _started_thread(task):
 	return task.thread
 
 
+def test_sigint_helper_fails_a_call_that_returns_first_and_sends_nothing_later():
+	start = time.monotonic()
+	with pytest.raises(pytest.fail.Exception, match='returned before the SIGINT'):
+		with sigint_main_after(0.3):
+			pass
+	# the timer is gone: no SIGINT lands after the block ( this sleep would take it )
+	time.sleep(0.5)
+	assert time.monotonic() - start < 0.3 + 0.5 + 0.2
+
+
+def test_sigint_helper_fails_a_call_that_ends_before_every_sigint():
+	with pytest.raises(pytest.fail.Exception, match='after 1 of the 2 SIGINTs'):
+		with sigint_main_after(0.1, 0.5):
+			time.sleep(5)
+	time.sleep(0.6)
+
+
+def test_sigint_helper_delivers_each_sigint():
+	caught = []
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.1, 0.3):
+		try:
+			time.sleep(5)
+		except KeyboardInterrupt:
+			caught.append(time.monotonic())
+		time.sleep(5)
+	assert len(caught) == 1
+
+
 def test_an_interrupted_join_does_not_make_a_running_thread_look_finished():
 	release = threading.Event()
 	thread = multiCMD._Thread(release.wait, (10,))
 	thread.start()
-	sigint_main_after(0.2)
 	try:
-		with pytest.raises(KeyboardInterrupt):
+		with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
 			thread.join()
 		assert thread.is_alive()
 		assert not multiCMD._join(thread, 0.2)
@@ -373,8 +400,7 @@ def test_wait_and_stop_after_an_interrupted_join_still_wait_for_the_command():
 	ex = AsyncExecutor(max_threads=1, quiet=True)
 	task = ex.run_command(['sleep', '1'])
 	thread = _started_thread(task)
-	sigint_main_after(0.2)
-	with pytest.raises(KeyboardInterrupt):
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
 		thread.join()
 	assert thread in ex.wait(timeout=0.1)
 	assert task.is_alive() and task.returncode is None
@@ -382,8 +408,7 @@ def test_wait_and_stop_after_an_interrupted_join_still_wait_for_the_command():
 	assert task.returncode == 0 and not task.is_alive()
 	task = ex.run_command(['sleep', '30'])
 	thread = _started_thread(task)
-	sigint_main_after(0.2)
-	with pytest.raises(KeyboardInterrupt):
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
 		thread.join()
 	ex.stop()
 	assert task.returncode is not None and not task.is_alive()
@@ -394,8 +419,7 @@ def test_wait_and_stop_after_an_interrupted_join_still_wait_for_the_command():
 @pytest.mark.slow
 def test_join_threads_after_an_interrupted_one_still_waits():
 	task = multiCMD.run_command(['sleep', '1'], quiet=True, wait_for_return=False, return_object=True)
-	sigint_main_after(0.2)
-	with pytest.raises(KeyboardInterrupt):
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.2):
 		multiCMD.join_threads()
 	assert task.is_alive() and task.returncode is None
 	multiCMD.join_threads()

@@ -112,8 +112,7 @@ def test_ctrl_c_while_draining_keeps_the_output_already_read(monkeypatch):
 		time.sleep(0.3)
 		target.extend(got)
 	monkeypatch.setattr(multiCMD, '_read_stream', late_reader)
-	sigint_main_after(0.5)
-	with pytest.raises(KeyboardInterrupt):
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.5):
 		run_command(['sh', '-c', 'echo out; exec 2>&-; sleep 30 & exit 0'], quiet=True)
 	assert seen[0].stdout == ['out']
 

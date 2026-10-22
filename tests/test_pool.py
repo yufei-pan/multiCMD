@@ -81,9 +81,8 @@ def test_ctrl_c_in_a_pool_waits_for_a_command_slow_to_die(monkeypatch):
 		tasks.extend(built[0])
 		return built
 	monkeypatch.setattr(multiCMD, '_build_tasks', build)
-	sigint_main_after(0.7)
 	start = time.monotonic()
-	with pytest.raises(KeyboardInterrupt):
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.7):
 		run_commands([['sh', '-c', 'trap "" INT TERM; sleep 30'], ['sleep', '30']], max_threads=2, quiet=True)
 	# the first one dies only to SIGKILL, a second after the stop
 	assert time.monotonic() - start >= 1.5
