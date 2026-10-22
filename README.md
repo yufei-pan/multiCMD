@@ -306,7 +306,10 @@ objects and its message lists each one with its return code and last error line.
 runs; each command is printed once, quoted so it can be pasted into a shell.
 A command that is not found (return code 127), cannot be executed (126) or that multiCMD
 itself could not run (-1, `task._error`) says why in its `task.stderr`; multiCMD also
-prints that on stderr, unless `quiet=True`.
+prints a line saying so on stderr, unless `quiet=True`. Before Python 3.11 the exec of a
+command given by its path, or of a file found in `PATH` that may not be executed, happens in
+the launcher's process: it exits 127 / 126 with the reason as the command's own stderr, which
+then shows with the command's output ( unless quiet ) instead of as a line of multiCMD's own.
 
 ### Asynchronous / fire-and-forget
 
