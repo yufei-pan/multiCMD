@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,types
+import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time
 from pprint import pformat
 version='1.54'
 __version__=version
@@ -70,7 +70,7 @@ class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None):
 		self.max_threads=max_threads
 		if semaphore is...:semaphore=threading.Semaphore(max_threads)
-		self.semaphore=semaphore;self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self.shell=shell;self.prefix=prefix;self.color=color;self.pty=pty;given=extra_env;env,extra_env=_check_env(env,'env'),_check_env(extra_env,'extra_env',allow_none=True);self.env=None if env is None else env.copy();self.extra_env=None if given is None else{}if extra_env is None else extra_env.copy();self._lock=threading.Lock();self._queue=collections.deque();self._dispatching=False;self._threads={};self._finished=collections.deque()
+		self.semaphore=semaphore;self.tasks=[];self.timeout=timeout;self.quiet=quiet;self.dry_run=dry_run;self.parse=parse;self.shell=shell;self.prefix=prefix;self.color=color;self.pty=pty;env,extra=_check_env(env,'env',drop_empty=True),_check_env(extra_env,'extra_env',allow_none=True);self.env=None if env is None else env.copy();self.extra_env=None if extra_env is None else dict(extra or{});self._lock=threading.Lock();self._queue=collections.deque();self._dispatching=False;self._threads={};self._finished=collections.deque()
 	def __iter__(self):return iter(self.tasks)
 	def __repr__(self):return f"AsyncExecutor(max_threads={self.max_threads}, semaphore={self.semaphore}, runningThreads={self.runningThreads}, tasks={self.tasks}, timeout={self.timeout}, quiet={self.quiet}, dry_run={self.dry_run}, parse={self.parse})"
 	def __str__(self):return str(self.tasks)
@@ -113,7 +113,7 @@ class AsyncExecutor:
 					task._env=task._extra_env=None;continue
 				self._reap()
 				try:self._start_thread(_run_executor_task,(task,_HeldPermit(sem),timeout,quiet,dry_run,self._finished,decor,use_pty),task)
-				except BaseException:sem.release();raise
+				except BaseException:sem.release();task._env=task._extra_env=None;raise
 		except BaseException:
 			with self._lock:self._dispatching=False
 			raise
@@ -163,7 +163,9 @@ class AsyncExecutor:
 		self.wait(timeout);return self.tasks
 	def cleanup(self,timeout=None):
 		self.stop(timeout)
-		with self._lock:self.tasks=[];self._queue.clear();self._threads.clear()
+		with self._lock:
+			for entry in self._queue:entry[0]._env=entry[0]._extra_env=None
+			self.tasks=[];self._queue.clear();self._threads.clear()
 		return self.tasks
 	def join(self,timeout=None,threads=...,print_error=True):
 		self.wait(timeout=timeout,threads=threads)
@@ -277,31 +279,37 @@ def set_sudo(use_sudo):
 	elif SUDO_PATH:USE_SUDO=True
 	else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);USE_SUDO=False
 class _ExecRefused(OSError):0
+_NOT_FOUND_ERRNOS={errno.ENOTDIR,errno.ENAMETOOLONG,errno.ELOOP}
+def _uses_wrapper():return _IS_POSIX and not _HAS_PROCESS_GROUP and bool(sys.executable)and not getattr(sys,'frozen',False)
+def _search_dirs(env,explicit):
+	if explicit:return[d or os.curdir for d in os.get_exec_path(env)]
+	path=(env if env is not None else os.environ).get('PATH');return os.defpath.split(os.pathsep)if path is None else path.split(os.pathsep)if path else[]
+def _candidate_exists(command,dirs):return any(os.path.isfile(os.path.join(d or os.curdir,command))for d in dirs)
 def _spawn(argv,stdout,stderr,env=None,explicit=False):
+	command=argv[0];wrapped=_uses_wrapper();bare=_IS_POSIX and os.sep not in command;dirs=_search_dirs(env,explicit)if bare else None
+	if wrapped and bare:
+		if shutil.which(command,path=os.pathsep.join(dirs))is None and not _candidate_exists(command,dirs):raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
 	try:return _spawn_process(argv,stdout,stderr,env,explicit)
-	except(FileNotFoundError,PermissionError):raise
 	except OSError as e:
-		if e.filename is None:raise
+		if wrapped:
+			if e.errno==errno.E2BIG:raise _ExecRefused(e.errno,e.strerror,command)from None
+			if isinstance(e,(FileNotFoundError,PermissionError)):raise RuntimeError('cannot start the exec wrapper %r: %s'%(sys.executable,e))from e
+			raise
+		if bare and e.errno in _NOT_FOUND_ERRNOS and not _candidate_exists(command,dirs):raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)from None
+		if isinstance(e,(FileNotFoundError,PermissionError))or e.filename is None:raise
 		raise _ExecRefused(e.errno,e.strerror,e.filename)from None
 def _spawn_process(argv,stdout,stderr,env=None,explicit=False):
 	kwargs={'stdin':subprocess.DEVNULL,'stdout':stdout,'stderr':stderr,'env':env}
 	if not _IS_POSIX:return subprocess.Popen(argv,**kwargs),None
-	grouped=True;command=argv[0]
+	grouped=True
 	if _HAS_PROCESS_GROUP:kwargs['process_group']=0
-	elif sys.executable and not getattr(sys,'frozen',False):
-		if os.sep not in command:
-			if explicit:search_path=os.pathsep.join(d or os.curdir for d in os.get_exec_path(env))
-			else:search_path=(env if env is not None else os.environ).get('PATH')
-			if shutil.which(command,path=search_path)is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
+	elif _uses_wrapper():
 		count='-'
-		if explicit:entries=[os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()];kwargs['env']=dict(item for item in _snapshot(os.environb)if item[0]);kwargs['env'].update((os.fsencode(_ENV_VAR+str(i)),entry)for(i,entry)in enumerate(entries));count=str(len(entries))
+		if explicit:entries=[os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()];kwargs['env']=dict(_snapshot(os.environb,drop_empty=True));kwargs['env'].update((os.fsencode(_ENV_VAR+str(i)),entry)for(i,entry)in enumerate(entries));count=str(len(entries))
 		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count]+list(argv)
 	else:grouped=False
 	old_mask=signal.pthread_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS)
 	try:proc=subprocess.Popen(argv,**kwargs)
-	except OSError as e:
-		if e.errno==errno.E2BIG and argv[0]!=command:raise OSError(e.errno,e.strerror,command)
-		raise
 	finally:signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
 	return proc,proc.pid if grouped else None
 def _stdout_isatty():
@@ -413,9 +421,10 @@ def _drain(task,readers,timeout):
 def _join_readers(readers,limit):
 	deadline=None if limit is None else time.monotonic()+limit
 	for reader in readers:_join(reader,None if deadline is None else max(0,deadline-time.monotonic()))
-def _snapshot(mapping):
+def _snapshot(mapping,drop_empty=False):
 	items=[]
 	for key in list(mapping):
+		if drop_empty and not key:continue
 		try:items.append((key,mapping[key]))
 		except KeyError:pass
 	return items
@@ -425,11 +434,20 @@ def _env_text(value,what):
 		try:return os.fsdecode(value)
 		except TypeError:pass
 	raise TypeError(f"{what} must be a str{''if os.name=='nt'else', bytes or os.PathLike'}, not {type(value).__name__}")
-def _check_env(mapping,name,allow_none=False):
+class _EnvSnapshot(collections.abc.Mapping):
+	__slots__='_data',
+	def __init__(self,data):self._data=data
+	def __getitem__(self,key):return self._data[key]
+	def __iter__(self):return iter(self._data)
+	def __len__(self):return len(self._data)
+	def __repr__(self):return'_EnvSnapshot(%r)'%(self._data,)
+	def __reduce__(self):return _EnvSnapshot,(self._data,)
+	def copy(self):return dict(self._data)
+def _check_env(mapping,name,allow_none=False,drop_empty=False):
 	if mapping is None:return
 	if not isinstance(mapping,collections.abc.Mapping):raise TypeError(f"{name} must be a mapping of variable names to values, not {type(mapping).__name__}")
 	env={}
-	for(key,value)in _snapshot(mapping):
+	for(key,value)in _snapshot(mapping,drop_empty=drop_empty):
 		key=_env_text(key,f"{name}: variable name")
 		if not key or'\x00'in key or'='in key[os.name=='nt':]:raise ValueError(f"{name}: invalid variable name {key!r}")
 		if value is not None or not allow_none:
@@ -441,7 +459,7 @@ def _check_env(mapping,name,allow_none=False):
 				if value is not None:os.fsencode(value)
 			except UnicodeEncodeError as e:raise ValueError(f"{name}[{key!r}] cannot be encoded: {e}")from None
 		env[key]=value
-	return types.MappingProxyType(env)if env or not allow_none else None
+	return _EnvSnapshot(env)if env or not allow_none else None
 def _apply_extra_env(env,extra_env):
 	names={key.upper():key for key in env}if os.name=='nt'else None
 	for(key,value)in extra_env.items():
@@ -455,7 +473,7 @@ def _child_env(task,pager=False):
 	base,extra=task._env,task._extra_env
 	if base is None and extra is None and not pager:return
 	if base is None:
-		env=dict(item for item in _snapshot(os.environ)if item[0]or extra is None)
+		env=dict(_snapshot(os.environ,drop_empty=extra is not None))
 		if pager:env.update(PAGER='cat',GIT_PAGER='cat')
 	elif extra is None and not pager:return base.copy()
 	else:
@@ -552,7 +570,7 @@ def _build_tasks(commands,parse=False,use_sudo=...,shell=False,env=None,extra_en
 	variables={};formatedCommands=[]
 	for command in commands:formatedCommands.extend(__format_command(command,expand=parse,shell=shell,variables=variables))
 	if use_sudo:formatedCommands=[[SUDO_PATH]+command for command in formatedCommands]
-	env=_check_env(env,'env');extra_env=_check_env(extra_env,'extra_env',allow_none=True);tasks=[Task(command)for command in formatedCommands]
+	env=_check_env(env,'env',drop_empty=True);extra_env=_check_env(extra_env,'extra_env',allow_none=True);tasks=[Task(command)for command in formatedCommands]
 	for task in tasks:task._env=env;task._extra_env=extra_env
 	return tasks,bool(use_sudo)
 def _validate_sudo():
