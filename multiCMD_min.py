@@ -156,7 +156,9 @@ class AsyncExecutor:
 				joined.update(pending)
 		except KeyboardInterrupt:
 			for task in self.tasks:task.stop=True
-			self.wait(timeout=5);raise
+			deadline=time.monotonic()+5
+			while self.runningThreads and time.monotonic()<deadline:time.sleep(.01)
+			raise
 		return[thread for thread in self.runningThreads if thread.is_alive()]
 	def stop(self,timeout=None):
 		for task in self.tasks:task.stop=True
