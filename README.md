@@ -405,7 +405,7 @@ SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
 arrives), can call `multiCMD.kill_all()` from its handler. A Ctrl-C (or a signal handler's
 exception) that lands while a command starts never loses it: on the main thread, where Python
 raises those, each command is started from a short-lived helper thread that registers it before
-handing it back (about 15-100 µs per command), so it is always stopped with the others.
+handing it back (some 15-55 µs per command), so it is always stopped with the others.
 
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). A Ctrl-C that lands while multiCMD does its bookkeeping on the rare paths (a thread that
