@@ -1917,19 +1917,24 @@ class _Handoff:
 			return self.result
 		return None
 
-def _start_command(task, use_pty, decor, explicit, handoff):
+def _start_command(task, use_pty, decor, quiet, explicit, handoff):
 	'''
-	Open a pty ( with use_pty ), start the task's command and register it ( internal; a _Handoff's start )
-	The command and the streams its output is read from go on the handoff as ( Popen, process group id,
-	[( stream, target list )] ) as soon as it exists, before it is registered. The pty's side is wrapped in a file
-	object before anything starts, and only ever closed through it.
+	Open a pty ( with use_pty ), start the task's command, register it and start its output readers ( internal; a
+	_Handoff's start )
+	The command goes on the handoff as ( Popen, process group id, [( stream, target list )], [reader _Thread] ) as
+	soon as it exists, before it is registered and before its readers start. The pty's side is wrapped in a file
+	object before anything starts, and only ever closed through it. The readers start here too, so a serial run's
+	main thread starts no thread at all: Thread.start() takes threading's own lock with `with`, which a Ctrl-C can
+	leave held on Python 3.6 - 3.9 and 3.14, and every thread then hangs as it ends.
 	'''
 	master = slave = None
+	readers = []
 	if use_pty:
 		master, slave = _open_pty(len(decor[0]))
 	if master is None:
 		proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit)
-		handoff.result = (proc, pgid, [(proc.stdout, task.stdout), (proc.stderr, task.stderr)])
+		streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
+		handoff.result = (proc, pgid, streams, readers)
 	else:
 		try:
 			reader = io.open(master, 'rb')
@@ -1943,19 +1948,28 @@ def _start_command(task, use_pty, decor, explicit, handoff):
 			os.close(slave)
 			reader.close()
 			raise
-		handoff.result = (proc, pgid, [(reader, task.stdout)])
+		streams = [(reader, task.stdout)]
+		handoff.result = (proc, pgid, streams, readers)
 		# only the command keeps the terminal side open, so the master sees EIO once it is gone
 		os.close(slave)
 		task._pty = True
 	_register(proc, pgid)
+	# started: a long-lived executor keeps its tasks, not the environments they were started with
+	task._env = task._extra_env = None
+	task.start_time = time.time()
+	task._last_output = time.monotonic()
+	readers.extend(_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams)
+	_start_threads(readers)
 
 def _undo_start(started):
 	'''Stop a command whose start came back after its caller gave up waiting for it ( internal; a _Handoff's undo )'''
-	proc, pgid, streams = started
+	proc, pgid, streams, readers = started
 	_kill_commands([(proc, pgid)], signal.SIGINT)
 	_unregister(proc)
-	for stream, _ in streams:
-		stream.close()
+	# a stream no reader reads is closed here ( a reader closes its own )
+	for i, (stream, _) in enumerate(streams):
+		if i >= len(readers) or readers[i]._abandon():
+			stream.close()
 
 def _stop_command(proc, pgid):
 	'''
@@ -1999,24 +2013,18 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	handoff = _Handoff()
 	# from the start on, an interrupt or any failure still stops the command, which runs in a process group of its own
 	try:
-		proc, pgid, streams = handoff.run(lambda handoff: _start_command(task, use_pty, decor, explicit, handoff), _undo_start)
-		# started: a long-lived executor keeps its tasks, not the environments they were started with
-		task._env = task._extra_env = None
-		task.start_time = time.time()
-		task._last_output = time.monotonic()
-		readers.extend(_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams)
-		_start_threads(readers)
+		proc, pgid, streams, readers = handoff.run(lambda handoff: _start_command(task, use_pty, decor, quiet, explicit, handoff), _undo_start)
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		first = e
 		cut = None
 		def settle():
-			nonlocal proc, pgid, streams
+			nonlocal proc, pgid, streams, readers
 			# what cut it short may have come before the start was back here: the command is the handoff's
 			started = handoff.take()
 			if started is None:
 				return
-			proc, pgid, streams = started
+			proc, pgid, streams, readers = started
 			# registered here too ( the start registers it, unless that was cut short ), so kill_all() and the exit
 			# hook reach it whatever cuts the kill short
 			_live_procs[proc] = pgid

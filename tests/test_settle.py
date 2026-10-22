@@ -7,6 +7,7 @@ import signal
 import sys
 import threading
 import time
+import _thread
 
 import pytest
 
@@ -798,10 +799,11 @@ def _left_running(before, wait=3.0):
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
 @pytest.mark.parametrize('ctrl_cs', [1, 2])
-def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch, ctrl_cs):
+def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch, request, ctrl_cs):
 	# ( review of round 9, blockers 1 and 2; probe rv9/orphan.py ) a real SIGINT from another thread lands
-	# anywhere in the start ( 0-0.5 ms after it begins ): as _fork_exec / posix_spawn returned ( before Popen stored the pid ), Popen lost the
-	# command, which ran on in its own process group ( 14 of 16 such Ctrl-Cs on 3.13 at 0e4d015 ). A second one
+	# anywhere in the start ( 0-0.5 ms after it begins ): as _fork_exec / posix_spawn returned ( before Popen
+	# stored the pid ), Popen lost the command, which ran on in its own process group ( 14 of 16 such Ctrl-Cs on
+	# 3.13 at 0e4d015 ). A second one
 	# right after, while the first is dealt with, ended the wait without stopping the command, and when it was
 	# pending as that began, left the command unregistered too
 	import random
@@ -815,15 +817,21 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 				inside.append(not self.done.flag)
 			return real_take(self)
 		monkeypatch.setattr(multiCMD._Handoff, 'take', take)
-	swallowed = []
+	# whether each Ctrl-C landed in a finalizer: a __del__ or a weakref callback, or pytest's report of one dropped
+	landed = []
+	def handler(signum, frame):
+		names = []
+		while frame is not None:
+			names.append(frame.f_code.co_name if 'unraisable' not in frame.f_code.co_filename else 'unraisable')
+			frame = frame.f_back
+		landed.append((bool({'__del__', '_remove', 'unraisable'} & set(names)), names[:12]))
+		raise KeyboardInterrupt
+	previous = signal.signal(signal.SIGINT, handler)
+	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
 	if hasattr(sys, 'unraisablehook'):
-		real_hook = sys.unraisablehook
-		def hook(unraisable):
-			if isinstance(unraisable.exc_value, KeyboardInterrupt):
-				swallowed.append(unraisable)
-			else:
-				real_hook(unraisable)
-		monkeypatch.setattr(sys, 'unraisablehook', hook)
+		# those dropped KeyboardInterrupts are expected here: not pytest's to report ( a second Ctrl-C landing in
+		# its report fails the test )
+		monkeypatch.setattr(sys, 'unraisablehook', lambda unraisable: None)
 	spawning = threading.Event()
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
@@ -832,38 +840,43 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 	monkeypatch.setattr(multiCMD, '_spawn', spawn)
 	before = _children()
 	lost = []
-	returned = 0
 	for _ in range(100):
 		# ( a spawn takes some 50 us: the timer's own wake-up takes about as long )
 		first = random.choice([0, random.uniform(0, 0.0005)])
 		delays = [first] + ([first + random.uniform(0, 0.002)] if ctrl_cs == 2 else [])
 		spawning.clear()
+		sent = []
 		def send():
-			# from the moment the spawn begins ( however long getting there took, under load )
-			spawning.wait(1)
-			start = time.monotonic()
-			for delay in delays:
-				time.sleep(max(0, start + delay - time.monotonic()))
-				signal.pthread_kill(main, signal.SIGINT)
-		timer = threading.Thread(target=send)
+			try:
+				# from the moment the spawn begins ( however long getting there took, under load )
+				spawning.wait(1)
+				start = time.monotonic()
+				for delay in delays:
+					time.sleep(max(0, start + delay - time.monotonic()))
+					signal.pthread_kill(main, signal.SIGINT)
+			finally:
+				sent.append(1)
+		del landed[:]
 		try:
 			try:
-				# ( a Ctrl-C may land while the timer starts: then nothing starts )
-				timer.start()
+				# ( a bare thread: Thread.start() and join() take threading's own locks with `with`, which a Ctrl-C
+				# can leave held on 3.6 - 3.9 and 3.14, and every thread then hangs as it ends )
+				_thread.start_new_thread(send, ())
 				multiCMD.run_command(['sleep', '3'], quiet=True)
 			finally:
 				while True:
 					try:
-						timer.join()
+						while not sent:
+							time.sleep(0.001)
 						break
 					except KeyboardInterrupt:
 						pass
 		except KeyboardInterrupt:
 			pass
 		else:
-			# CPython drops a KeyboardInterrupt its handler raises inside a weakref callback or a __del__ ( a
-			# Thread collected on the main thread ): that Ctrl-C never reached multiCMD
-			returned += 1
+			# CPython drops a KeyboardInterrupt its handler raises inside a __del__ or a weakref callback ( a Popen or
+			# a Thread collected on the main thread ): that Ctrl-C never reached multiCMD, and it is the only excuse
+			assert landed and all(ok for ok, _ in landed), landed
 		lost.extend(_left_running(before))
 		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
 		with multiCMD._live_procs_lock:
@@ -875,11 +888,12 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		if lost:
 			break
 	for pid in lost:
-		os.killpg(pid, signal.SIGKILL)
+		try:
+			os.killpg(pid, signal.SIGKILL)
+		except OSError:
+			pass
 	# before ( 0e4d015 ): a command started, unknown to kill_all(), left running
 	assert lost == []
-	# every call that was not interrupted lost its Ctrl-C to CPython, not to multiCMD
-	assert returned <= (len(swallowed) if hasattr(sys, 'unraisablehook') else 3)
 	if hasattr(multiCMD, '_Handoff'):
 		assert any(inside), 'no Ctrl-C landed while the command started'
 
@@ -960,3 +974,19 @@ def test_a_ctrl_c_that_thread_start_turns_into_another_error_is_still_raised(mon
 		multiCMD.run_command(['sleep', '2'], quiet=True)
 	# before: the command ran to its end and the call returned
 	assert time.monotonic() - started < 1.5 and not multiCMD._live_procs
+
+
+def test_a_serial_run_starts_no_thread_from_the_main_thread(monkeypatch):
+	# ( found with the free-threaded stress loops ) Thread.start() takes threading's _active_limbo_lock with `with`,
+	# which a Ctrl-C can leave held on 3.6 - 3.9 and 3.14: every thread then hangs as it ends ( seen on 3.14t )
+	starters = []
+	real_start = threading.Thread.start
+	def start(self):
+		starters.append(threading.current_thread() is threading.main_thread())
+		real_start(self)
+	monkeypatch.setattr(threading.Thread, 'start', start)
+	assert multiCMD.run_command(['echo', 'a'], quiet=True) == ['a']
+	if os.name != 'nt':
+		assert multiCMD.run_command(['echo', 'b'], quiet=True, pty=True) == ['b']
+	# before: its output readers were started there
+	assert starters and not any(starters)
