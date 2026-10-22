@@ -272,10 +272,15 @@ def _wait_in_thread(ex, timeout):
 def test_interrupted_reap_leaves_no_dead_thread_behind():
 	ex = AsyncExecutor(max_threads=2, quiet=True)
 	task = ex.run_command(['true'])
-	deadline = time.monotonic() + 5
-	while not ex._finished and time.monotonic() < deadline:
+	# the task's own thread, not the dispatcher's ( which finishes first ): the join to interrupt is the one that reaps it
+	deadline = time.monotonic() + 10
+	while time.monotonic() < deadline:
+		thread = task.thread
+		if thread is not None and any(entry[0] is thread for entry in list(ex._finished)):
+			break
 		time.sleep(0.01)
-	thread = ex._finished[0][0]
+	else:
+		raise AssertionError('the task thread never reported itself finished')
 	_interrupt_join(thread)
 	with pytest.raises(KeyboardInterrupt):
 		ex.runningThreads
