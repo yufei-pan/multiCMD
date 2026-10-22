@@ -34,9 +34,9 @@ __running_threads = set()
 __running_threads_lock = threading.Lock()
 # fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
 __finished_threads = collections.deque()
-# before 3.9.8 a Thread.join() that a Ctrl-C interrupts right after it took the thread's tstate lock leaves the
-# lock held, and every later Thread.join() without a timeout blocks for good ( bpo-45274 )
-_JOIN_MAY_HANG = sys.version_info < (3, 9, 8)
+# before 3.9.8, and on 3.10.0, a Thread.join() that a Ctrl-C interrupts right after it took the thread's tstate lock
+# leaves the lock held, and every later Thread.join() without a timeout blocks for good ( bpo-45274, fixed in 3.9.8 and 3.10.1 )
+_JOIN_MAY_HANG = sys.version_info < (3, 9, 8) or sys.version_info[:3] == (3, 10, 0)
 
 # immutable helpers compiled once at import time
 _BRACKET_RX   = re.compile(r'\[([^\]]+)\]')

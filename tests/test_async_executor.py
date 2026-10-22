@@ -1,5 +1,6 @@
 import _thread
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -714,7 +715,16 @@ def test_abandon_gives_the_same_answer_after_a_ctrl_c_cut_it_short():
 	assert not thread._runs()
 
 
-@pytest.mark.skipif(sys.version_info >= (3, 9, 8), reason='the held tstate lock of bpo-45274 needs Python < 3.9.8')
+@pytest.mark.parametrize('version, may_hang', [((3, 9, 7), True), ((3, 9, 8), False), ((3, 10, 0), True), ((3, 10, 1), False), ((3, 13, 0), False)])
+def test_join_may_hang_where_the_bpo_45274_fix_is_missing(version, may_hang):
+	# the fix is in 3.9.8 and 3.10.1: 3.10.0 still leaves the tstate lock held
+	code = ('import sys; sys.version_info = %r + ("final", 0); sys.path.insert(0, %r); import multiCMD; print(multiCMD._JOIN_MAY_HANG)'
+		% (version, os.path.dirname(multiCMD.__file__)))
+	out = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, check=True, universal_newlines=True).stdout
+	assert out.strip() == str(may_hang)
+
+
+@pytest.mark.skipif(not multiCMD._JOIN_MAY_HANG, reason='the held tstate lock of bpo-45274 needs Python < 3.9.8 or 3.10.0')
 def test_a_join_after_an_interrupted_one_left_the_tstate_lock_held_does_not_block():
 	thread = multiCMD._Thread(time.sleep, (0.1,))
 	thread.start()
