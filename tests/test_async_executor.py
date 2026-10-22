@@ -720,6 +720,50 @@ def test_abandon_gives_the_same_answer_after_a_ctrl_c_cut_it_short():
 	assert not _runs(thread)
 
 
+def test_a_waiter_interrupted_while_it_holds_the_done_lock_blocks_nobody():
+	# ( review of round 9, finding 3 ) a KeyboardInterrupt right after a waiter took the done primitive's lock
+	release = threading.Event()
+	thread = multiCMD._Thread(release.wait, (10,))
+	thread.start()
+	done = thread.done
+	if isinstance(done, threading.Event):
+		# before ( 0e4d015 ): right after Condition.__enter__ took the Event's lock
+		done._cond.acquire()
+	release.set()
+	if not isinstance(done, threading.Event):
+		assert done.wait(5)
+		# right after a waiter's acquire() got the wake lock, before it let it go
+		assert done._wake.acquire(True, 1)
+	joined = []
+	joiner = threading.Thread(target=lambda: joined.append(multiCMD._join(thread, 5)), daemon=True)
+	started = time.monotonic()
+	joiner.start()
+	joiner.join(10)
+	# before: the worker's own done.set() blocked for good, and so did every join
+	assert joined == [True] and time.monotonic() - started < 1
+	assert not thread.is_alive() and done.wait(0.5)
+	# set again ( an _abandon() asked again ): nothing to release twice
+	done.set()
+	assert not thread._abandon()
+
+
+def test_done_is_set_once_and_wakes_every_waiter():
+	done = multiCMD._Done()
+	assert not done.is_set() and not done.wait(0.05)
+	woke = []
+	waiters = [threading.Thread(target=lambda: woke.append(done.wait(5)), daemon=True) for _ in range(4)]
+	for waiter in waiters:
+		waiter.start()
+	time.sleep(0.05)
+	started = time.monotonic()
+	done.set()
+	done.set()
+	for waiter in waiters:
+		waiter.join(5)
+	assert woke == [True] * 4 and time.monotonic() - started < 0.5
+	assert done.is_set() and done.wait(0)
+
+
 @pytest.mark.parametrize('version, may_hang', [((3, 9, 7), True), ((3, 9, 8), False), ((3, 10, 0), True), ((3, 10, 1), False), ((3, 13, 0), False)])
 def test_join_may_hang_where_the_bpo_45274_fix_is_missing(version, may_hang):
 	# the fix is in 3.9.8 and 3.10.1: 3.10.0 still leaves the tstate lock held

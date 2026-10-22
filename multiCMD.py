@@ -202,6 +202,53 @@ class _HeldPermit:
 		self.semaphore.release()
 		return False
 
+class _Done:
+	'''
+	A flag that is set once, and that threads can wait for ( internal ): a threading.Event no interrupt can jam
+
+	threading.Event waits and sets under a Condition, whose Python-level __enter__ takes its lock in C and
+	returns: a KeyboardInterrupt landing in between ( on the main thread ) leaves that lock held for good, and
+	every later set() or wait() then blocks ( seen on free-threaded 3.13t; the window exists on every CPython ).
+	Here flag is the state, and the bare lock _wake is only there to wake waiters early: it is held from the
+	start, and set() stores flag, then releases _wake, once ( setdefault() says which set() does: an unlocked lock
+	cannot be released again ). A waiter never holds it with `with`: it tries to take it for one 0.1 s step at a
+	time, lets it go at once when it got it, and looks at flag after every step. A lock a waiter was interrupted
+	holding, or that a set() cut short never released, only costs the other waiters one step each.
+	@attributes:
+		flag: Whether it is set ( bool )
+	'''
+	def __init__(self):
+		self.flag = False
+		self._wake = threading.Lock()
+		self._wake.acquire()
+		# ( who releases _wake: the first set() to get there )
+		self._released = {}
+
+	def is_set(self):
+		return self.flag
+
+	def set(self):
+		self.flag = True
+		mine = object()
+		if self._released.setdefault('by', mine) is mine:
+			self._wake.release()
+
+	def wait(self, timeout=None):
+		'''
+		Wait until it is set, up to timeout seconds ( None: for as long as it takes ), in 0.1 s steps
+		@returns:
+			bool: Whether it is set
+		'''
+		deadline = None if timeout is None else time.monotonic() + timeout
+		while not self.flag:
+			step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
+			if step <= 0:
+				return False
+			if self._wake.acquire(True, step):
+				# ( only to wake up: the next waiter gets it at once )
+				self._wake.release()
+		return True
+
 class _Thread(threading.Thread):
 	'''
 	A daemon thread that reports itself done, for every thread multiCMD starts and waits for ( internal )
@@ -221,14 +268,15 @@ class _Thread(threading.Thread):
 	to its target yet; whoever meant to start it abandons it when it did not ( see _start_threads ). Whichever
 	comes first, run() or _abandon(), decides whether the target runs, so the answer never depends on timing
 	afterwards, and _abandon() gives the same answer however often it is asked, a Ctrl-C between two included.
+	done is a _Done, not a threading.Event, so no interrupt can leave it blocking anyone.
 	@attributes:
 		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
-		done: Set once the target has returned or raised, or the thread was abandoned
+		done: Set once the target has returned or raised, or the thread was abandoned ( a _Done )
 	'''
 	def __init__(self, target, args=(), task=None):
 		super().__init__(target=target, args=args, daemon=True)
 		self.task = task
-		self.done = threading.Event()
+		self.done = _Done()
 		# ( in a child forked meanwhile only the forking thread exists )
 		self._pid = os.getpid()
 		# who decided whether the target runs: 'run' or 'abandon'. setdefault() is one atomic step that also
@@ -262,11 +310,11 @@ class _Thread(threading.Thread):
 			self.done.set()
 
 	def is_alive(self):
-		return not self.done.is_set() and self._pid == os.getpid()
+		return not self.done.flag and self._pid == os.getpid()
 
 	def join(self, timeout=None):
 		deadline = None if timeout is None else time.monotonic() + timeout
-		while not self.done.is_set():
+		while not self.done.flag:
 			step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
 			if step <= 0 or self._pid != os.getpid():
 				return
