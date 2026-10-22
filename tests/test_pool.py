@@ -211,4 +211,8 @@ def test_a_second_ctrl_c_while_the_pool_starts_still_stops_every_command(monkeyp
 	with pytest.raises(KeyboardInterrupt):
 		run_commands([['sleep', '0.3']] * 12, max_threads=4, quiet=True)
 	assert all(task.stop for task in tasks)
+	# the interrupt that cut the stop short is a second one: it ends the wait, and the workers stop the commands
+	deadline = time.monotonic() + 5
+	while multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.05)
 	assert not multiCMD._live_procs
