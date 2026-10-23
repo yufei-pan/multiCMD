@@ -2335,7 +2335,7 @@ def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(l
 		proc = procs[0]
 		if not multiCMD._wait_all([(proc, None)], 2):
 			registered = proc in multiCMD._live_procs
-			if registered and state['tripped'][1] in bare:
+			if registered and state['tripped'] is not None and state['tripped'][1] in bare:
 				excused.append(state['tripped'])
 			else:
 				# before ( 3c0e49b ): registered and running, by one raised as `task.stderr.append('Timeout!')` returned
@@ -2393,7 +2393,7 @@ def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_
 		proc, pgid = spawned[0]
 		if _group_running(pgid, 2):
 			tracked = proc in multiCMD._live_procs or proc in multiCMD._draining
-			if tracked and state['tripped'][1] in bare:
+			if tracked and state['tripped'] is not None and state['tripped'][1] in bare:
 				excused.append(state['tripped'])
 			else:
 				# before ( 3c0e49b ): by one raised as _unregister() or _poll() returned, in neither registry; on 3.10 by

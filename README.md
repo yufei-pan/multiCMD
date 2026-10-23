@@ -424,10 +424,11 @@ begun to deal with it, is raised before multiCMD has registered the command (one
 call waits for a running command leaves it registered but not signalled: `kill_all()` and the exit hook
 still reach it), and on 3.6-3.9, where Python raises a Ctrl-C at nearly any instruction, a second one at a
 few other moments of that handling can do the same, and even a first one, at a few instructions between the
-steps of a run, can leave a command registered but not signalled. From Python 3.11 no window is known where a
-Ctrl-C loses a command. On every Python, two Ctrl-Cs at nearly the same moment, the first cutting short the stop
+steps of a run, can leave a command registered but not signalled. From Python 3.11 no other window is known where
+a Ctrl-C loses a command. On every Python, two Ctrl-Cs at nearly the same moment, the first cutting short the stop
 of a command that timed out or of what a finished command left running with its output open, can leave that
-registered but not signalled (`kill_all()` and the exit hook still reach it).
+not signalled: `kill_all()` still reaches it, and so does the exit hook, except on Python 3.6-3.10 for what a
+finished command left running, which can then outlive the program.
 On Python 3.6-3.9 and 3.14 a Ctrl-C that lands just as Python's `threading` takes one of its own
 locks with `with` (as `Thread.start()` does, for a serial run's output readers too) can leave that
 lock held, and the program then hangs as its threads end. That is CPython's own, and any threaded
@@ -514,7 +515,7 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   a finished command's background processes still hold open, no longer leaves the command or those
   processes running unknown to `kill_all()` and the exit hook, or known to them but never signalled.
   A second Ctrl-C ends the wait for the commands at once; each is still sent SIGTERM, and `kill_all()`
-  and the exit hook finish the kill. Both but for the limits below.
+  and the exit hook finish the kill. The limits below are the exceptions.
 - Once the interpreter exits, a command queued on one of multiCMD's threads that has not started fails
   with -1 ("not started: the interpreter is exiting") instead of starting and outliving the program.
 - A command still running a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the
@@ -526,7 +527,9 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   signalled; on 3.6-3.9 a second one at a few other moments can lose it too, and a first one at a few
   instructions can leave it registered but not signalled. On every Python, two Ctrl-Cs at nearly the same
   moment, the first cutting short the stop of a timed-out command or of a finished command's background
-  processes, can leave them registered but not signalled. On Python 3.6-3.9 and 3.14 a Ctrl-C just as
+  processes, can leave them not signalled: `kill_all()` still reaches them, and so does the exit hook, except
+  on Python 3.6-3.10 for a finished command's background processes, which can then outlive the program. On
+  Python 3.6-3.9 and 3.14 a Ctrl-C just as
   `threading` takes one of its own locks can leave that lock held and hang the program as its threads end
   (CPython's own).
 
