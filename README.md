@@ -423,7 +423,8 @@ Ctrl-C that lands while the first is still on its way out of the command's start
 begun to deal with it, is raised before multiCMD has registered the command (one that lands so while a
 call waits for a running command leaves it registered but not signalled: `kill_all()` and the exit hook
 still reach it), and on 3.6-3.9, where Python raises a Ctrl-C at nearly any instruction, a second one at a
-few other moments of that handling can do the same. From Python 3.11 no such window is known.
+few other moments of that handling can do the same, and even a first one, at a few instructions between the
+steps of a run, can leave a command registered but not signalled. From Python 3.11 no such window is known.
 On Python 3.6-3.9 and 3.14 a Ctrl-C that lands just as Python's `threading` takes one of its own
 locks with `with` (as `Thread.start()` does, for a serial run's output readers too) can leave that
 lock held, and the program then hangs as its threads end. That is CPython's own, and any threaded
@@ -518,7 +519,8 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   a command's fork returns, before `Popen` has stored the pid, still loses the command, as in 1.54
   (serial runs only, some 60-150 µs per command); on Python 3.6-3.10 a second Ctrl-C right after a
   first one that lands as a command starts can lose it too, and on 3.6-3.9 a second one at a few other
-  moments; on Python 3.6-3.9 and 3.14 a Ctrl-C just as `threading` takes one of its own locks can
+  moments, or a first one at a few instructions leaves it registered but not signalled; on Python 3.6-3.9
+  and 3.14 a Ctrl-C just as `threading` takes one of its own locks can
   leave that lock held and hang the program as its threads end (CPython's own).
 
 ## License
