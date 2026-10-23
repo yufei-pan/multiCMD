@@ -861,13 +861,16 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	# per Ctrl-C: whether it landed in a finalizer ( a __del__ or a weakref callback, or pytest's report of one
 	# dropped ), whether inside the fork, and where
 	landed = []
+	# whether a Ctrl-C raises: only while a run goes on ( one that lands after it is only recorded )
+	armed = [False]
 	def handler(signum, frame):
 		names = []
 		while frame is not None:
 			names.append(frame.f_code.co_name if 'unraisable' not in frame.f_code.co_filename else 'unraisable')
 			frame = frame.f_back
 		landed.append((bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
-		raise KeyboardInterrupt
+		if armed[0]:
+			raise KeyboardInterrupt
 	previous = signal.signal(signal.SIGINT, handler)
 	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
 	if hasattr(sys, 'unraisablehook'):
@@ -924,19 +927,17 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 			try:
 				# ( a bare thread: Thread.start() and join() take threading's own locks with `with`, which a Ctrl-C
 				# can leave held on 3.6 - 3.9 and 3.14, and every thread then hangs as it ends )
+				armed[0] = True
 				_thread.start_new_thread(send, ())
 				multiCMD.run_command(['sleep', '3'], quiet=True)
 			finally:
-				# until every SIGINT is sent and its handler has run ( two sent close together may come as one: up to 1 s ),
-				# so none lands after this run, outside it
+				# a Ctrl-C from here on is only recorded ( none raises outside the run, where nothing would take it );
+				# wait until every SIGINT is sent and its handler has run ( two sent close together may come as one: up
+				# to 1 s )
+				armed[0] = False
 				waited = time.monotonic() + 1
-				while True:
-					try:
-						while not sent or (len(landed) < len(delays) and time.monotonic() < waited):
-							time.sleep(0.001)
-						break
-					except KeyboardInterrupt:
-						pass
+				while not sent or (len(landed) < len(delays) and time.monotonic() < waited):
+					time.sleep(0.001)
 		except KeyboardInterrupt:
 			pass
 		else:
