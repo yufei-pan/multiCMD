@@ -325,3 +325,31 @@ def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, cap
 		proc.kill()
 		multiCMD.join_threads(timeout=5)
 	assert ran[0].returncode == -signal.SIGKILL
+
+
+@pytest.mark.skipif(not multiCMD._CAN_PEEK, reason='needs os.waitid() with WNOWAIT')
+def test_a_command_reaped_outside_popen_while_its_lock_is_jammed_is_recorded_as_popen_does(launcher):
+	# ( review of round 11, finding 4; probe echild_probe.py ) SIGCHLD ignored has the kernel reap the command: with
+	# its Popen lock jammed, os.waitid() then raised ECHILD and _poll() returned None for ever, so every wait ran to
+	# its timeout and every kill_all() cost 2 s
+	previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+	try:
+		proc, pgid = multiCMD._spawn(['sleep', '0.2'], subprocess.DEVNULL, subprocess.DEVNULL)
+		multiCMD._register(proc, pgid)
+		try:
+			_jam(proc)
+			# ( the kernel has reaped it by then )
+			assert pid_gone(proc.pid)
+			time.sleep(0.3)
+			started = time.monotonic()
+			# before ( fc0c782 ): False after 2 s, returncode None
+			assert multiCMD._wait_all([(proc, pgid)], 2) and proc.returncode == 0
+			assert time.monotonic() - started < multiCMD._JAMMED_AFTER + 0.5
+			started = time.monotonic()
+			multiCMD.kill_all()
+			# before: still registered, and each kill_all() took 2 s or more
+			assert proc not in multiCMD._live_procs and time.monotonic() - started < 0.5
+		finally:
+			multiCMD._live_procs.pop(proc, None)
+	finally:
+		signal.signal(signal.SIGCHLD, previous)

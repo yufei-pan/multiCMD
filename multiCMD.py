@@ -1452,6 +1452,9 @@ def _poll(proc):
 	kill_all() as it lands in an interrupted Popen.wait() or poll(), which holds that lock and is about to reap, would
 	leave it ECHILD, which Popen records as returncode 0. Another thread holds the lock for real only for the
 	microseconds of one poll, and finds the returncode set as it goes on. The lock itself is only looked at.
+	A command reaped outside Popen ( SIGCHLD ignored, which has the kernel reap it; a waitpid() of the program's
+	own ) is no longer a child to reap ( ECHILD ): poll() records returncode 0 then, as its status is lost, and so
+	does this, once the lock has kept poll() from it for _JAMMED_AFTER seconds.
 	'''
 	returncode = proc.poll()
 	if returncode is not None or not _CAN_PEEK:
@@ -1463,19 +1466,24 @@ def _poll(proc):
 	if state is None:
 		# still running
 		return None
-	if state == 'gone':
-		# reaped meanwhile, by whoever holds the lock
-		return proc.returncode
 	now = time.monotonic()
 	# ( since when poll() is kept from it: an exited command whose lock is free is reaped by poll() itself )
 	if now - proc.__dict__.setdefault('_multicmd_unreaped_since', now) < _JAMMED_AFTER or _in_subprocess():
-		return None
-	try:
-		pid, status = os.waitpid(proc.pid, os.WNOHANG)
-	except OSError:
+		# ( 'gone': reaped meanwhile by whoever holds the lock, which sets returncode as it goes on )
 		return proc.returncode
-	if pid == proc.pid and proc.returncode is None:
-		proc.returncode = _exit_code(status)
+	if state == 'exited':
+		try:
+			pid, status = os.waitpid(proc.pid, os.WNOHANG)
+		except ChildProcessError:
+			state = 'gone'
+		except OSError:
+			return proc.returncode
+		else:
+			if pid == proc.pid and proc.returncode is None:
+				proc.returncode = _exit_code(status)
+	if state == 'gone' and proc.returncode is None:
+		# reaped outside Popen: its status is lost, and Popen records 0 then ( Popen._internal_poll, on ECHILD )
+		proc.returncode = 0
 	return proc.returncode
 
 def _stdout_isatty():
@@ -1658,7 +1666,9 @@ def _kill_commands(commands, first_signal, quiet=False):
 	members and up to 1s more. Every signal goes to the whole process group, and each step goes to
 	every command before waiting, so the total stays near 2s however many commands there are.
 	Windows: terminate(), up to 1s, kill(), up to 1s.
-	A command still running after all that is no longer tracked ( see _give_up_on ).
+	A command still running after all that is no longer tracked ( see _give_up_on ), and one that is reaped leaves
+	the registry, as its own call has it do once it is reaped ( a command recorded as reaped outside Popen, see
+	_poll, or one whose call has gone, would otherwise cost every later kill_all() a look ).
 
 	@params:
 		commands: ( Popen, process group id | None ) pairs
@@ -1684,6 +1694,8 @@ def _kill_commands(commands, first_signal, quiet=False):
 						pass
 			if not _wait_all(commands, 1):
 				_give_up_on(commands, quiet)
+		for proc, _ in commands:
+			_unregister(proc)
 		return
 	for proc, pgid in commands:
 		_send(proc, pgid, first_signal)
@@ -1697,6 +1709,8 @@ def _kill_commands(commands, first_signal, quiet=False):
 		_send(proc, pgid, signal.SIGKILL)
 	if not _wait_all(leftovers, 1):
 		_give_up_on(leftovers, quiet)
+	for proc, _ in commands:
+		_unregister(proc)
 
 def kill_all(sig=None):
 	'''
