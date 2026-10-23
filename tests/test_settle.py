@@ -798,47 +798,75 @@ def _describe(pid):
 def _left_running(before, wait=6.0):
 	'''
 	The children started since before that still run after up to wait seconds, or that are dead but neither
-	reaped nor registered ( kill_all() and the exit hook reap what is registered ). A start the helper undoes is
-	stopped within about 3 s: up to 1 s for take() to give up, then the kill's 2 s; wait leaves room for load.
+	reaped nor registered ( kill_all() and the exit hook reap what is registered ). A command cut short as it starts
+	is stopped within about 2 s ( the kill ); wait leaves room for load.
 	'''
 	deadline = time.monotonic() + wait
 	while True:
-		with multiCMD._live_procs_lock:
-			registered = {proc.pid for proc in multiCMD._live_procs.copy()}
+		registered = {proc.pid for proc in multiCMD._live_procs.copy()}
 		left = {pid for pid in _children() - before if not _zombie(pid) or pid not in registered}
 		if not left or time.monotonic() > deadline:
 			return left
 		time.sleep(0.02)
 
 
+def _hook_the_fork(monkeypatch, in_fork, forked):
+	'''
+	Have in_fork[0] say whether the main thread is inside the C call that forks a command: _fork_exec ( Python 3.11+ ),
+	_posixsubprocess.fork_exec ( 3.6 - 3.10 ) or os.posix_spawn. Set before it, cleared once it has returned ( and its
+	pid is appended to forked ), so a Ctrl-C whose handler sees it set was raised as that call returned, before Popen
+	could store the pid. Nothing after the clear can raise it before Popen has the pid.
+	'''
+	import _posixsubprocess
+	import subprocess
+	def hooked(real):
+		def fork(*args, **kwargs):
+			in_fork[0] = True
+			try:
+				pid = real(*args, **kwargs)
+				forked.append(pid)
+			finally:
+				in_fork[0] = False
+			return pid
+		return fork
+	if hasattr(subprocess, '_fork_exec'):
+		monkeypatch.setattr(subprocess, '_fork_exec', hooked(subprocess._fork_exec))
+	else:
+		monkeypatch.setattr(_posixsubprocess, 'fork_exec', hooked(_posixsubprocess.fork_exec))
+	if hasattr(os, 'posix_spawn'):
+		monkeypatch.setattr(os, 'posix_spawn', hooked(os.posix_spawn))
+
+
+# on Python 3.6 - 3.9 and 3.14 a Ctrl-C right after a C lock's acquire in a `with lock:` leaves the lock held, and
+# Thread.start() takes threading's own _active_limbo_lock so: every thread then hangs as it ends ( CPython's own, see
+# the README ). The stress test below keeps its Ctrl-Cs out of the output readers' Thread.start() there: one that would
+# land inside it is taken right after it
+_WITH_MAY_JAM = sys.version_info < (3, 10) or sys.version_info >= (3, 14)
+
+
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
 @pytest.mark.parametrize('ctrl_cs', [1, 2])
-def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch, request, ctrl_cs):
-	# ( review of round 9, blockers 1 and 2; probe rv9/orphan.py ) a real SIGINT from another thread lands
-	# anywhere in the start ( 0-0.5 ms after it begins ): as _fork_exec / posix_spawn returned ( before Popen
-	# stored the pid ), Popen lost the command, which ran on in its own process group ( 14 of 16 such Ctrl-Cs on
-	# 3.13 at 0e4d015 ). A second one
-	# right after, while the first is dealt with, ended the wait without stopping the command, and when it was
-	# pending as that began, left the command unregistered too
+def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launcher, monkeypatch, request, ctrl_cs):
+	# a real SIGINT from another thread lands anywhere in the start ( 0-0.5 ms after the spawn begins ), and in the
+	# second variant another one 0-2 ms later, while the first is dealt with. A command is lost ( it runs on in its
+	# own process group, unknown to kill_all() ) only when the Ctrl-C was raised as the fork returned, before Popen
+	# stored the pid, as in 1.54 ( see _execute ). Anywhere else, inside Popen after the fork included ( see _Popen ),
+	# it is registered and stopped: before ( 0e4d015 had that; the helper start of fe8fa40 is reverted ) nothing
+	# else may be lost, and what a second Ctrl-C left registered is dead
 	import random
 	main = threading.main_thread().ident
-	inside = []
-	if hasattr(multiCMD, '_Handoff'):
-		real_take = multiCMD._Handoff.take
-		def take(self):
-			if not self._waited:
-				# whether the Ctrl-C landed while the main thread waited for the start
-				inside.append(not self.done.flag)
-			return real_take(self)
-		monkeypatch.setattr(multiCMD._Handoff, 'take', take)
-	# whether each Ctrl-C landed in a finalizer: a __del__ or a weakref callback, or pytest's report of one dropped
+	in_fork = [False]
+	forked = []
+	_hook_the_fork(monkeypatch, in_fork, forked)
+	# per Ctrl-C: whether it landed in a finalizer ( a __del__ or a weakref callback, or pytest's report of one
+	# dropped ), whether inside the fork, and where
 	landed = []
 	def handler(signum, frame):
 		names = []
 		while frame is not None:
 			names.append(frame.f_code.co_name if 'unraisable' not in frame.f_code.co_filename else 'unraisable')
 			frame = frame.f_back
-		landed.append((bool({'__del__', '_remove', 'unraisable'} & set(names)), names[:12]))
+		landed.append((bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
 		raise KeyboardInterrupt
 	previous = signal.signal(signal.SIGINT, handler)
 	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
@@ -846,19 +874,38 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		# those dropped KeyboardInterrupts are expected here: not pytest's to report ( a second Ctrl-C landing in
 		# its report fails the test )
 		monkeypatch.setattr(sys, 'unraisablehook', lambda unraisable: None)
+	if _WITH_MAY_JAM:
+		real_start = threading.Thread.start
+		def start(self):
+			if getattr(self, '_target', None) is multiCMD._read_stream:
+				old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+				try:
+					real_start(self)
+				finally:
+					signal.pthread_sigmask(signal.SIG_SETMASK, old)
+			else:
+				real_start(self)
+		monkeypatch.setattr(threading.Thread, 'start', start)
 	spawning = threading.Event()
+	# per run: whether _spawn returned
+	spawned = []
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
 		spawning.set()
-		return real_spawn(*args, **kwargs)
+		result = real_spawn(*args, **kwargs)
+		spawned.append(True)
+		return result
 	monkeypatch.setattr(multiCMD, '_spawn', spawn)
 	before = _children()
-	lost = []
+	# the children lost and not excused; those lost inside the fork; the runs cut short between the fork and the end of
+	# the spawn ( where _Popen hands the command over )
+	lost, forks, recovered = [], [], []
 	for _ in range(100):
-		# ( a spawn takes some 50 us: the timer's own wake-up takes about as long )
+		# ( a spawn takes some 60 - 150 us: the timer's own wake-up takes about as long )
 		first = random.choice([0, random.uniform(0, 0.0005)])
 		delays = [first] + ([first + random.uniform(0, 0.002)] if ctrl_cs == 2 else [])
 		spawning.clear()
+		del spawned[:], forked[:]
 		sent = []
 		def send():
 			try:
@@ -890,13 +937,27 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 		else:
 			# CPython drops a KeyboardInterrupt its handler raises inside a __del__ or a weakref callback ( a Popen or
 			# a Thread collected on the main thread ): that Ctrl-C never reached multiCMD, and it is the only excuse
-			assert landed and all(ok for ok, _ in landed), landed
-		lost.extend(_left_running(before))
+			assert landed and all(dropped for dropped, _, _ in landed), landed
+		inside = any(inside for _, inside, _ in landed)
+		left = _left_running(before, wait=0 if inside else 6.0)
+		if inside and len(left) <= 1:
+			# the one window that loses a command: kill it, and reap it ( nothing else holds it )
+			forks.extend(left)
+			for pid in left:
+				try:
+					os.killpg(pid, signal.SIGKILL)
+				except OSError:
+					os.kill(pid, signal.SIGKILL)
+				os.waitpid(pid, 0)
+		else:
+			lost.extend(left)
+		if forked and not spawned and not inside and landed:
+			# cut short after the fork, before _spawn returned ( see _Popen ), and still stopped
+			recovered.append(1)
 		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
-		with multiCMD._live_procs_lock:
-			left = list(multiCMD._live_procs.copy())
-		assert ctrl_cs == 2 or not left
-		for proc in left:
+		left_registered = list(multiCMD._live_procs.copy())
+		assert ctrl_cs == 2 or not left_registered
+		for proc in left_registered:
 			proc.wait(5)
 			multiCMD._unregister(proc)
 		if lost:
@@ -908,10 +969,9 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 				kill(pid, signal.SIGKILL)
 			except OSError:
 				pass
-	# before ( 0e4d015 ): a command started, unknown to kill_all(), left running
-	assert described == []
-	if hasattr(multiCMD, '_Handoff'):
-		assert any(inside), 'no Ctrl-C landed while the command started'
+	# before ( this test with 0e4d015's _Popen gone ): a command cut short inside Popen after the fork, or before the
+	# spawn returned, left running unknown to kill_all()
+	assert described == [], (len(forks), len(recovered))
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
@@ -990,19 +1050,3 @@ def test_a_ctrl_c_that_thread_start_turns_into_another_error_is_still_raised(mon
 		multiCMD.run_command(['sleep', '2'], quiet=True)
 	# before: the command ran to its end and the call returned
 	assert time.monotonic() - started < 1.5 and not multiCMD._live_procs
-
-
-def test_a_serial_run_starts_no_thread_from_the_main_thread(monkeypatch):
-	# ( found with the free-threaded stress loops ) Thread.start() takes threading's _active_limbo_lock with `with`,
-	# which a Ctrl-C can leave held on 3.6 - 3.9 and 3.14: every thread then hangs as it ends ( seen on 3.14t )
-	starters = []
-	real_start = threading.Thread.start
-	def start(self):
-		starters.append(threading.current_thread() is threading.main_thread())
-		real_start(self)
-	monkeypatch.setattr(threading.Thread, 'start', start)
-	assert multiCMD.run_command(['echo', 'a'], quiet=True) == ['a']
-	if os.name != 'nt':
-		assert multiCMD.run_command(['echo', 'b'], quiet=True, pty=True) == ['b']
-	# before: its output readers were started there
-	assert starters and not any(starters)

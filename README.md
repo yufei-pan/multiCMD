@@ -402,10 +402,19 @@ it too), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
 commands still running when the interpreter exits are killed. A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
-arrives), can call `multiCMD.kill_all()` from its handler. A Ctrl-C (or a signal handler's
-exception) that lands while a command starts never loses it: on the main thread, where Python
-raises those, each command is started from a short-lived helper thread that registers it before
-handing it back (some 15-55 µs per command), so it is always stopped with the others.
+arrives), can call `multiCMD.kill_all()` from its handler.
+
+A Ctrl-C (or a signal handler's exception, such as a SIGTERM handler's `sys.exit()`) that lands
+while a command starts stops it like any other, from the moment `Popen` knows the child's pid.
+One that lands while the command is being forked can leave it running unregistered, as in 1.54:
+Python raises it as the fork returns, before `Popen` has stored the pid, so neither the call nor
+`kill_all()` nor the exit hook knows the command, which runs on in its own process group. Python
+raises those on the main thread only, so this concerns serial runs (`max_threads=1`); and the
+window is the fork's own length, some 60-150 µs per command however long it then runs.
+On Python 3.6-3.9 and 3.14 a Ctrl-C that lands just as Python's `threading` takes one of its own
+locks with `with` (as `Thread.start()` does, for a serial run's output readers too) can leave that
+lock held, and the program then hangs as its threads end. That is CPython's own, and any threaded
+program can meet it; Python 3.10-3.13 do not leave the lock held.
 
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). A Ctrl-C that lands while multiCMD does its bookkeeping on the rare paths (a thread that
