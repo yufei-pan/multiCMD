@@ -103,6 +103,15 @@ _PGROUP_EXEC = (
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
 _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
+# the C function behind signal.pthread_sigmask(): it sets the calling thread's mask and returns the old one in one
+# call, after which an interrupt can only land with both done. The Python wrapper then converts that result in a
+# generator expression, where a Ctrl-C lands with the mask set and the old one lost ( see _spawn_process ). None
+# without one ( not POSIX, or a platform that has no pthread_sigmask )
+try:
+	import _signal
+except ImportError:
+	_signal = None
+_sigmask = getattr(_signal, 'pthread_sigmask', None) or getattr(signal, 'pthread_sigmask', None)
 # commands still running: Popen -> process group id ( None when the command has no group of its own )
 _live_procs = {}
 # commands that exited while something they started still holds their output open, and a waiting
@@ -1462,6 +1471,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	The group lets a timeout / stop / Ctrl-C reach everything the command starts. SIGTTIN and
 	SIGTTOU are blocked while it starts and the command inherits that, so if it reads the
 	terminal from its background group the read fails with EIO instead of the kernel stopping it.
+	The calling thread's mask is set back as it was however the start ends, a Ctrl-C anywhere included.
 	Python 3.11+ uses Popen(process_group=0); older Pythons run the command through the exec
 	wrapper _PGROUP_EXEC. Windows gets a plain Popen.
 
@@ -1507,11 +1517,22 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count] + list(argv)
 	else:
 		grouped = False
-	old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
-	try:
+	if _sigmask is None:
 		proc = _popen(argv, started=started, grouped=grouped, **kwargs)
+		return proc, (proc.pid if grouped else None)
+	# the mask as it is, read with a call that changes nothing ( an interrupt as it returns leaves nothing to undo ): from
+	# the block on, an interrupt landing anywhere leaves it set back ( from Python 3.10 Python raises one only as a call
+	# begins or returns, or on a loop's way back, so nothing in the finally comes before its call; on 3.6 - 3.9 only a
+	# second one landing as the finally begins could )
+	old_mask = _sigmask(signal.SIG_BLOCK, ())
+	try:
+		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
+		proc = _popen(argv, started=started, grouped=grouped, **kwargs)
+		# ( here too: on Python 3.6 - 3.9 an interrupt can be raised between the end of a try and its finally, which
+		# then never runs )
+		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
-		signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+		_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
 
 # whether an exited command can be looked at without reaping it ( os.waitid() with WNOWAIT; see _poll )

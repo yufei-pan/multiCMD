@@ -1611,3 +1611,41 @@ def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_on
 		state['k'] += 1
 	assert state['k'] > 10
 
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_ctrl_c_anywhere_in_a_start_leaves_the_signal_mask_as_it_was(launcher):
+	# ( matrix of round 12, finding 2 ) _spawn_process blocked SIGTTIN / SIGTTOU with signal.pthread_sigmask(), whose
+	# Python wrapper turns the C call's result into a set in a generator expression once the mask is set: a Ctrl-C
+	# landing there left them blocked on the main thread for good ( old_mask never assigned, the finally never entered:
+	# 45 % of the Ctrl-Cs raised in that wrapper, by a probe ), and one landing as the restoring call began left them
+	# blocked too. A Ctrl-C at each point of a start, in turn: in _spawn_process, as what it calls begins and returns,
+	# and in the signal module's own code
+	code = multiCMD._spawn_process.__code__
+	def counted(frame, event):
+		return (frame.f_code is code or frame.f_back is not None and frame.f_back.f_code is code
+			or frame.f_code.co_filename == signal.__file__)
+	before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+	state = {'k': 0}
+	while True:
+		started = []
+		profile = _interrupt_at(state, counted)
+		sys.setprofile(profile)
+		try:
+			multiCMD._spawn_process(['true'], subprocess.DEVNULL, subprocess.DEVNULL, started=started)
+		except KeyboardInterrupt:
+			pass
+		finally:
+			sys.setprofile(None)
+		mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+		signal.pthread_sigmask(signal.SIG_SETMASK, before)
+		for proc, _ in started:
+			if getattr(proc, 'pid', None) is not None and proc.returncode is None:
+				proc.wait(10)
+		# before ( f891332 ): SIGTTIN and SIGTTOU left blocked by a Ctrl-C in the wrapper's generator expression, or as
+		# the restoring call began
+		assert mask == before, state['where']
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert state['k'] > 5
+
