@@ -900,6 +900,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	# the children lost and not excused; those lost inside the fork; the runs cut short between the fork and the end of
 	# the spawn ( where _Popen hands the command over )
 	lost, forks, recovered = [], [], []
+	request.addfinalizer(lambda: (multiCMD.kill_all(), [multiCMD._live_procs.pop(proc, None) for proc in multiCMD._live_procs.copy()]))
 	for _ in range(100):
 		# ( a spawn takes some 60 - 150 us: the timer's own wake-up takes about as long )
 		first = random.choice([0, random.uniform(0, 0.0005)])
@@ -925,9 +926,12 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 				_thread.start_new_thread(send, ())
 				multiCMD.run_command(['sleep', '3'], quiet=True)
 			finally:
+				# until every SIGINT is sent and its handler has run ( two sent close together may come as one: up to 1 s ),
+				# so none lands after this run, outside it
+				waited = time.monotonic() + 1
 				while True:
 					try:
-						while not sent:
+						while not sent or (len(landed) < len(delays) and time.monotonic() < waited):
 							time.sleep(0.001)
 						break
 					except KeyboardInterrupt:
@@ -954,11 +958,12 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 		if forked and not spawned and not inside and landed:
 			# cut short after the fork, before _spawn returned ( see _Popen ), and still stopped
 			recovered.append(1)
-		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would
+		# what a second Ctrl-C left registered is dead by now: reap it, as kill_all() would ( _wait_all(), not
+		# proc.wait(): that Ctrl-C may have landed inside a poll(), and left its Popen lock held, see _poll )
 		left_registered = list(multiCMD._live_procs.copy())
 		assert ctrl_cs == 2 or not left_registered
+		assert multiCMD._wait_all([(proc, None) for proc in left_registered], 5), left_registered
 		for proc in left_registered:
-			proc.wait(5)
 			multiCMD._unregister(proc)
 		if lost:
 			break
