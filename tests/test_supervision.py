@@ -357,3 +357,117 @@ def test_a_sigterm_handlers_exit_leaves_no_command_running(tmp_path, how):
 	assert started and left == [], (started, proc.stderr)
 	# and no more start once the exit hook has begun ( without that check, all 20 started, each killed in turn )
 	assert len(started) <= 5, started
+
+
+_LATE_AT_EXIT = r'''
+import atexit, sys, weakref
+sys.path.insert(0, sys.argv[1])
+def late(how):
+	import multiCMD
+	task = multiCMD.run_command(['echo', 'hi'], quiet=True, return_object=True)
+	print(how, 'serial', task.returncode, task.stdout, task.stop, flush=True)
+	codes = multiCMD.run_commands([['echo', 'a'], ['echo', 'b']], max_threads=2, quiet=True, return_code_only=True)
+	print(how, 'pool', codes, flush=True)
+	try:
+		multiCMD.run_command(['false'], quiet=True, raise_error=True)
+	except multiCMD.CommandError:
+		print(how, 'raised', flush=True)
+class Late:
+	pass
+holder = Late()
+# registered before multiCMD is imported: both run after its exit hook
+atexit.register(late, 'atexit')
+weakref.finalize(holder, late, 'finalize')
+import multiCMD
+'''
+
+
+def test_a_command_run_from_an_atexit_handler_after_the_exit_hook_runs(tmp_path):
+	# ( review of round 11, finding 1 ) the exit hook's _exiting gated the main thread too, and was never cleared: a
+	# command run from an atexit handler or a weakref.finalize callback that runs after the hook was skipped silently
+	# ( returncode None, task.stop set, raise_error not raising ), where 1.54 ran it
+	proc = subprocess.run([sys.executable, '-c', _LATE_AT_EXIT, str(PACKAGE_ROOT)],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert proc.returncode == 0, proc.stderr
+	lines = proc.stdout.splitlines()
+	for how in ('finalize', 'atexit'):
+		# before ( fc0c782 ): "<how> serial None [] True", the pool's [None, None], and no CommandError
+		assert f"{how} serial 0 ['hi'] False" in lines, (lines, proc.stderr)
+		assert f'{how} pool [0, 0]' in lines and f'{how} raised' in lines, (lines, proc.stderr)
+
+
+_REFUSED_AT_EXIT = r'''
+import atexit, sys
+sys.path.insert(0, sys.argv[1])
+def late():
+	multiCMD.join_threads(timeout=10)
+	for task in tasks:
+		print(task.returncode, task._error, any('the interpreter is exiting' in line for line in task.stderr), flush=True)
+atexit.register(late)
+import multiCMD
+# queued on daemon threads: the first runs as the program ends, the others start after the exit hook began
+tasks = multiCMD.run_commands([['sleep', '30']] * 3, max_threads=1, quiet=True, wait_for_return=False, return_object=True)
+import time
+deadline = time.monotonic() + 10
+while not multiCMD._live_procs and time.monotonic() < deadline:
+	time.sleep(0.01)
+'''
+
+
+def test_a_command_the_exit_hook_keeps_from_starting_fails_with_that_reason(tmp_path):
+	# ( review of round 11, finding 1 ) never skipped silently: a daemon thread's command that would start after the
+	# exit hook began fails, -1 with the reason in its stderr
+	proc = subprocess.run([sys.executable, '-c', _REFUSED_AT_EXIT, str(PACKAGE_ROOT)],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert proc.returncode == 0, proc.stderr
+	first, *rest = proc.stdout.splitlines()
+	# the first one killed by the hook; before ( fc0c782 ): the others None, False, False
+	assert first.split()[0] not in ('0', 'None') and first.split()[1:] == ['False', 'False'], proc.stdout
+	assert rest == ['-1 True True'] * 2, (proc.stdout, proc.stderr)
+
+
+_IN_FLIGHT_AT_EXIT = r'''
+import sys, time
+sys.path.insert(0, sys.argv[1])
+import multiCMD
+pids, count = sys.argv[2], int(sys.argv[3])
+real = multiCMD._spawn
+def spawn(*args, **kwargs):
+	# the command runs, and its thread is held up before it registers it: the program exits meanwhile
+	proc, pgid = real(*args, **kwargs)
+	with open(pids, 'a') as f:
+		f.write('%d\n' % proc.pid)
+	time.sleep(0.3)
+	return proc, pgid
+multiCMD._spawn = spawn
+multiCMD.run_commands([['sleep', '30']] * count, max_threads=0, quiet=True, wait_for_return=False)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+	try:
+		with open(pids) as f:
+			if len(f.read().split()) == count:
+				break
+	except OSError:
+		pass
+	time.sleep(0.005)
+'''
+
+
+@linux_only
+def test_a_command_started_as_the_exit_hook_begins_is_still_stopped(tmp_path):
+	# ( review of round 11, finding 2; probe exit_inflight.py ) a daemon thread past the start's check of _exiting
+	# that had not registered its command yet registered it after the hook's last look at the registry, and was then
+	# frozen with the interpreter: the command outlived the program
+	pids = tmp_path / 'pids'
+	proc = subprocess.run([sys.executable, '-c', _IN_FLIGHT_AT_EXIT, str(PACKAGE_ROOT), str(pids), '3'],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert proc.returncode == 0, proc.stderr
+	started = [int(pid) for pid in pids.read_text().split()]
+	left = [pid for pid in started if not pid_gone(pid, wait=2)]
+	for pid in left:
+		try:
+			os.kill(pid, signal.SIGKILL)
+		except OSError:
+			pass
+	# before ( fc0c782 ): all three ran on
+	assert len(started) == 3 and left == [], (started, left, proc.stderr)

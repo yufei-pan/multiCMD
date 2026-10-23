@@ -115,7 +115,8 @@ _draining = {}
 _live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
-# set by the exit hook: from then on no command starts, and one that started meanwhile stops ( see _kill_running_at_exit )
+# set by the exit hook: from then on a thread other than the main one starts no command asked for before it, and one
+# that started meanwhile stops ( see _kill_running_at_exit and _cut_by_exit )
 _exiting = False
 
 #%% objects
@@ -141,6 +142,8 @@ class Task:
 		# this command's own environment ( see _check_env ): env replaces the inherited one, extra_env is applied on top
 		self._env = None
 		self._extra_env = None
+		# whether the main thread asked for it once the exit hook had begun ( an atexit handler's call: see _cut_by_exit )
+		self._at_exit = False
 
 	def __iter__(self):
 		yield from (
@@ -1763,17 +1766,41 @@ def kill_all(sig=None):
 	commands = list(_live_procs.copy().items()) + list(_draining.copy().items())
 	_kill_commands(commands, signal.SIGTERM if sig is None else sig)
 
+def _cut_by_exit(task):
+	'''
+	Whether the exit hook keeps task's command from running ( internal ): it has begun, the command was asked for
+	before it, and this thread is not the main one
+	Daemon threads still run while the exit hook and the atexit handlers after it do ( fire-and-forget, executor and
+	pool threads whose caller gave up waiting ), and are frozen once they are done: a command they start then outlives
+	the program. The main thread is the one exiting: a command it runs from an atexit handler, a weakref.finalize
+	callback or a __del__ that runs after the hook ( registered before multiCMD was imported ) runs as it always has,
+	and so do the commands of a call it makes then, whichever thread starts them ( it is waiting for them, unless it
+	did not ask to: what it leaves running then is not stopped at exit, as before 1.55 ).
+	'''
+	return _exiting and not task._at_exit and threading.current_thread() is not threading.main_thread()
+
+# commands between their start's check of _cut_by_exit and their registration: Task -> None ( see _kill_running_at_exit )
+_starting = {}
+# how long the exit hook waits for those to be registered, in seconds
+_EXIT_START_WAIT = 1.0
+
 def _kill_running_at_exit():
 	'''
 	At interpreter exit, stop the commands that are still running ( internal )
 	What a finished command left running in the background is left alone: a fire-and-forget
 	command may start a long job on purpose ( `btrfs scrub start`, `nohup ...` ).
-	Daemon threads still run meanwhile ( fire-and-forget, executor and pool threads whose caller gave up waiting ),
-	so _exiting is set first: no command starts after it ( see __run_command ), one registered meanwhile stops itself
-	( see _execute ), and the registry is looked at again after each kill, until nothing new is in it.
+	Daemon threads still run meanwhile, so _exiting is set first: from then on such a thread starts no command asked
+	for before it ( it fails, see __run_command and _cut_by_exit ), and one it registers meanwhile stops itself ( see
+	_execute ). A start that passed that check just before is counted in _starting from before the check until its
+	command is registered ( or it fails ): the hook waits for those, up to _EXIT_START_WAIT, so that its look at the
+	registry sees their commands, and looks at the registry again after each kill, until nothing new is in it.
 	'''
 	global _exiting
 	_exiting = True
+	# ( bounded: a start held up there, a write to a full stdout say, must not hold up the exit )
+	deadline = time.monotonic() + _EXIT_START_WAIT
+	while _starting and time.monotonic() < deadline:
+		time.sleep(0.005)
 	killed = set()
 	while True:
 		commands = [(proc, pgid) for proc, pgid in _live_procs.copy().items() if proc not in killed]
@@ -2146,8 +2173,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		# ( for kill_all() and the exit hook, which know no quiet of their own: see _give_up_on )
 		proc._multicmd_quiet = quiet
 		_register(proc, pgid)
-		if _exiting:
-			# started as the exit hook began: it may not have seen this one ( see _kill_running_at_exit )
+		_starting.pop(task, None)
+		if _cut_by_exit(task):
+			# started as the exit hook began: it may have given up waiting for this one ( see _kill_running_at_exit )
 			task.stop = True
 		# started: a long-lived executor keeps its tasks, not the environments they were started with
 		task._env = task._extra_env = None
@@ -2171,6 +2199,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# registered here, so kill_all() and the exit hook reach it whatever cuts the kill short
 				proc._multicmd_quiet = quiet
 				_live_procs[proc] = pgid
+			_starting.pop(task, None)
 			# the pty's descriptors no file object owns yet, and a stream no reader reads, are closed here ( a reader
 			# closes its own; closing a file object again does nothing )
 			if wrapped:
@@ -2271,32 +2300,39 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		list[str]: The output of the command
 	'''
 	with sem:
-		if task.stop or _exiting:
-			# stopped before it started ( or the interpreter is exiting ): it stays unfinished, like a skipped queued command
-			task.stop = True
-			task._env = task._extra_env = None
-			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
-			if dry_run:
-				if not quiet:
-					_display.message(_dry_run_line(task))
+			# a start from here until its command is registered ( see _execute ) is one the exit hook waits for
+			_starting[task] = None
+			if task.stop:
+				# stopped before it started: it stays unfinished, like a skipped queued command
+				task._env = task._extra_env = None
 				return task.stdout + task.stderr if with_stdErr else task.stdout
-			if not quiet:
-				_display.message('Running command: ' + _quote_command(task.command), decor)
-				_display.message('-' * 100, decor)
-			_execute(task, timeout, quiet, decor, use_pty)
-		# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
-		except FileNotFoundError as e:
-			_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet))
-		except (PermissionError, _ExecRefused) as e:
-			# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-			_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet))
-		except Exception as e:
-			_settle(lambda: _fail_task(task, str(e), e, quiet))
+			try:
+				if _cut_by_exit(task):
+					# never skipped silently: it fails, with that reason, as a command multiCMD cannot start does
+					raise RuntimeError('not started: the interpreter is exiting')
+				if dry_run:
+					if not quiet:
+						_display.message(_dry_run_line(task))
+					return task.stdout + task.stderr if with_stdErr else task.stdout
+				if not quiet:
+					_display.message('Running command: ' + _quote_command(task.command), decor)
+					_display.message('-' * 100, decor)
+				_execute(task, timeout, quiet, decor, use_pty)
+			# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
+			except FileNotFoundError as e:
+				_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet))
+			except (PermissionError, _ExecRefused) as e:
+				# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
+				_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet))
+			except Exception as e:
+				_settle(lambda: _fail_task(task, str(e), e, quiet))
+			finally:
+				task._finalized = True
+				# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
+				task._env = task._extra_env = None
 		finally:
-			task._finalized = True
-			# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
-			task._env = task._extra_env = None
+			_starting.pop(task, None)
 		if not quiet:
 			_display.message('-' * 100, decor)
 			_display.message(f'Process exited with return code {task.returncode}', decor)
@@ -2494,9 +2530,12 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 	extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
 	# one snapshot shared by every task of the call
 	tasks = [Task(command) for command in formatedCommands]
+	# a call the main thread makes once the exit hook has begun ( from an atexit handler: see _cut_by_exit )
+	at_exit = _exiting and threading.current_thread() is threading.main_thread()
 	for task in tasks:
 		task._env = env
 		task._extra_env = extra_env
+		task._at_exit = at_exit
 	return tasks, bool(use_sudo)
 
 def _validate_sudo():
