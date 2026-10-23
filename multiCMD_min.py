@@ -19,6 +19,9 @@ _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
 _ENV_VAR='_MULTICMD_ENV_'
 _PGROUP_EXEC="import os,signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\nos.setpgid(0,0)\na=sys.argv\nc=a[2]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(os.environb[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:os.execv(f,a[2:])\n\tos.execve(f,a[2:],v)\ntry:\n\tif os.sep in c:x(c)\n\tp=os.environ.get('PATH') if v is None else v.get(b'PATH')\n\tr=None\n\tfor d in os.fsdecode(os.defpath if p is None else p).split(os.pathsep):\n\t\tf=os.path.join(d or os.curdir,c)\n\t\tif os.path.isfile(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,os.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
+try:import _signal
+except ImportError:_signal=None
+_sigmask=getattr(_signal,'pthread_sigmask',None)or getattr(signal,'pthread_sigmask',None)
 _live_procs={}
 _draining={}
 _live_procs_lock=threading.Lock()
@@ -124,11 +127,17 @@ def _is_interrupt(error):
 		tb=tb.tb_next
 	return False
 _settling=threading.local()
+_HAS_GETFRAME=hasattr(sys,'_getframe')
+def _settle_running(frame):
+	while frame is not None:
+		if frame.f_code is _SETTLE_CODE:return True
+		frame=frame.f_back
+	return False
 def _settle(step,cuts=None,quiet=False):
 	if cuts is None:cuts=[]
-	failures=[];done=False;own=False
+	failures=[];done=False;own=not _settle_running(sys._getframe(1))if _HAS_GETFRAME else getattr(_settling,'messages',None)is None;messages={}
 	try:
-		if getattr(_settling,'messages',None)is None:own=True;_settling.messages={}
+		if own:_settling.messages=messages
 		while not done and len(failures)<_STEP_FAILURES:
 			try:
 				while not done and len(failures)<_STEP_FAILURES:
@@ -138,10 +147,11 @@ def _settle(step,cuts=None,quiet=False):
 		if failures and(done or cuts)and not quiet:error=failures[0];_show_error(f"multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again"+(''if done else f" {len(failures)} times, without completing"))
 	finally:
 		if own:
-			messages,_settling.messages=getattr(_settling,'messages',None),None
-			for text in(messages or{}).values():_write_error(text)
+			_settling.messages=None
+			for text in messages.values():_write_error(text)
 	if cuts:raise cuts[0]
 	if not done:raise failures[0]
+_SETTLE_CODE=_settle.__code__
 def _abandon_all(threads,forget=None):
 	for thread in threads:
 		if thread._abandon()and forget is not None:forget(thread)
@@ -456,9 +466,10 @@ def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None,st
 		if explicit:entries=[os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()];kwargs['env']=dict(_snapshot(os.environb,drop_empty=True));kwargs['env'].update((os.fsencode(_ENV_VAR+str(i)),entry)for(i,entry)in enumerate(entries));count=str(len(entries))
 		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count]+list(argv)
 	else:grouped=False
-	old_mask=signal.pthread_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS)
-	try:proc=_popen(argv,started=started,grouped=grouped,**kwargs)
-	finally:signal.pthread_sigmask(signal.SIG_SETMASK,old_mask)
+	if _sigmask is None:proc=_popen(argv,started=started,grouped=grouped,**kwargs);return proc,proc.pid if grouped else None
+	old_mask=_sigmask(signal.SIG_BLOCK,())
+	try:_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS);proc=_popen(argv,started=started,grouped=grouped,**kwargs);_sigmask(signal.SIG_SETMASK,old_mask)
+	finally:_sigmask(signal.SIG_SETMASK,old_mask)
 	return proc,proc.pid if grouped else None
 _CAN_PEEK=_IS_POSIX and hasattr(os,'waitid')and hasattr(os,'WNOWAIT')
 _JAMMED_AFTER=.5
@@ -698,9 +709,8 @@ def _child_env(task,pager=False):
 		if pager:env.setdefault('PAGER','cat');env.setdefault('GIT_PAGER','cat')
 	if extra:_apply_extra_env(env,extra)
 	return env
-def _stop_command(proc,pgid,quiet=False):
-	try:_kill_commands([(proc,pgid)],signal.SIGINT,quiet)
-	except BaseException:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT);raise
+def _stop_command(proc,pgid,quiet=False):_kill_commands([(proc,pgid)],signal.SIGINT,quiet)
+def _cut_stop(proc,pgid):_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT)
 def _execute(task,timeout,quiet,decor,use_pty=False):
 	explicit=task._env is not None or task._extra_env is not None;fds={};wrapped=[];proc=pgid=None;started=[];streams=[];readers=[];interrupted=None;waiting=False
 	try:
@@ -715,7 +725,7 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		if _cut_by_exit(task):task.stop=True
 		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);waiting=True;reason=_watch(task,proc,timeout)
 	except BaseException as e:
-		first=e;interrupt=waiting or _is_interrupt(first);cuts=[]
+		first=e;interrupt=None;cuts=[];raised=[];settled=False
 		def settle():
 			nonlocal proc,pgid;found=_started_command(started)
 			if found is not None:proc,pgid=found
@@ -728,15 +738,22 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 				elif proc is not None:pending=[(proc.stdout,None),(proc.stderr,None)]
 			for(i,(stream,_))in enumerate(pending):
 				if stream is not None and(i>=len(readers)or readers[i]._abandon()):stream.close()
-			if cuts and interrupt and proc is not None:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT)
-		while True:
-			try:_settle(settle,cuts,quiet);break
-			except BaseException as c:
-				if cuts and c is cuts[0]:break
-				if not _is_interrupt(c):
-					if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(c).__name__}: {c}")
-					break
-				cuts.append(c)
+			if cuts and interrupt and proc is not None:_cut_stop(proc,pgid)
+		while not settled:
+			try:
+				while not settled:
+					try:
+						if raised:
+							seen=raised.pop()
+							if cuts and seen is cuts[0]:settled=True
+							elif _is_interrupt(seen):cuts.append(seen)
+							else:
+								settled=True
+								if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(seen).__name__}: {seen}")
+						elif interrupt is None:interrupt=waiting or _is_interrupt(first)
+						else:_settle(settle,cuts,quiet);settled=True
+					except BaseException as c:raised.append(c)
+			except BaseException as c:raised.append(c)
 		cut=cuts[0]if cuts else None
 		if proc is None:
 			if cut is not None:raise cut
@@ -744,10 +761,15 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		if cut is not None:
 			if interrupt:raise cut
 			first,interrupt=cut,True
-		if not interrupt:_stop_command(proc,pgid,quiet);_unregister(proc);_join_all(readers,1);raise first
+		if not interrupt:
+			try:_stop_command(proc,pgid,quiet)
+			except BaseException:_cut_stop(proc,pgid);raise
+			_unregister(proc);_join_all(readers,1);raise first
 		reason,interrupted='stop',first
 	if reason=='timeout':task.stderr.append('Timeout!')
-	if reason is not None:_stop_command(proc,pgid,quiet)
+	if reason is not None:
+		try:_stop_command(proc,pgid,quiet)
+		except BaseException:_cut_stop(proc,pgid);raise
 	_unregister(proc);task.returncode=_poll(proc)
 	if reason is None:
 		_draining[proc]=pgid
@@ -755,7 +777,9 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		except BaseException as e:reason,interrupted='stop',e
 		finally:_draining.pop(proc,None)
 		if reason=='timeout':task.stderr.append('Timeout!')
-		if reason is not None:_stop_command(proc,pgid,quiet)
+		if reason is not None:
+			try:_stop_command(proc,pgid,quiet)
+			except BaseException:_cut_stop(proc,pgid);raise
 	_join_all(readers,None if reason is None else 1)
 	if reason=='timeout':task.returncode=124
 	elif task.returncode is None:
@@ -790,7 +814,7 @@ def _write_error(text):
 	except Exception:pass
 def _show_error(text,key=None):
 	messages=getattr(_settling,'messages',None)
-	if messages is None:_write_error(text)
+	if messages is None or _HAS_GETFRAME and not _settle_running(sys._getframe(1)):_write_error(text)
 	else:messages[text if key is None else key]=text
 def _cannot_run(task,returncode,what,error,quiet=False):
 	line=str(error)
