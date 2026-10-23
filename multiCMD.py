@@ -265,8 +265,8 @@ class _Thread(threading.Thread):
 	as stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and Thread.join()
 	returns at once, for good. done is set by the thread itself once its target has returned or raised, and
 	is_alive() and join() go by it, so they stay right on every Python, whatever join was interrupted before:
-	- join(timeout) waits for done in 0.1 s steps ( so a Ctrl-C reaches the waiting thread ), bounded by
-	  timeout, and once done is set it joins the thread itself, which releases its stack ( from Python 3.13 a
+	- join(timeout) waits for done ( _Done.wait(), in 0.1 s steps, so a Ctrl-C reaches the waiting thread ), bounded
+	  by timeout, and once done is set it joins the thread itself, which releases its stack ( from Python 3.13 a
 	  finished thread nobody joined keeps its stack mapped for as long as the Thread object lives ), within
 	  what is left of timeout: a thread whose target has finished is done, whether or not it has left yet;
 	- is_alive() is True until done is set, from the moment the thread is created: one registered before it
@@ -330,14 +330,14 @@ class _Thread(threading.Thread):
 		return not self.done.flag and self._pid == os.getpid()
 
 	def join(self, timeout=None):
+		# ( in a child forked meanwhile the thread does not exist: nothing ever sets done there )
+		if self._pid != os.getpid():
+			return
 		deadline = None if timeout is None else time.monotonic() + timeout
-		while not self.done.flag:
-			step = 0.1 if deadline is None else min(0.1, deadline - time.monotonic())
-			if step <= 0 or self._pid != os.getpid():
-				return
-			self.done.wait(step)
+		if not self.done.wait(timeout):
+			return
 		# ( an abandoned thread may never have come up )
-		if self._started.is_set() and self._pid == os.getpid():
+		if self._started.is_set():
 			left = None if deadline is None else max(0, deadline - time.monotonic())
 			if _JOIN_MAY_HANG:
 				# its target has finished, so it is only leaving: never block on a lock an interrupted join left held

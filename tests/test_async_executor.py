@@ -1043,3 +1043,29 @@ def test_fail_task_run_again_records_the_failure_once():
 	first = list(task.stderr)
 	multiCMD._fail_task(task, 'cannot start its thread', error, quiet=True)
 	assert task.stderr == first and task.returncode == -1 and task._finalized
+
+
+# ( os.fork() with threads running warns from 3.12: the child only calls join() and os._exit() )
+@pytest.mark.filterwarnings('ignore::DeprecationWarning')
+def test_a_thread_join_waits_on_its_done_flag_and_never_in_a_forked_child():
+	# ( review of round 10, finding 12: join() waits through _Done.wait(), and keeps only the fork check )
+	release = threading.Event()
+	thread = multiCMD._Thread(release.wait, (10,))
+	thread.start()
+	try:
+		started = time.monotonic()
+		thread.join(0.3)
+		assert thread.is_alive() and 0.25 < time.monotonic() - started < 1
+		if hasattr(os, 'fork'):
+			pid = os.fork()
+			if pid == 0:
+				# the thread does not exist here: join returns at once, without a timeout too
+				began = time.monotonic()
+				thread.join()
+				os._exit(0 if time.monotonic() - began < 1 else 1)
+			_, status = os.waitpid(pid, 0)
+			assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+	finally:
+		release.set()
+	thread.join(5)
+	assert not thread.is_alive() and not threading.Thread.is_alive(thread)
