@@ -138,12 +138,19 @@ def _settle(step,cuts=None,quiet=False):
 	failures=[];done=False;own=not _settle_running(sys._getframe(1))if _HAS_GETFRAME else getattr(_settling,'messages',None)is None;messages={}
 	try:
 		if own:_settling.messages=messages
-		while not done and len(failures)<_STEP_FAILURES:
+		while True:
 			try:
-				while not done and len(failures)<_STEP_FAILURES:
-					try:step();done=True
-					except BaseException as e:(cuts if _is_interrupt(e)else failures).append(e)
-			except BaseException as e:(cuts if _is_interrupt(e)else failures).append(e)
+				while True:
+					try:
+						if done or len(failures)>=_STEP_FAILURES:break
+						step();done=True
+					except BaseException as e:
+						if _is_interrupt(e):cuts.append(e);done=False
+						else:failures.append(e)
+				break
+			except BaseException as e:
+				if _is_interrupt(e):cuts.append(e);done=False
+				else:failures.append(e)
 		if failures and(done or cuts)and not quiet:error=failures[0];_show_error(f"multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again"+(''if done else f" {len(failures)} times, without completing"))
 	finally:
 		if own:
@@ -739,20 +746,22 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 			for(i,(stream,_))in enumerate(pending):
 				if stream is not None and(i>=len(readers)or readers[i]._abandon()):stream.close()
 			if cuts and interrupt and proc is not None:_cut_stop(proc,pgid)
-		while not settled:
+		while True:
 			try:
-				while not settled:
+				while True:
 					try:
 						if raised:
-							seen=raised.pop()
+							seen=raised.pop(0)
 							if cuts and seen is cuts[0]:settled=True
-							elif _is_interrupt(seen):cuts.append(seen)
+							elif _is_interrupt(seen):cuts.append(seen);settled=False
 							else:
 								settled=True
 								if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(seen).__name__}: {seen}")
+						elif settled:break
 						elif interrupt is None:interrupt=waiting or _is_interrupt(first)
 						else:_settle(settle,cuts,quiet);settled=True
 					except BaseException as c:raised.append(c)
+				break
 			except BaseException as c:raised.append(c)
 		cut=cuts[0]if cuts else None
 		if proc is None:
@@ -766,8 +775,10 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 			except BaseException:_cut_stop(proc,pgid);raise
 			_unregister(proc);_join_all(readers,1);raise first
 		reason,interrupted='stop',first
+		try:_stop_command(proc,pgid,quiet)
+		except BaseException:_cut_stop(proc,pgid);raise
 	if reason=='timeout':task.stderr.append('Timeout!')
-	if reason is not None:
+	if reason is not None and interrupted is None:
 		try:_stop_command(proc,pgid,quiet)
 		except BaseException:_cut_stop(proc,pgid);raise
 	_unregister(proc);task.returncode=_poll(proc)
