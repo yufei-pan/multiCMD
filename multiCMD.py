@@ -428,8 +428,24 @@ def _is_interrupt(error):
 		tb = tb.tb_next
 	return False
 
-# per thread: the failure messages to show once the outermost _settle() on that thread is done ( None: show at once )
+# per thread: the failure messages to show once the outermost _settle() running on that thread is done ( None: show
+# at once ). Only that _settle() sets it, and resets it as it ends, but whether one runs is told by the stack, not by
+# this: an interrupt that lands before the reset leaves a dict no running _settle() owns, which _show_error() then
+# never fills and the next outermost _settle() replaces ( see _settle_running )
 _settling = threading.local()
+# ( without it, not CPython: whether a _settle() runs is told by _settling alone, which such an interrupt leaves stale )
+_HAS_GETFRAME = hasattr(sys, '_getframe')
+
+def _settle_running(frame):
+	'''
+	Whether a _settle() runs on this thread at frame or further up its stack ( internal; see _settling )
+	A loop over the frames, so whatever an interrupt left in _settling never outlives the _settle() that set it.
+	'''
+	while frame is not None:
+		if frame.f_code is _SETTLE_CODE:
+			return True
+		frame = frame.f_back
+	return False
 
 def _settle(step, cuts=None, quiet=False):
 	'''
@@ -449,9 +465,10 @@ def _settle(step, cuts=None, quiet=False):
 	  that fails on its own _STEP_FAILURES times is not run again, and the first failure is raised then ( an
 	  interrupt meanwhile is raised instead, and the failure shown unless quiet ).
 	The failure messages step shows ( see _show_error ) are shown after it, each once: a step run again shows
-	nothing twice. An interrupt pending as _settle is called can still be raised before step starts ( from the call
-	itself: no Python code can take it earlier ); a caller that must have step run then calls it again with that
-	interrupt in cuts ( see _execute ).
+	nothing twice. Only the outermost _settle() running on a thread shows them, told by the stack ( see _settling ): an
+	interrupt that cuts the end of one short leaves nothing that keeps a later one from showing its own. An interrupt
+	pending as _settle is called can still be raised before step starts ( from the call itself: no Python code can
+	take it earlier ); a caller that must have step run then calls it again with that interrupt in cuts ( see _execute ).
 	@params:
 		step: The step ( called with no arguments )
 		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
@@ -464,11 +481,12 @@ def _settle(step, cuts=None, quiet=False):
 	# step's own failures, and whether it has completed
 	failures = []
 	done = False
-	own = False
+	# whether this is the outermost _settle() running on this thread, which shows the messages ( see _settling )
+	own = not _settle_running(sys._getframe(1)) if _HAS_GETFRAME else getattr(_settling, 'messages', None) is None
+	messages = {}
 	try:
-		if getattr(_settling, 'messages', None) is None:
-			own = True
-			_settling.messages = {}
+		if own:
+			_settling.messages = messages
 		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one )
 		while not done and len(failures) < _STEP_FAILURES:
 			try:
@@ -486,13 +504,16 @@ def _settle(step, cuts=None, quiet=False):
 				+ ('' if done else f' {len(failures)} times, without completing'))
 	finally:
 		if own:
-			messages, _settling.messages = getattr(_settling, 'messages', None), None
-			for text in (messages or {}).values():
+			# ( reset before anything is called: an interrupt among the writes leaves nothing behind )
+			_settling.messages = None
+			for text in messages.values():
 				_write_error(text)
 	if cuts:
 		raise cuts[0]
 	if not done:
 		raise failures[0]
+
+_SETTLE_CODE = _settle.__code__
 
 def _abandon_all(threads, forget=None):
 	'''
@@ -2482,10 +2503,10 @@ def _show_error(text, key=None):
 	'''
 	Show a failure message on stderr ( internal ); see _write_error
 	Inside _settle() it is shown once the step is done, and a step run again shows it once: the last message
-	given for each key ( default: the text ).
+	given for each key ( default: the text ). Outside one it is shown at once, whatever an interrupt left in _settling.
 	'''
 	messages = getattr(_settling, 'messages', None)
-	if messages is None:
+	if messages is None or _HAS_GETFRAME and not _settle_running(sys._getframe(1)):
 		_write_error(text)
 	else:
 		messages[text if key is None else key] = text

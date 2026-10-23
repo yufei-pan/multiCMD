@@ -1549,3 +1549,65 @@ def test_no_generator_of_multicmds_is_closed_on_the_main_threads_paths(launcher,
 	# before ( fc0c782 ): _files_named and the <genexpr>s ( on 3.9, 3.13.17, 3.14: Debian's 3.13.5 closes such a
 	# generator without resuming its frame, and passes either way )
 	assert closed == []
+
+
+# ---- matrix of round 12: an interrupt at any point where Python raises one, in turn ( see _interrupt_at )
+
+def _interrupt_at(state, counted):
+	'''
+	A profile function ( sys.setprofile ) that raises KeyboardInterrupt at the state['k']-th event counted(frame, event)
+	accepts, counting from 0: a Python function's 'call' ( Python raises a pending Ctrl-C as a function starts ), its
+	'return' ( on 3.6 - 3.10 also as the caller gets the result ), and a C function's 'c_return' ( as its caller gets
+	the result ). That is where Python itself raises a Ctrl-C ( and, from 3.10 on, only there or on a loop's way
+	back ), so k from 0 up to the last event puts one at each of those points in turn. A profile function that raises
+	is unset by Python: one per run. It sets state['n'] ( events counted so far ), state['where'] ( the one it raised at )
+	and state['injected'].
+	'''
+	state.update(n=0, where=None, injected=False)
+	def profile(frame, event, arg):
+		if event not in ('call', 'return', 'c_return') or not counted(frame, event):
+			return
+		if state['n'] == state['k']:
+			state['injected'] = True
+			state['where'] = (event, frame.f_code.co_name, frame.f_lineno, getattr(arg, '__name__', None) if event == 'c_return' else None)
+			raise KeyboardInterrupt('injected')
+		state['n'] += 1
+	return profile
+
+
+def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_ones(capfd):
+	# ( matrix of round 12, finding 1 ) _settle() set its per-thread state as it began and reset it in its finally; a
+	# Ctrl-C landing in that finally before the reset ( as getattr() returned ) left it set, so every later _settle() on
+	# that thread took itself for a nested one and never showed the messages of its step: _show_error() dropped them
+	# for good ( seen on 3.13t after the start stress test ). A Ctrl-C at each point of a _settle() whose step shows a
+	# message, in turn, and then a step that fails once on its own: its failure is shown
+	code = multiCMD._settle.__code__
+	def counted(frame, event):
+		return frame.f_code is code or frame.f_back is not None and frame.f_back.f_code is code
+	def step():
+		multiCMD._show_error('shown by the step')
+	state = {'k': 0}
+	while True:
+		profile = _interrupt_at(state, counted)
+		sys.setprofile(profile)
+		try:
+			multiCMD._settle(step)
+		except KeyboardInterrupt:
+			pass
+		finally:
+			sys.setprofile(None)
+		capfd.readouterr()
+		runs = []
+		def fails_once():
+			runs.append(1)
+			if len(runs) == 1:
+				raise OSError('transient')
+		multiCMD._settle(fails_once)
+		err = capfd.readouterr().err
+		# before ( f891332 ): nothing shown after a Ctrl-C as getattr() returned in the finally
+		assert len(runs) == 2 and err.count('OSError: transient') == 1, (state['where'], err)
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert state['k'] > 10
+
