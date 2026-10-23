@@ -2239,14 +2239,19 @@ def _stop_command(proc, pgid, quiet=False):
 	'''
 	Kill a command with everything it started ( _kill_commands; quiet as there ) ( internal )
 	An interrupt that ends the wait for it ( a second Ctrl-C, or whatever a signal handler raises ) leaves it sent
-	SIGTERM at least, and still registered: kill_all() and the exit hook do the rest.
+	SIGTERM at least, and still registered: kill_all() and the exit hook do the rest. That is the caller's to do: it
+	calls this in a try whose handler calls _cut_stop(), as an interrupt can land as the call begins, before any try
+	in here could take it.
 	'''
-	try:
-		_kill_commands([(proc, pgid)], signal.SIGINT, quiet)
-	except BaseException:
-		_send(proc, pgid, signal.SIGTERM)
-		_send(proc, pgid, signal.SIGCONT)
-		raise
+	_kill_commands([(proc, pgid)], signal.SIGINT, quiet)
+
+def _cut_stop(proc, pgid):
+	'''
+	The rest of a stop an interrupt cut short, or kept from beginning: SIGTERM, and SIGCONT for a stopped command
+	( internal; see _stop_command )
+	'''
+	_send(proc, pgid, signal.SIGTERM)
+	_send(proc, pgid, signal.SIGCONT)
 
 def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
@@ -2376,8 +2381,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			if cuts and interrupt and proc is not None:
 				# a second interrupt ( of any kind ) while the first is dealt with: it ends the wait for the command,
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
-				_send(proc, pgid, signal.SIGTERM)
-				_send(proc, pgid, signal.SIGCONT)
+				_cut_stop(proc, pgid)
 		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
 		# is taken by the outer one )
 		while not settled:
@@ -2423,7 +2427,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			first, interrupt = cut, True
 		if not interrupt:
 			# a failure of multiCMD's: the caller records it ( -1 )
-			_stop_command(proc, pgid, quiet)
+			try:
+				_stop_command(proc, pgid, quiet)
+			except BaseException:
+				_cut_stop(proc, pgid)
+				raise
 			_unregister(proc)
 			_join_all(readers, 1)
 			raise first
@@ -2433,7 +2441,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
 	if reason is not None:
-		_stop_command(proc, pgid, quiet)
+		try:
+			_stop_command(proc, pgid, quiet)
+		except BaseException:
+			_cut_stop(proc, pgid)
+			raise
 	_unregister(proc)
 	task.returncode = _poll(proc)
 	if reason is None:
@@ -2452,7 +2464,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		if reason == 'timeout':
 			task.stderr.append('Timeout!')
 		if reason is not None:
-			_stop_command(proc, pgid, quiet)
+			try:
+				_stop_command(proc, pgid, quiet)
+			except BaseException:
+				_cut_stop(proc, pgid)
+				raise
 	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124

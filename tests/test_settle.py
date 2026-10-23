@@ -1561,11 +1561,13 @@ def _interrupt_at(state, counted):
 	the result ). That is where Python itself raises a Ctrl-C ( and, from 3.10 on, only there or on a loop's way
 	back ), so k from 0 up to the last event puts one at each of those points in turn. A profile function that raises
 	is unset by Python: one per run. It sets state['n'] ( events counted so far ), state['where'] ( the one it raised at )
-	and state['injected'].
+	and state['injected']. A finalizer or weakref callback the garbage collector runs meanwhile is not counted: CPython
+	drops what is raised there.
 	'''
 	state.update(n=0, where=None, injected=False)
 	def profile(frame, event, arg):
-		if event not in ('call', 'return', 'c_return') or not counted(frame, event):
+		if event not in ('call', 'return', 'c_return') or frame.f_code.co_name in ('__del__', '_remove') \
+			or not counted(frame, event):
 			return
 		if state['n'] == state['k']:
 			state['injected'] = True
@@ -1699,3 +1701,41 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 		state['k'] += 1
 	assert lost == []
 	assert state['k'] > 5 and state['registered']
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
+def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(launcher, monkeypatch):
+	# ( matrix of round 12, with finding 3 ) a second Ctrl-C ends the wait for the command, which is sent SIGTERM at
+	# least: _stop_command() did that in a try of its own, and one that landed as the call to it began, before that try,
+	# left the command registered but running, unsignalled. A first Ctrl-C once Popen has the pid, and a second one at
+	# each point of multiCMD's code in turn, to the end of the run: the command is dead soon after either way
+	state = {'k': 0}
+	def counted(frame, event):
+		mine = multiCMD.__file__
+		return frame.f_code.co_filename == mine or frame.f_back is not None and frame.f_back.f_code.co_filename == mine
+	real_execute_child = subprocess.Popen._execute_child
+	def execute_child(self, *args, **kwargs):
+		real_execute_child(self, *args, **kwargs)
+		state['proc'] = self
+		sys.setprofile(_interrupt_at(state, counted))
+		raise KeyboardInterrupt('first')
+	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
+	running = []
+	while True:
+		try:
+			with pytest.raises(KeyboardInterrupt):
+				multiCMD.run_command(['sleep', '30'], quiet=True)
+		finally:
+			sys.setprofile(None)
+		proc = state['proc']
+		if not multiCMD._wait_all([(proc, None)], 2):
+			# before ( f891332 ): left running by a second Ctrl-C as _stop_command() began, registered; or lost
+			running.append((state['where'], proc in multiCMD._live_procs))
+			proc.kill()
+		multiCMD._wait_all([(proc, None)], 5)
+		multiCMD._unregister(proc)
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert running == []
+	assert state['k'] > 40 and not multiCMD._live_procs
