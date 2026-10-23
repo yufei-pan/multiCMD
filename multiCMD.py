@@ -1225,10 +1225,37 @@ def _search_dirs(env, explicit):
 	entry, and so an empty PATH, is the current directory ( see _files_named )
 	'''
 	if explicit:
-		# ( env may hold bytes names, which os.get_exec_path() handles )
-		return os.get_exec_path(env)
-	# without its warnings.catch_warnings(), which is not thread-safe: env is os.environ, or a copy of it
+		# ( env may hold bytes names )
+		return _exec_path(env)
+	# env is os.environ, or a copy of it
 	path = (env if env is not None else os.environ).get('PATH')
+	return (os.defpath if path is None else path).split(os.pathsep)
+
+def _exec_path(env):
+	'''
+	os.get_exec_path(env), without the warnings.catch_warnings() it takes around the lookup ( internal )
+	That is not thread-safe before Python 3.14, and from 3.14 takes the warnings module's lock with `with`, which a
+	Ctrl-C right after the acquire leaves held for good ( a serial run starts its command on the main thread ): every
+	later Popen of a bare name and every warning, on any thread, then hangs ( seen with the start stress test on
+	3.14t ). A dict holding both a str and a bytes PATH warns of the comparison ( BytesWarning, under python -b ).
+	'''
+	if env is None:
+		env = os.environ
+	try:
+		path = env.get('PATH')
+	except (TypeError, BytesWarning):
+		path = None
+	if os.supports_bytes_environ:
+		try:
+			pathb = env[b'PATH']
+		except (KeyError, TypeError, BytesWarning):
+			pass
+		else:
+			if path is not None:
+				raise ValueError("env cannot contain 'PATH' and b'PATH' keys")
+			path = pathb
+		if isinstance(path, bytes):
+			path = os.fsdecode(path)
 	return (os.defpath if path is None else path).split(os.pathsep)
 
 def _files_named(command, dirs):
@@ -1259,9 +1286,10 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	- a failure to start multiCMD's own launcher ( the exec wrapper's interpreter, fork, pipes ) is never the
 	  command's: it stays an internal error whose message and traceback say what went wrong. Only E2BIG is the
 	  command's even then, as its arguments and environment travel in the wrapper's.
-	The exec wrapper applies the same rule in the command's process ( see _PGROUP_EXEC ); Popen ( Python 3.11+, or a
-	frozen app ) tries every PATH entry and reports one error from any of them, so a bare name it cannot start is
-	tried again here, one regular file at a time.
+	The exec wrapper applies the same rule in the command's process ( see _PGROUP_EXEC ). Popen ( Python 3.11+, or a
+	frozen app ) would try every PATH entry and report one error from any of them, and look them up with
+	os.get_exec_path() ( see _exec_path ), so a bare name is looked up here, one regular file at a time, and Popen
+	given its path ( executable ).
 	'''
 	command = argv[0]
 	wrapped = _uses_wrapper()
@@ -1269,21 +1297,19 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	if wrapped and bare and next(_files_named(command, _search_dirs(env, explicit)), None) is None:
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
-	try:
-		return _spawn_process(argv, stdout, stderr, env, explicit, started=started)
-	except OSError as e:
-		if wrapped:
-			if e.errno == errno.E2BIG:
-				raise _ExecRefused(e.errno, e.strerror, command) from None
-			if isinstance(e, (FileNotFoundError, PermissionError)):
-				# it is the interpreter that is missing or may not run, not the command
-				raise RuntimeError('cannot start the exec wrapper %r: %s' % (sys.executable, e)) from e
-			raise
-		if e.filename is None:
-			# not the command's exec that failed ( fork, pipes, ... )
-			raise
-		if not bare or e.errno == errno.E2BIG:
-			if isinstance(e, (FileNotFoundError, PermissionError)):
+	if wrapped or not bare:
+		try:
+			return _spawn_process(argv, stdout, stderr, env, explicit, started=started)
+		except OSError as e:
+			if wrapped:
+				if e.errno == errno.E2BIG:
+					raise _ExecRefused(e.errno, e.strerror, command) from None
+				if isinstance(e, (FileNotFoundError, PermissionError)):
+					# it is the interpreter that is missing or may not run, not the command
+					raise RuntimeError('cannot start the exec wrapper %r: %s' % (sys.executable, e)) from e
+				raise
+			if e.filename is None or isinstance(e, (FileNotFoundError, PermissionError)):
+				# not the command's exec that failed ( fork, pipes, ... ), or one that says what it is
 				raise
 			raise _ExecRefused(e.errno, e.strerror, e.filename) from None
 	failure = None

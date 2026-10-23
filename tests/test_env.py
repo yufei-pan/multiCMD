@@ -629,7 +629,8 @@ def test_a_bare_name_too_big_to_exec_is_not_tried_again_per_path_entry(launcher,
 	# one argument longer than MAX_ARG_STRLEN ( 128 KiB )
 	task = run_command(['mcmd-env-tool', 'x' * 200000], quiet=True, return_object=True)
 	assert task.returncode == 126 and not task._error and 'Argument list too long' in task.stderr[0]
-	assert calls == [None]
+	# ( once: through the wrapper, or Popen given the first file's path, see _exec_path )
+	assert calls == ([None] if launcher == 'wrapper' else [str(dirs[0] / 'mcmd-env-tool')])
 
 
 def test_snapshots_are_dropped_whatever_happens_to_the_task(launcher, tmp_path, monkeypatch):
@@ -939,3 +940,26 @@ def test_a_task_whose_thread_cannot_start_drops_its_snapshot(monkeypatch):
 	while time.monotonic() < deadline and ex._dispatching:
 		time.sleep(0.02)
 	assert task._extra_env is None and task._env is None
+
+
+def test_a_bare_name_is_looked_up_without_os_get_exec_path(launcher, monkeypatch):
+	# os.get_exec_path() takes warnings.catch_warnings(), whose lock 3.14 takes with `with`: a Ctrl-C right after the
+	# acquire, as Popen looked a serial run's command up on the main thread, left it held, and every later Popen of a
+	# bare name and every warning hung ( seen with the start stress test on 3.14t )
+	calls = []
+	real = os.get_exec_path
+	monkeypatch.setattr(os, 'get_exec_path', lambda *args: (calls.append(args), real(*args))[1])
+	import warnings
+	real_catch = warnings.catch_warnings
+	class Catch(real_catch):
+		def __enter__(self):
+			calls.append('catch_warnings')
+			return super().__enter__()
+	monkeypatch.setattr(warnings, 'catch_warnings', Catch)
+	assert run_command(['echo', 'a'], quiet=True) == ['a']
+	assert run_command(['sh', '-c', 'echo $A'], quiet=True, extra_env={'A': 'b'}) == ['b']
+	assert run_command(['sh', '-c', 'echo $A'], quiet=True, env={'A': 'c', 'PATH': os.environ['PATH']}) == ['c']
+	assert run_command(['echo', 'd'], quiet=True, pty=True) == ['d']
+	assert run_command(['mcmd-no-such-command-xyz'], quiet=True, return_code_only=True) == 127
+	# before ( fdc45b9 ): Popen ( 3.11+ ) and an environment of the command's own looked the name up with it
+	assert calls == []
