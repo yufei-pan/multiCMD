@@ -1801,3 +1801,43 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 	assert running == []
 	assert state['k'] > 40 and not multiCMD._live_procs
 
+
+# ( a Ctrl-C inside Thread.start()'s wait can leave that thread's Event inconsistent, CPython's own: the thread, which
+# multiCMD abandons then, fails as it comes up, and CPython reports that as unraisable )
+@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
+def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised():
+	# ( matrix of round 12, finding 4 ) on 3.13t the start stress test saw run_command() return normally after a
+	# Ctrl-C whose handler ran in the standard library's frames of the start ( a generator expression of
+	# signal.pthread_sigmask(), Thread.__init__, Popen.__init__, _execute_child ), and multiCMD's _execute never saw an
+	# exception. One KeyboardInterrupt at each call, return and C-call return of a serial run in turn, in every frame
+	# of the main thread ( subprocess's, contextlib's, os's ... ), outside the finalizers and weakref callbacks CPython
+	# drops what is raised in: run_command() raises it every time, so a Ctrl-C that Python raises there is never lost
+	# by multiCMD ( see _collection_watch ). threading's own frames are left out where a Ctrl-C right after
+	# a `with lock:` acquire leaves the lock held ( 3.6 - 3.9, 3.14: CPython's own, see the README )
+	skipped = {threading.__file__} if _WITH_MAY_JAM else set()
+	def counted(frame, event):
+		outer = frame
+		while outer is not None:
+			if outer.f_code.co_name in ('__del__', '_remove'):
+				return False
+			outer = outer.f_back
+		return frame.f_code.co_filename not in skipped
+	state = {'k': 0}
+	returned = []
+	while True:
+		sys.setprofile(_interrupt_at(state, counted))
+		try:
+			multiCMD.run_command(['true'], quiet=True)
+			if state['injected']:
+				returned.append(state['where'])
+		except KeyboardInterrupt:
+			pass
+		finally:
+			sys.setprofile(None)
+		multiCMD.kill_all(signal.SIGKILL)
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert returned == []
+	assert state['k'] > 100 and not multiCMD._live_procs
