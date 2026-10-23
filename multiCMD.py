@@ -103,10 +103,12 @@ _PGROUP_EXEC = (
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
 _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
-# the C function behind signal.pthread_sigmask(): it sets the calling thread's mask and returns the old one in one
-# call, after which an interrupt can only land with both done. The Python wrapper then converts that result in a
-# generator expression, where a Ctrl-C lands with the mask set and the old one lost ( see _spawn_process ). None
-# without one ( not POSIX, or a platform that has no pthread_sigmask )
+# the C function behind signal.pthread_sigmask(): it sets the calling thread's mask, then runs the Python signal
+# handlers ( PyErr_CheckSignals(), for a signal it may have unblocked ), so a Ctrl-C can come out of the call itself
+# with the new mask set and the old one never returned ( see _spawn_process, which reads the old one with a call that
+# changes nothing ). The Python wrapper adds another such point: it converts that result in a generator expression,
+# where a Ctrl-C lands with the mask set and the old one lost. None without one ( not POSIX, or a platform that has
+# no pthread_sigmask )
 try:
 	import _signal
 except ImportError:
@@ -1534,10 +1536,11 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	if _sigmask is None:
 		proc = _popen(argv, started=started, grouped=grouped, **kwargs)
 		return proc, (proc.pid if grouped else None)
-	# the mask as it is, read with a call that changes nothing ( an interrupt as it returns leaves nothing to undo ): from
-	# the block on, an interrupt landing anywhere leaves it set back ( from Python 3.10 Python raises one only as a call
-	# begins or returns, or on a loop's way back, so nothing in the finally comes before its call; on 3.6 - 3.9 only a
-	# second one landing as the finally begins could )
+	# the mask as it is, read with a call that changes nothing ( an interrupt raised from inside it or as it returns
+	# leaves nothing to undo ): the block is in the try, as it can raise one with the mask already set ( see _sigmask ).
+	# From the block on, an interrupt landing anywhere leaves it set back ( from Python 3.10 Python raises one only as a
+	# call begins or returns, or on a loop's way back, so nothing in the finally comes before its call; on 3.6 - 3.9
+	# only a second one landing as the finally begins could ). The restoring call raises one only once the mask is back
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
 	try:
 		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
