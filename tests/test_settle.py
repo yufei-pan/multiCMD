@@ -2,9 +2,11 @@
 A Ctrl-C while multiCMD settles its bookkeeping: the step runs again to its end and the Ctrl-C is raised after it,
 never lost; the failure messages a step shows appear once, after it
 '''
+import collections
 import dis
 import functools
 import gc
+import inspect
 import os
 import signal
 import subprocess
@@ -2015,3 +2017,88 @@ def test_the_only_ctrl_c_anywhere_while_a_missing_command_is_dealt_with_is_raise
 		state['k'] += 1
 	assert lost == []
 	assert state['k'] > (20 if points == 'calls' else 2) and not multiCMD._live_procs
+
+
+# ---- review of round 14: a real Ctrl-C, tripped at an opcode of _execute and raised where CPython itself raises it
+
+def _lines_of(func, first, last):
+	'''The numbers of func's first line whose text is first, and of the next one after it whose text is last'''
+	lines, start = inspect.getsourcelines(func)
+	texts = [line.strip() for line in lines]
+	lo = texts.index(first)
+	return start + lo, start + texts.index(last, lo + 1)
+
+
+def _real_trip(state, code, lines):
+	'''
+	A trace function ( for _hook ) that trips a real pending SIGINT at the state['k']-th opcode event of code on the
+	lines ( lo, hi ), counting from 0, unlike _interrupt_at, which raises from the hook: _thread.interrupt_main() is
+	called from C ( a defaultdict's default_factory, so that no point where Python raises one runs in the trace
+	function ) with tracing off, and CPython raises it at its own next such point, whatever the Python version ( on
+	3.10 a conditional jump taken, or the start of a handler, included ). It sets state['tripped'] ( the line and
+	offset, None when the k-th event never came ) and state['n'].
+	'''
+	state.update(n=0, tripped=None)
+	trip = collections.defaultdict(_thread.interrupt_main)
+	lo, hi = lines
+	def trace(frame, event, arg):
+		frame.f_trace_opcodes = True
+		# ( f_lineno is None at an instruction of no line, such as a handler's first from 3.11 )
+		line = frame.f_lineno
+		if event != 'opcode' or frame.f_code is not code or line is None or not lo <= line <= hi or state['tripped']:
+			return trace
+		if state['n'] != state['k']:
+			state['n'] += 1
+			return trace
+		state['tripped'] = (line, frame.f_lasti)
+		sys.settrace(None)
+		return trip[0]
+	return trace
+
+
+_REAL_TRIPS = pytest.mark.skipif(not sys.platform.startswith('linux') or sys.version_info < (3, 7)
+	or signal.getsignal(signal.SIGINT) is not signal.default_int_handler,
+	reason='POSIX commands; opcode events need Python 3.7+; the default SIGINT handler')
+
+
+@_REAL_TRIPS
+def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_command_stopped(launcher, monkeypatch):
+	# ( review of round 14, item 1 ) once its loops had settled the first Ctrl-C, _execute decided what to raise
+	# ( `cut = cuts[0] if cuts else None`, `if proc is None:` ... ) outside every try, before the stop's. Python 3.10
+	# raises a pending Ctrl-C at every conditional jump taken there ( 3.6 - 3.9 at nearly any instruction ): a second
+	# one left _execute with the command registered, never signalled, still running 2 s later. A first Ctrl-C once
+	# Popen has the pid, and a real second one tripped at each opcode of those lines in turn: the command is dead soon
+	# after, and run_command() raises
+	code = multiCMD._execute.__code__
+	lines = _lines_of(multiCMD._execute, 'cut = cuts[0] if cuts else None', "reason, interrupted = 'stop', first")
+	state = {'k': 0}
+	real_execute_child = subprocess.Popen._execute_child
+	def execute_child(self, *args, **kwargs):
+		real_execute_child(self, *args, **kwargs)
+		state['proc'] = self
+		_hook(_real_trip(state, code, lines))
+		raise KeyboardInterrupt('first')
+	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
+	running, returned = [], []
+	while True:
+		try:
+			try:
+				multiCMD.run_command(['sleep', '30'], quiet=True)
+			finally:
+				_unhook()
+			returned.append(state['tripped'])
+		except KeyboardInterrupt:
+			pass
+		proc = state['proc']
+		if not multiCMD._wait_all([(proc, None)], 2):
+			# before ( 8bf868a ), on 3.10: registered and running, by one tripped at `cut = ...`, `if proc is None:`,
+			# `if cut is not None:` or `if not interrupt:`
+			running.append((state['tripped'], proc in multiCMD._live_procs))
+			proc.kill()
+		multiCMD._wait_all([(proc, None)], 5)
+		multiCMD._unregister(proc)
+		if state['tripped'] is None:
+			break
+		state['k'] += 1
+	assert running == [] and returned == []
+	assert state['k'] > 5 and not multiCMD._live_procs

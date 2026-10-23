@@ -2405,77 +2405,81 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# a second interrupt ( of any kind ) while the first is dealt with: it ends the wait for the command,
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_cut_stop(proc, pgid)
-		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
-		# is taken by the outer one, which is left from inside its try; neither has a condition ). The inner one does not
-		# end while something raised is not looked at: an interrupt landing once settle has completed ( on its way back,
-		# right after `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ),
-		# or a second one settle has not sent SIGTERM for
-		while True:
-			try:
-				while True:
-					try:
-						if raised:
-							# ( the oldest first: whatever came after _settle raised is looked at after it )
-							seen = raised.pop(0)
-							if cuts and seen is cuts[0]:
-								# raised by _settle, once settle has completed
-								settled = True
-							elif _is_interrupt(seen):
-								# pending as _settle was called, so settle never ran, or landing as it returned, once it
-								# had, or while this loop looked: it runs ( again ), knowing of it
-								cuts.append(seen)
-								settled = False
-							else:
-								# settle failed on its own, every time it ran ( see _settle ): what it did not do is left
-								# to the stop below, kill_all() and the exit hook
-								settled = True
-								if not quiet:
-									_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: '
-										f'{type(seen).__name__}: {seen}')
-						elif settled:
-							break
-						elif interrupt is None:
-							interrupt = waiting or _is_interrupt(first)
-						else:
-							_settle(settle, cuts, quiet)
-							settled = True
-					except BaseException as c:
-						raised.append(c)
-				# ( not the loop's way back: an interrupt landing there would leave _execute, the command not stopped )
-				break
-			except BaseException as c:
-				raised.append(c)
-		cut = cuts[0] if cuts else None
-		if proc is None:
-			# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
-			if cut is not None:
-				raise cut
-			raise
-		if cut is not None:
-			if interrupt:
-				# a second interrupt: it ends the wait for the command ( sent SIGTERM by settle )
-				raise cut
-			# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
-			first, interrupt = cut, True
-		if not interrupt:
-			# a failure of multiCMD's: the caller records it ( -1 )
-			try:
-				_stop_command(proc, pgid, quiet)
-			except BaseException:
-				_cut_stop(proc, pgid)
-				raise
-			_unregister(proc)
-			_join_all(readers, 1)
-			raise first
-		# an interrupt ( a Ctrl-C, a SIGTERM handler's SystemExit, whatever a program's signal handler raised ): the
-		# command is stopped and recorded as stopped, and the interrupt raised once it is dead. Stopped here, in the
-		# handler: Python 3.12 leaves it by a loop-like jump back, where an interrupt lands outside every try, and a
-		# second one there would leave the command unsignalled
-		reason, interrupted = 'stop', first
+		# what the loops below end on: the first interrupt that cut settle short, or came around it
+		cut = None
+		# from the loops to the end of the stop, an interrupt that lands outside their trys ( a second Ctrl-C: on Python
+		# 3.10 Python raises one at every conditional jump taken, as these decisions make, and on 3.6 - 3.9 at nearly any
+		# instruction ) has the command sent SIGTERM, and is raised on; one raised here on purpose needs no more
 		try:
+			# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
+			# is taken by the outer one, which is left from inside its try; neither has a condition ). The inner one does not
+			# end while something raised is not looked at: an interrupt landing once settle has completed ( on its way back,
+			# right after `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ),
+			# or a second one settle has not sent SIGTERM for
+			while True:
+				try:
+					while True:
+						try:
+							if raised:
+								# ( the oldest first: whatever came after _settle raised is looked at after it )
+								seen = raised.pop(0)
+								if cuts and seen is cuts[0]:
+									# raised by _settle, once settle has completed
+									settled = True
+								elif _is_interrupt(seen):
+									# pending as _settle was called, so settle never ran, or landing as it returned, once it
+									# had, or while this loop looked: it runs ( again ), knowing of it
+									cuts.append(seen)
+									settled = False
+								else:
+									# settle failed on its own, every time it ran ( see _settle ): what it did not do is left
+									# to the stop below, kill_all() and the exit hook
+									settled = True
+									if not quiet:
+										_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: '
+											f'{type(seen).__name__}: {seen}')
+							elif settled:
+								break
+							elif interrupt is None:
+								interrupt = waiting or _is_interrupt(first)
+							else:
+								_settle(settle, cuts, quiet)
+								settled = True
+						except BaseException as c:
+							raised.append(c)
+					# ( not the loop's way back: an interrupt landing there would leave _execute, the command not stopped )
+					break
+				except BaseException as c:
+					raised.append(c)
+			cut = cuts[0] if cuts else None
+			if proc is None:
+				# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
+				if cut is not None:
+					raise cut
+				raise
+			if cut is not None:
+				if interrupt:
+					# a second interrupt: it ends the wait for the command ( sent SIGTERM by settle )
+					raise cut
+				# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
+				first, interrupt = cut, True
+			if not interrupt:
+				# a failure of multiCMD's: the caller records it ( -1 )
+				_stop_command(proc, pgid, quiet)
+				_unregister(proc)
+				_join_all(readers, 1)
+				raise first
+			# an interrupt ( a Ctrl-C, a SIGTERM handler's SystemExit, whatever a program's signal handler raised ): the
+			# command is stopped and recorded as stopped, and the interrupt raised once it is dead. ( Stopped in the
+			# handler rather than after it, which changes nothing: on Python 3.12 the handler's way out is a jump back,
+			# which jumps before it checks for an interrupt, and CPython looks the handler of one raised there up at the
+			# instruction before the jump's target, the end of the try above: this handler runs again for it )
+			reason, interrupted = 'stop', first
 			_stop_command(proc, pgid, quiet)
-		except BaseException:
-			_cut_stop(proc, pgid)
+		except BaseException as c:
+			if proc is not None and c is not cut and c is not first:
+				# ( a stop cut short, or kept from beginning: see _stop_command )
+				_cut_stop(proc, pgid)
 			raise
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
