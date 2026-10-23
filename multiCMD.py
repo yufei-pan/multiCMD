@@ -2363,7 +2363,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		interrupt = None
 		# the interrupts that cut settle short ( see _settle ), or that came around it: never a failure of settle's own
 		cuts = []
-		# what the _settle() calls below raised that the loop has not looked at yet, and whether it is done
+		# what the _settle() calls below raised, and what landed around them, that the loop has not looked at yet ( in
+		# the order it came ), and whether settle is done with: it completed knowing of every interrupt in cuts, or
+		# failed on its own
 		raised = []
 		settled = False
 		def settle():
@@ -2397,20 +2399,25 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_cut_stop(proc, pgid)
 		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
-		# is taken by the outer one, which is left from inside its try )
+		# is taken by the outer one, which is left from inside its try ). The inner one does not end while something
+		# raised is not looked at: an interrupt landing once settle has completed ( on its way back, right after
+		# `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ), or a second
+		# one settle has not sent SIGTERM for
 		while True:
 			try:
-				while not settled:
+				while raised or not settled:
 					try:
 						if raised:
-							seen = raised.pop()
+							# ( the oldest first: whatever came after _settle raised is looked at after it )
+							seen = raised.pop(0)
 							if cuts and seen is cuts[0]:
 								# raised by _settle, once settle has completed
 								settled = True
 							elif _is_interrupt(seen):
-								# pending as _settle was called, so settle never ran, or landing as it returned, or while
-								# this loop looked: it runs again, knowing of it
+								# pending as _settle was called, so settle never ran, or landing as it returned, once it
+								# had, or while this loop looked: it runs ( again ), knowing of it
 								cuts.append(seen)
+								settled = False
 							else:
 								# settle failed on its own, every time it ran ( see _settle ): what it did not do is left
 								# to the stop below, kill_all() and the exit hook

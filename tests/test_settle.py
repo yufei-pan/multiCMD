@@ -1913,14 +1913,17 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 @pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
 @pytest.mark.parametrize('points', _POINTS)
-def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(collecting, points):
+@pytest.mark.parametrize('command', [['true'], ['mcmd-no-such-command-xyz']], ids=['true', 'missing'])
+def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(collecting, points, command):
 	# ( matrix of round 12, finding 4 ) on 3.13t the start stress test saw run_command() return normally after a
 	# Ctrl-C whose handler ran in the standard library's frames of the start ( a generator expression of
 	# signal.pthread_sigmask(), Thread.__init__, Popen.__init__, _execute_child ), and multiCMD's _execute never saw an
 	# exception. One KeyboardInterrupt at each call, return and C-call return of a serial run in turn, and at each loop
 	# back-jump, in every frame of the main thread ( subprocess's, contextlib's, os's ... ), outside the finalizers,
 	# weakref callbacks and collections CPython drops what is raised in ( see _interrupt_at ): run_command() raises it
-	# every time, so a Ctrl-C that Python raises there is never lost by multiCMD. threading's own frames are left out where a Ctrl-C right after a `with lock:` acquire leaves the lock held
+	# every time, so a Ctrl-C that Python raises there is never lost by multiCMD, for a command that runs and for one
+	# that is not found ( review of round 13, B1: on 3.14 lost on the way back of _execute's loop, see the test below ).
+	# threading's own frames are left out where a Ctrl-C right after a `with lock:` acquire leaves the lock held
 	# ( 3.6 - 3.9, 3.14: CPython's own, see the README )
 	skipped = {threading.__file__} if _WITH_MAY_JAM else set()
 	def counted(frame, event):
@@ -1930,7 +1933,7 @@ def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(collecting, points):
 	while True:
 		_hook(_interrupt_at(state, counted, points, collecting))
 		try:
-			multiCMD.run_command(['true'], quiet=True)
+			multiCMD.run_command(command, quiet=True)
 			if state['injected']:
 				returned.append(state['where'])
 		except KeyboardInterrupt:
@@ -1943,3 +1946,51 @@ def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(collecting, points):
 		state['k'] += 1
 	assert returned == []
 	assert state['k'] > (100 if points == 'calls' else 10) and not multiCMD._live_procs
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
+@pytest.mark.parametrize('points', _POINTS)
+@pytest.mark.parametrize('batch', [False, True], ids=['run_command', 'serial batch'])
+def test_the_only_ctrl_c_anywhere_while_a_missing_command_is_dealt_with_is_raised(monkeypatch, collecting, points, batch):
+	# ( review of round 13, B1 ) _execute deals with a command that is not found in the handler that settles a Ctrl-C,
+	# and once _settle() had returned, `settled = True` ended both its loops: a Ctrl-C landing next, on the inner loop's
+	# way back ( a check point on 3.14, and on 3.6 - 3.9 ), was taken by the outer one into what was raised, and never
+	# looked at. As the run deals with a failure, that is its only Ctrl-C: run_command() returned 127, and a serial
+	# batch ran its next command. The only Ctrl-C of the run at each point of multiCMD's code in turn, from the moment
+	# the command is found missing until the next one would start: it is raised, and the next command never starts
+	mine = multiCMD.__file__
+	def counted(frame, event):
+		return frame.f_code.co_filename == mine or frame.f_back is not None and frame.f_back.f_code.co_filename == mine
+	state = {'k': 0}
+	spawns = []
+	real_spawn = multiCMD._spawn
+	def spawn(command, *args, **kwargs):
+		# ( no Ctrl-C from the next command's start on )
+		_unhook()
+		spawns.append(command)
+		try:
+			return real_spawn(command, *args, **kwargs)
+		except FileNotFoundError:
+			_hook(_interrupt_at(state, counted, points, collecting))
+			raise
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
+	lost = []
+	while True:
+		del spawns[:]
+		try:
+			if batch:
+				outcome = run_commands([['mcmd-no-such-command-xyz'], ['true']], max_threads=1, quiet=True, return_code_only=True)
+			else:
+				outcome = multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=True, return_code_only=True)
+		except KeyboardInterrupt:
+			outcome = 'raised'
+		finally:
+			_unhook()
+		if state['injected'] and (outcome != 'raised' or len(spawns) > 1):
+			# before ( cf4a7c1 ): returned 127 ( [127, 0] ) after one on the way back of _execute's inner loop
+			lost.append((state['where'], outcome, spawns[1:]))
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert lost == []
+	assert state['k'] > (20 if points == 'calls' else 2) and not multiCMD._live_procs
