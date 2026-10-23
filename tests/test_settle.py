@@ -2,6 +2,8 @@
 A Ctrl-C while multiCMD settles its bookkeeping: the step runs again to its end and the Ctrl-C is raised after it,
 never lost; the failure messages a step shows appear once, after it
 '''
+import dis
+import functools
 import gc
 import os
 import signal
@@ -839,20 +841,28 @@ def _hook_the_fork(monkeypatch, in_fork, forked):
 		monkeypatch.setattr(os, 'posix_spawn', hooked(os.posix_spawn))
 
 
+def _collection_phase(collecting, name, info):
+	'''The gc.callbacks callback of _collection_watch ( partial()-bound to its dict )'''
+	collecting[threading.get_ident()] = name == 'start'
+
+
 def _collection_watch():
 	'''
 	A function that says whether a garbage collection runs on this thread now ( from its gc.callbacks start to its stop ),
-	and one that stops watching. A collection runs finalizers and weakref callbacks from C, wherever it was triggered,
+	one that stops watching, and one that forgets what it saw on this thread, for a caller to call as each run begins,
+	when no collection runs. A collection runs finalizers and weakref callbacks from C, wherever it was triggered,
 	and CPython drops what is raised there: reported to the unraisable hook, or to stderr before 3.8, or not at all
 	( an io object's close() as it is collected, up to 3.12 ). Free-threaded 3.13t also runs a signal handler from within
 	a collection, outside any finalizer, with the frame that triggered it as the current one, and drops the
-	KeyboardInterrupt it raises silently
+	KeyboardInterrupt it raises silently. So is one raised in the watch's own callback ( _collection_phase ): one that
+	landed in its 'stop' before it recorded the end would leave it saying a collection runs, and excuse every Ctrl-C
+	after it, without the reset
 	'''
 	collecting = {}
-	def phase(name, info):
-		collecting[threading.get_ident()] = name == 'start'
+	phase = functools.partial(_collection_phase, collecting)
 	gc.callbacks.append(phase)
-	return (lambda: collecting.get(threading.get_ident(), False)), (lambda: gc.callbacks.remove(phase))
+	return ((lambda: collecting.get(threading.get_ident(), False)), (lambda: gc.callbacks.remove(phase)),
+		(lambda: collecting.pop(threading.get_ident(), None)))
 
 
 # on Python 3.6 - 3.9 and 3.14 a Ctrl-C right after a C lock's acquire in a `with lock:` leaves the lock held, and
@@ -880,7 +890,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	# dropped, or anything else that runs during a collection, see _collection_watch ), whether inside the fork, and where
 	landed = []
 	# whether a garbage collection runs on this thread now ( see _collection_watch )
-	collecting, unwatch = _collection_watch()
+	collecting, unwatch, reset_watch = _collection_watch()
 	request.addfinalizer(unwatch)
 	# whether a Ctrl-C raises: only while a run goes on ( one that lands after it is only recorded )
 	armed = [False]
@@ -952,6 +962,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 			finally:
 				sent.append(1)
 		del landed[:], unraisable[:]
+		reset_watch()
 		try:
 			try:
 				# ( a bare thread: Thread.start() and join() take threading's own locks with `with`, which a Ctrl-C
@@ -1020,7 +1031,7 @@ def test_the_stress_tests_excuse_is_only_what_runs_during_a_collection():
 	# and took them for interrupts multiCMD lost. They ran during a garbage collection, which _collection_watch() tells
 	# from gc.callbacks: a weakref callback a collection runs is excused, and the same callback run otherwise is not,
 	# nor is a function called by the run itself
-	collecting, unwatch = _collection_watch()
+	collecting, unwatch, _ = _collection_watch()
 	seen = []
 	try:
 		class Box:
@@ -1614,31 +1625,121 @@ def test_no_generator_of_multicmds_is_closed_on_the_main_threads_paths(launcher,
 
 # ---- matrix of round 12: an interrupt at any point where Python raises one, in turn ( see _interrupt_at )
 
-def _interrupt_at(state, counted):
+# the points _interrupt_at puts a Ctrl-C at: calls and returns, or loop back-jumps ( opcode events: from Python 3.7 )
+_POINTS = ['calls', pytest.param('jumps', marks=pytest.mark.skipif(sys.version_info < (3, 7), reason='opcode events need Python 3.7+'))]
+
+# code -> its loop back-jumps that are check points ( see _back_jumps )
+_JUMPS = {}
+
+def _back_jumps(code):
 	'''
-	A profile function ( sys.setprofile ) that raises KeyboardInterrupt at the state['k']-th event counted(frame, event)
-	accepts, counting from 0: a Python function's 'call' ( Python raises a pending Ctrl-C as a function starts ), its
-	'return' ( on 3.6 - 3.10 also as the caller gets the result ), and a C function's 'c_return' ( as its caller gets
-	the result ). That is where Python itself raises a Ctrl-C ( and, from 3.10 on, only there or on a loop's way
-	back ), so k from 0 up to the last event puts one at each of those points in turn. A profile function that raises
-	is unset by Python: one per run. It sets state['n'] ( events counted so far ), state['where'] ( the one it raised at )
-	and state['injected']. A finalizer or weakref callback the garbage collector runs meanwhile is not counted: CPython
-	drops what is raised there.
+	code's loop back-jumps where Python raises a pending interrupt, as { offset: the jump's offset }, for the jump and
+	for the EXTENDED_ARG before it, if any ( up to 3.10 the opcode event of such a jump comes at that EXTENDED_ARG only,
+	from 3.11 at both ): JUMP_BACKWARD from 3.11 ( not JUMP_BACKWARD_NO_INTERRUPT ), a JUMP_ABSOLUTE to an earlier
+	offset before. 3.10 and 3.11 also raise one at a conditional jump back ( POP_JUMP_IF_FALSE,
+	POP_JUMP_BACKWARD_IF_FALSE ... ), only when it is taken, which an opcode event cannot tell ( it comes before the
+	jump ): those are left out. On 3.6 - 3.9 Python raises one after most instructions, so after a JUMP_ABSOLUTE, at
+	its target, with the try blocks of the jump in force
+	'''
+	jumps = _JUMPS.get(code)
+	if jumps is None:
+		jumps = _JUMPS[code] = {}
+		prefix = None
+		for x in dis.get_instructions(code):
+			if x.opname == 'EXTENDED_ARG':
+				prefix = x.offset if prefix is None else prefix
+				continue
+			if x.opname == 'JUMP_BACKWARD' or x.opname == 'JUMP_ABSOLUTE' and x.argval < x.offset:
+				jumps[x.offset] = x.offset
+				if prefix is not None:
+					jumps[prefix] = x.offset
+			prefix = None
+	return jumps
+
+
+def _interrupt_at(state, counted, points='calls', collecting=None):
+	'''
+	A hook ( for _hook ) that raises KeyboardInterrupt at the state['k']-th point counted(frame, event) accepts, counting
+	from 0. With points 'calls' a profile function, at a Python function's 'call' ( Python raises a pending Ctrl-C as a
+	function starts ), its 'return' ( on 3.6 - 3.10 also as the caller gets the result ), and a C function's 'c_return'
+	( as its caller gets the result ); with 'jumps' a trace function, at the 'opcode' event of a loop back-jump ( see
+	_back_jumps ). That is where Python itself raises a Ctrl-C ( from 3.10 on, only there ), so k from 0 up to the last
+	point puts one at each of them in turn. A hook that raises is unset by Python: one per run. It sets state['n']
+	( points counted so far ), state['where'] ( the one it raised at ) and state['injected']. Nothing is counted inside a
+	finalizer or weakref callback ( a __del__ or a _remove further up the stack ), or while a garbage collection runs
+	( collecting: see _collection_watch, reset here as the run begins ): CPython drops what is raised there.
 	'''
 	state.update(n=0, where=None, injected=False)
-	def profile(frame, event, arg):
-		if event not in ('call', 'return', 'c_return') or frame.f_code.co_name in ('__del__', '_remove') \
-			or not counted(frame, event):
-			return
+	if collecting is not None:
+		collecting[2]()
+	def excused(frame):
+		if collecting is not None and collecting[0]():
+			return True
+		if frame.f_code is _hook.__code__ or frame.f_code is _unhook.__code__:
+			# ( the test's own: setting the hook, and unsetting it )
+			return True
+		while frame is not None:
+			if frame.f_code.co_name in ('__del__', '_remove') or frame.f_code is _collection_phase.__code__:
+				return True
+			frame = frame.f_back
+		return False
+	def inject(frame, event, what):
 		if state['n'] == state['k']:
 			state['injected'] = True
-			state['where'] = (event, frame.f_code.co_name, frame.f_lineno, getattr(arg, '__name__', None) if event == 'c_return' else None)
+			state['where'] = (event, frame.f_code.co_name, frame.f_lineno, what)
 			raise KeyboardInterrupt('injected')
 		state['n'] += 1
-	return profile
+	def profile(frame, event, arg):
+		if event in ('call', 'return', 'c_return') and counted(frame, event) and not excused(frame):
+			inject(frame, event, getattr(arg, '__name__', None) if event == 'c_return' else None)
+	# the frame and the jump whose EXTENDED_ARG was counted: its own event, which follows from 3.11, is the same point
+	prefixed = [None]
+	def trace(frame, event, arg):
+		# ( at every event: from 3.12 one set as the frame's 'call' comes, before it has a trace function, does nothing )
+		frame.f_trace_opcodes = True
+		if event != 'opcode':
+			return trace
+		jump = _back_jumps(frame.f_code).get(frame.f_lasti)
+		if jump is None or (frame.f_lasti == jump and prefixed[0] == (frame, jump)):
+			return trace
+		prefixed[0] = (frame, jump) if frame.f_lasti != jump else None
+		if counted(frame, event) and not excused(frame):
+			inject(frame, event, jump)
+		return trace
+	return profile if points == 'calls' else trace
 
 
-def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_ones(capfd):
+def _hook(hook):
+	'''
+	Set a hook from _interrupt_at on this thread: a profile function for every frame from here on, a trace function for
+	those and for the frames running already, up to the test's own ( a loop of theirs is traced too )
+	'''
+	if hook.__name__ == 'profile':
+		sys.setprofile(hook)
+		return
+	sys.settrace(hook)
+	frame = sys._getframe(1)
+	while frame is not None and not frame.f_code.co_name.startswith('test_'):
+		frame.f_trace = hook
+		frame.f_trace_opcodes = True
+		frame = frame.f_back
+
+
+def _unhook():
+	sys.setprofile(None)
+	sys.settrace(None)
+
+
+@pytest.fixture
+def collecting():
+	'''A _collection_watch() for _interrupt_at, for the test's length'''
+	watch = _collection_watch()
+	yield watch
+	watch[1]()
+
+
+@pytest.mark.parametrize('points', _POINTS)
+def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_ones(capfd, collecting, points):
 	# ( matrix of round 12, finding 1 ) _settle() set its per-thread state as it began and reset it in its finally; a
 	# Ctrl-C landing in that finally before the reset ( as getattr() returned ) left it set, so every later _settle() on
 	# that thread took itself for a nested one and never showed the messages of its step: _show_error() dropped them
@@ -1651,14 +1752,13 @@ def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_on
 		multiCMD._show_error('shown by the step')
 	state = {'k': 0}
 	while True:
-		profile = _interrupt_at(state, counted)
-		sys.setprofile(profile)
+		_hook(_interrupt_at(state, counted, points, collecting))
 		try:
 			multiCMD._settle(step)
 		except KeyboardInterrupt:
 			pass
 		finally:
-			sys.setprofile(None)
+			_unhook()
 		capfd.readouterr()
 		runs = []
 		def fails_once():
@@ -1672,7 +1772,7 @@ def test_a_ctrl_c_anywhere_in_a_settled_step_leaves_no_state_behind_for_later_on
 		if not state['injected']:
 			break
 		state['k'] += 1
-	assert state['k'] > 10
+	assert state['k'] > (10 if points == 'calls' else 1)
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
@@ -1681,24 +1781,22 @@ def test_a_ctrl_c_anywhere_in_a_start_leaves_the_signal_mask_as_it_was(launcher)
 	# Python wrapper turns the C call's result into a set in a generator expression once the mask is set: a Ctrl-C
 	# landing there left them blocked on the main thread for good ( old_mask never assigned, the finally never entered:
 	# 45 % of the Ctrl-Cs raised in that wrapper, by a probe ), and one landing as the restoring call began left them
-	# blocked too. A Ctrl-C at each point of a start, in turn: in _spawn_process, as what it calls begins and returns,
-	# and in the signal module's own code
+	# blocked too. A Ctrl-C at each point of a start, in turn: in _spawn_process, and as what it calls begins and
+	# returns ( it calls _signal.pthread_sigmask(), the C function, and no code of the signal module's )
 	code = multiCMD._spawn_process.__code__
 	def counted(frame, event):
-		return (frame.f_code is code or frame.f_back is not None and frame.f_back.f_code is code
-			or frame.f_code.co_filename == signal.__file__)
+		return frame.f_code is code or frame.f_back is not None and frame.f_back.f_code is code
 	before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
 	state = {'k': 0}
 	while True:
 		started = []
-		profile = _interrupt_at(state, counted)
-		sys.setprofile(profile)
+		_hook(_interrupt_at(state, counted))
 		try:
 			multiCMD._spawn_process(['true'], subprocess.DEVNULL, subprocess.DEVNULL, started=started)
 		except KeyboardInterrupt:
 			pass
 		finally:
-			sys.setprofile(None)
+			_unhook()
 		mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
 		signal.pthread_sigmask(signal.SIG_SETMASK, before)
 		for proc, _ in started:
@@ -1714,7 +1812,8 @@ def test_a_ctrl_c_anywhere_in_a_start_leaves_the_signal_mask_as_it_was(launcher)
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
-def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_it(launcher, monkeypatch):
+@pytest.mark.parametrize('points', _POINTS)
+def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_it(launcher, monkeypatch, collecting, points):
 	# ( matrix of round 12, finding 3 ) _execute() began its handling of an interrupt with _is_interrupt(first), a call
 	# before the loop that settles: a second Ctrl-C raised as it began ( the next point where Python raises one, so
 	# where a signal delivered twice lands ) left _execute before settle had registered the command, which ran on in
@@ -1727,7 +1826,7 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 		if proc is not None and proc in multiCMD._live_procs:
 			# registered: nothing after this can lose it
 			state['registered'] = True
-			sys.setprofile(None)
+			_unhook()
 			return False
 		mine = multiCMD.__file__
 		return frame.f_code.co_filename == mine or frame.f_back is not None and frame.f_back.f_code.co_filename == mine
@@ -1736,7 +1835,7 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 		real_execute_child(self, *args, **kwargs)
 		# the first Ctrl-C, inside Popen once it has the pid; the second one from here on
 		state['proc'] = self
-		sys.setprofile(_interrupt_at(state, counted))
+		_hook(_interrupt_at(state, counted, points, collecting))
 		raise KeyboardInterrupt('first')
 	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
 	lost = []
@@ -1747,7 +1846,7 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 			with pytest.raises(KeyboardInterrupt):
 				multiCMD.run_command(['sleep', '30'], quiet=True)
 		finally:
-			sys.setprofile(None)
+			_unhook()
 		proc = state['proc']
 		if proc in multiCMD._live_procs:
 			# what a second Ctrl-C left registered: kill_all() and the exit hook reach it
@@ -1761,11 +1860,11 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 			break
 		state['k'] += 1
 	assert lost == []
-	assert state['k'] > 5 and state['registered']
+	assert state['k'] > (5 if points == 'calls' else 0) and state['registered']
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
-def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(launcher, monkeypatch):
+def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(launcher, monkeypatch, collecting):
 	# ( matrix of round 12, with finding 3 ) a second Ctrl-C ends the wait for the command, which is sent SIGTERM at
 	# least: _stop_command() did that in a try of its own, and one that landed as the call to it began, before that try,
 	# left the command registered but running, unsignalled. A first Ctrl-C once Popen has the pid, and a second one at
@@ -1778,7 +1877,7 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 	def execute_child(self, *args, **kwargs):
 		real_execute_child(self, *args, **kwargs)
 		state['proc'] = self
-		sys.setprofile(_interrupt_at(state, counted))
+		_hook(_interrupt_at(state, counted, collecting=collecting))
 		raise KeyboardInterrupt('first')
 	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
 	running = []
@@ -1787,7 +1886,7 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 			with pytest.raises(KeyboardInterrupt):
 				multiCMD.run_command(['sleep', '30'], quiet=True)
 		finally:
-			sys.setprofile(None)
+			_unhook()
 		proc = state['proc']
 		if not multiCMD._wait_all([(proc, None)], 2):
 			# before ( f891332 ): left running by a second Ctrl-C as _stop_command() began, registered; or lost
@@ -1806,27 +1905,23 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 # multiCMD abandons then, fails as it comes up, and CPython reports that as unraisable )
 @pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
-def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised():
+@pytest.mark.parametrize('points', _POINTS)
+def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(collecting, points):
 	# ( matrix of round 12, finding 4 ) on 3.13t the start stress test saw run_command() return normally after a
 	# Ctrl-C whose handler ran in the standard library's frames of the start ( a generator expression of
 	# signal.pthread_sigmask(), Thread.__init__, Popen.__init__, _execute_child ), and multiCMD's _execute never saw an
-	# exception. One KeyboardInterrupt at each call, return and C-call return of a serial run in turn, in every frame
-	# of the main thread ( subprocess's, contextlib's, os's ... ), outside the finalizers and weakref callbacks CPython
-	# drops what is raised in: run_command() raises it every time, so a Ctrl-C that Python raises there is never lost
-	# by multiCMD ( see _collection_watch ). threading's own frames are left out where a Ctrl-C right after
-	# a `with lock:` acquire leaves the lock held ( 3.6 - 3.9, 3.14: CPython's own, see the README )
+	# exception. One KeyboardInterrupt at each call, return and C-call return of a serial run in turn, and at each loop
+	# back-jump, in every frame of the main thread ( subprocess's, contextlib's, os's ... ), outside the finalizers,
+	# weakref callbacks and collections CPython drops what is raised in ( see _interrupt_at ): run_command() raises it
+	# every time, so a Ctrl-C that Python raises there is never lost by multiCMD. threading's own frames are left out where a Ctrl-C right after a `with lock:` acquire leaves the lock held
+	# ( 3.6 - 3.9, 3.14: CPython's own, see the README )
 	skipped = {threading.__file__} if _WITH_MAY_JAM else set()
 	def counted(frame, event):
-		outer = frame
-		while outer is not None:
-			if outer.f_code.co_name in ('__del__', '_remove'):
-				return False
-			outer = outer.f_back
 		return frame.f_code.co_filename not in skipped
 	state = {'k': 0}
 	returned = []
 	while True:
-		sys.setprofile(_interrupt_at(state, counted))
+		_hook(_interrupt_at(state, counted, points, collecting))
 		try:
 			multiCMD.run_command(['true'], quiet=True)
 			if state['injected']:
@@ -1834,10 +1929,10 @@ def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised():
 		except KeyboardInterrupt:
 			pass
 		finally:
-			sys.setprofile(None)
+			_unhook()
 		multiCMD.kill_all(signal.SIGKILL)
 		if not state['injected']:
 			break
 		state['k'] += 1
 	assert returned == []
-	assert state['k'] > 100 and not multiCMD._live_procs
+	assert state['k'] > (100 if points == 'calls' else 10) and not multiCMD._live_procs
