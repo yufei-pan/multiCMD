@@ -1479,3 +1479,45 @@ def test_a_ctrl_c_whose_clean_up_fails_on_its_own_once_is_still_a_ctrl_c(monkeyp
 		assert procs[0] not in multiCMD._live_procs
 	finally:
 		multiCMD.kill_all(signal.SIGKILL)
+
+
+def _builds(monkeypatch):
+	'''The tasks every run_commands() call builds, in a list'''
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	return tasks
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
+@pytest.mark.parametrize('where', ['waiting', 'draining'])
+def test_what_a_programs_handler_raises_into_a_serial_run_stops_the_run(monkeypatch, tmp_path, cancelling_handler, where):
+	# ( review of round 11, finding 6 ) a program's SIGINT handler that raises an Exception of its own while a serial run
+	# waits for its command: _execute stopped the command, and __run_command's `except Exception` recorded the
+	# handler's exception as multiCMD's own failure ( -1 ) and swallowed it, so the run went on with the next command
+	tasks = _builds(monkeypatch)
+	pidfile = tmp_path / 'pid'
+	first = ['sleep', '30'] if where == 'waiting' else ['sh', '-c', f'sleep 30 & echo $! > {pidfile}; echo hi']
+	main = threading.main_thread().ident
+	timer = threading.Timer(0.5, signal.pthread_kill, (main, signal.SIGINT))
+	timer.start()
+	try:
+		# before ( fc0c782 ): nothing raised, [-1, 0]
+		with pytest.raises(_Cancelled):
+			run_commands([first, ['true']], quiet=True)
+	finally:
+		timer.cancel()
+	assert cancelling_handler == [signal.SIGINT]
+	if where == 'waiting':
+		# recorded as stopped ( killed by the kill sequence's SIGINT ), not as a failure of multiCMD's
+		assert tasks[0].returncode == -signal.SIGINT and not tasks[0]._error
+	else:
+		# the command itself had exited; what held its output is stopped
+		assert tasks[0].returncode == 0 and tasks[0].stdout == ['hi']
+		pid = int(pidfile.read_text())
+		gone = pid_gone(pid, wait=2)
+		if not gone:
+			os.kill(pid, signal.SIGKILL)
+		assert gone
+	assert tasks[0]._finalized and tasks[1].returncode is None and tasks[1].stop
+	assert not multiCMD._live_procs and not multiCMD._draining

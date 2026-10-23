@@ -430,7 +430,12 @@ cannot start, stopping commands after a Ctrl-C or a failure, cancelling a batch,
 that cannot be run) makes that bookkeeping run again from the start, and the KeyboardInterrupt (or
 whatever your own handler raised) is raised once it is complete, so it neither cuts that short nor gets
 lost. Your handler, if you installed one, is called with every Ctrl-C as it lands, and C-level hooks on
-SIGINT (`faulthandler.register`, `signal.siginterrupt`) stay as they are.
+SIGINT (`faulthandler.register`, `signal.siginterrupt`) stay as they are. Whatever your handler raises
+while a call waits for its commands is handled as a Ctrl-C: the commands are stopped (a serial run's
+current one recorded as stopped, the ones after it skipped) and the exception is raised on. multiCMD
+tells it from a failure of its own by your handler's frame in its traceback, and takes anything raised
+while it only waits for a running command as yours; a handler that uninstalls itself before it
+raises is not seen elsewhere, and what it raises then while a command starts counts as a failure.
 
 ## Key functions and objects
 

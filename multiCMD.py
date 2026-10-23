@@ -903,7 +903,10 @@ class AsyncExecutor:
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
 		try:
 			self._wait_until(deadline, threads)
-		except _INTERRUPTS:
+		except BaseException as e:
+			# ( a thread never started is the caller's error, not an interrupt )
+			if not _is_interrupt(e):
+				raise
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its
 			# __context__ ); one that lands while the tasks are stopped is raised by _stop_tasks, before the wait
@@ -2177,6 +2180,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	running in the background on purpose.
 	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is
 	re-raised once the command is dead; a second one ends that wait, the command sent SIGTERM and still registered.
+	So is anything else a signal handler raises into the run ( a SIGTERM handler's SystemExit, a program's own
+	exception ), the task finalized as stopped: once the command runs, multiCMD only waits for it ( _watch, _drain:
+	polls, sleeps and joins, no I/O of their own ), so whatever is raised there is taken as such; before that, while
+	it starts, only an exception _is_interrupt() recognizes is ( a KeyboardInterrupt, a SystemExit, one with a
+	handler's frame in its traceback ), and anything else is a failure of multiCMD's, which the caller records ( -1 ).
 	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands while the command starts stops it like
 	any other, from the moment Popen has stored the child's pid ( see _Popen ). One that Python raises as the fork's
 	C call ( _fork_exec / posix_spawn ) returns, before Popen has stored the pid it returned, loses the command, which
@@ -2206,6 +2214,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	readers = []
 	# the interrupt to raise once the command is dead ( see below )
 	interrupted = None
+	# whether multiCMD only waits for the command now ( see below )
+	waiting = False
 	# from the pty on, an interrupt or any failure closes it; from the spawn on, it still stops the command, which runs
 	# in a process group of its own
 	try:
@@ -2240,11 +2250,14 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._last_output = time.monotonic()
 		readers.extend(_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams)
 		_start_threads(readers)
+		# from here on multiCMD only waits for the command ( polls and sleeps, no I/O of its own ), so whatever is
+		# raised meanwhile was raised into the run by a signal handler
+		waiting = True
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		first = e
-		# whether what came is an interrupt, rather than a failure ( see _is_interrupt )
-		interrupt = _is_interrupt(first)
+		# whether what came is an interrupt, rather than a failure of multiCMD's ( see _is_interrupt )
+		interrupt = waiting or _is_interrupt(first)
 		# the interrupts that cut settle short ( see _settle ): never a failure of settle's own
 		cuts = []
 		def settle():
@@ -2305,12 +2318,15 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# a second interrupt: it ends the wait for the command ( sent SIGTERM by settle )
 				raise cut
 			# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
-			first = cut
-		if not isinstance(first, KeyboardInterrupt):
+			first, interrupt = cut, True
+		if not interrupt:
+			# a failure of multiCMD's: the caller records it ( -1 )
 			_stop_command(proc, pgid, quiet)
 			_unregister(proc)
 			_join_all(readers, 1)
 			raise first
+		# an interrupt ( a Ctrl-C, a SIGTERM handler's SystemExit, whatever a program's signal handler raised ): the
+		# command is stopped and recorded as stopped, and the interrupt raised once it is dead
 		reason, interrupted = 'stop', first
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
@@ -2324,8 +2340,10 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		_draining[proc] = pgid
 		try:
 			reason = _drain(task, readers, timeout)
-		except _INTERRUPTS as e:
-			# ( a SystemExit from a SIGTERM handler as well: the background group is stopped before it is raised )
+		except BaseException as e:
+			# _drain only waits ( joins, no I/O of its own ): whatever is raised into it is an interrupt, a SIGTERM
+			# handler's SystemExit or another signal handler's exception, and the background group is stopped before
+			# it is raised
 			reason, interrupted = 'stop', e
 		finally:
 			_draining.pop(proc, None)
@@ -2387,13 +2405,18 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 					_display.message('-' * 100, decor)
 				_execute(task, timeout, quiet, decor, use_pty)
 			# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
-			except FileNotFoundError as e:
-				_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet), quiet=quiet)
-			except (PermissionError, _ExecRefused) as e:
-				# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-				_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet), quiet=quiet)
 			except Exception as e:
-				_settle(lambda: _fail_task(task, str(e), e, quiet), quiet=quiet)
+				if task._finalized:
+					# what a signal handler raised into the run: _execute recorded the command as stopped ( see there ),
+					# and it is raised on, as a KeyboardInterrupt is
+					raise
+				if isinstance(e, FileNotFoundError):
+					_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet), quiet=quiet)
+				elif isinstance(e, (PermissionError, _ExecRefused)):
+					# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
+					_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet), quiet=quiet)
+				else:
+					_settle(lambda: _fail_task(task, str(e), e, quiet), quiet=quiet)
 			finally:
 				task._finalized = True
 				# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
@@ -2935,7 +2958,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		try:
 			for task, decor in zip(tasks, decors):
 				__run_command(task, sem, timeout, quiet, False, decor=decor, use_pty=use_pty)
-		except _INTERRUPTS:
+		except BaseException:
+			# an interrupt ( a Ctrl-C, a signal handler's exception ): the commands after it never start
 			_stop_tasks(tasks)
 			raise
 	# return the only the output for the tasks
@@ -2976,7 +3000,10 @@ def join_threads(threads=...,timeout=None):
 	try:
 		for thread in threads:
 			_join(thread, timeout)
-	except _INTERRUPTS:
+	except BaseException as e:
+		# ( a thread never started is the caller's error, not an interrupt )
+		if not _is_interrupt(e):
+			raise
 		ours = []
 		def stop():
 			ours[:] = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
