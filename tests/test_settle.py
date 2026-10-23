@@ -1695,7 +1695,7 @@ def _interrupt_at(state, counted, points='calls', collecting=None):
 	# the frame and the jump whose EXTENDED_ARG was counted: its own event, which follows from 3.11, is the same point
 	prefixed = [None]
 	def trace(frame, event, arg):
-		# ( at every event: from 3.12 one set as the frame's 'call' comes, before it has a trace function, does nothing )
+		# ( at every event: set as the frame's 'call' comes, before it has a trace function, it does nothing )
 		frame.f_trace_opcodes = True
 		if event != 'opcode':
 			return trace
@@ -1709,6 +1709,25 @@ def _interrupt_at(state, counted, points='calls', collecting=None):
 	return profile if points == 'calls' else trace
 
 
+# whether opcode events have been traced once in this process ( see _hook )
+_PRIMED = []
+
+def _prime_opcode_events():
+	'''Trace the opcodes of a small loop once: on 3.12 the first trace function of a process gets no opcode events'''
+	def trace(frame, event, arg):
+		frame.f_trace_opcodes = True
+		return trace
+	def loop():
+		for _ in range(2):
+			pass
+	sys.settrace(trace)
+	try:
+		loop()
+	finally:
+		sys.settrace(None)
+	_PRIMED.append(True)
+
+
 def _hook(hook):
 	'''
 	Set a hook from _interrupt_at on this thread: a profile function for every frame from here on, a trace function for
@@ -1717,6 +1736,8 @@ def _hook(hook):
 	if hook.__name__ == 'profile':
 		sys.setprofile(hook)
 		return
+	if not _PRIMED:
+		_prime_opcode_events()
 	sys.settrace(hook)
 	frame = sys._getframe(1)
 	while frame is not None and not frame.f_code.co_name.startswith('test_'):

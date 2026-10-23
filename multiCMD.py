@@ -502,12 +502,16 @@ def _settle(step, cuts=None, quiet=False):
 		if own:
 			_settling.messages = messages
 		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one, which is left from
-		# inside its try, as a loop's way back is where Python raises one ). An interrupt runs step again, one that lands
-		# once it has completed included ( on that way back, right after `done = True` ), so step knows of it
+		# inside its try, as a loop's way back is where Python raises one. Neither has a condition: Python 3.12 and 3.13
+		# copy a loop's condition to the end of its body, with a back-jump that no try covers ). An interrupt runs step
+		# again, one that lands once it has completed included ( on that way back, right after `done = True` ), so step
+		# knows of it
 		while True:
 			try:
-				while not done and len(failures) < _STEP_FAILURES:
+				while True:
 					try:
+						if done or len(failures) >= _STEP_FAILURES:
+							break
 						step()
 						done = True
 					except BaseException as e:
@@ -2402,13 +2406,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_cut_stop(proc, pgid)
 		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
-		# is taken by the outer one, which is left from inside its try ). The inner one does not end while something
-		# raised is not looked at: an interrupt landing once settle has completed ( on its way back, right after
-		# `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ), or a second
-		# one settle has not sent SIGTERM for
+		# is taken by the outer one, which is left from inside its try; neither has a condition ). The inner one does not
+		# end while something raised is not looked at: an interrupt landing once settle has completed ( on its way back,
+		# right after `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ),
+		# or a second one settle has not sent SIGTERM for
 		while True:
 			try:
-				while raised or not settled:
+				while True:
 					try:
 						if raised:
 							# ( the oldest first: whatever came after _settle raised is looked at after it )
@@ -2428,6 +2432,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 								if not quiet:
 									_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: '
 										f'{type(seen).__name__}: {seen}')
+						elif settled:
+							break
 						elif interrupt is None:
 							interrupt = waiting or _is_interrupt(first)
 						else:
@@ -2462,11 +2468,18 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			_join_all(readers, 1)
 			raise first
 		# an interrupt ( a Ctrl-C, a SIGTERM handler's SystemExit, whatever a program's signal handler raised ): the
-		# command is stopped and recorded as stopped, and the interrupt raised once it is dead
+		# command is stopped and recorded as stopped, and the interrupt raised once it is dead. Stopped here, in the
+		# handler: Python 3.12 leaves it by a loop-like jump back, where an interrupt lands outside every try, and a
+		# second one there would leave the command unsignalled
 		reason, interrupted = 'stop', first
+		try:
+			_stop_command(proc, pgid, quiet)
+		except BaseException:
+			_cut_stop(proc, pgid)
+			raise
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
-	if reason is not None:
+	if reason is not None and interrupted is None:
 		try:
 			_stop_command(proc, pgid, quiet)
 		except BaseException:
