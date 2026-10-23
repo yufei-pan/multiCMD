@@ -629,7 +629,7 @@ def test_a_bare_name_too_big_to_exec_is_not_tried_again_per_path_entry(launcher,
 	# one argument longer than MAX_ARG_STRLEN ( 128 KiB )
 	task = run_command(['mcmd-env-tool', 'x' * 200000], quiet=True, return_object=True)
 	assert task.returncode == 126 and not task._error and 'Argument list too long' in task.stderr[0]
-	# ( once: through the wrapper, or Popen given the first file's path, see _exec_path )
+	# ( once: through the wrapper, or Popen given the first file's path, see _search_dirs )
 	assert calls == ([None] if launcher == 'wrapper' else [str(dirs[0] / 'mcmd-env-tool')])
 
 

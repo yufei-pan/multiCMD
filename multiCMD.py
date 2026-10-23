@@ -1218,44 +1218,17 @@ def _uses_wrapper():
 	# ( a frozen app's sys.executable is the app itself, not a Python that can run the wrapper )
 	return _IS_POSIX and not _HAS_PROCESS_GROUP and bool(sys.executable) and not getattr(sys, 'frozen', False)
 
-def _search_dirs(env, explicit):
+def _search_dirs(env):
 	'''
-	The directories a bare command name is looked up in, as os.get_exec_path() gives them ( internal ):
-	the PATH of the command's environment split on os.pathsep, os.defpath when it has none; an empty
-	entry, and so an empty PATH, is the current directory ( see _files_named )
+	The directories a bare command name is looked up in, as os.get_exec_path() gives them, without calling it ( internal ):
+	the PATH of the command's environment ( None: os.environ ) split on os.pathsep, os.defpath when it has none; an
+	empty entry, and so an empty PATH, is the current directory ( see _files_named ). os.get_exec_path() takes
+	warnings.catch_warnings() around the lookup, which is not thread-safe before Python 3.14 and from 3.14 takes the
+	warnings module's lock with `with`: a Ctrl-C right after the acquire ( a serial run starts its command on the main
+	thread ) leaves it held for good, and every later warning, on any thread, hangs. env is always a str-keyed dict here
+	( see _child_env ), so its bytes and b'PATH' handling has nothing to do.
 	'''
-	if explicit:
-		# ( env may hold bytes names )
-		return _exec_path(env)
-	# env is os.environ, or a copy of it
-	path = (env if env is not None else os.environ).get('PATH')
-	return (os.defpath if path is None else path).split(os.pathsep)
-
-def _exec_path(env):
-	'''
-	os.get_exec_path(env), without the warnings.catch_warnings() it takes around the lookup ( internal )
-	That is not thread-safe before Python 3.14, and from 3.14 takes the warnings module's lock with `with`, which a
-	Ctrl-C right after the acquire leaves held for good ( a serial run starts its command on the main thread ): every
-	later Popen of a bare name and every warning, on any thread, then hangs ( seen with the start stress test on
-	3.14t ). A dict holding both a str and a bytes PATH warns of the comparison ( BytesWarning, under python -b ).
-	'''
-	if env is None:
-		env = os.environ
-	try:
-		path = env.get('PATH')
-	except (TypeError, BytesWarning):
-		path = None
-	if os.supports_bytes_environ:
-		try:
-			pathb = env[b'PATH']
-		except (KeyError, TypeError, BytesWarning):
-			pass
-		else:
-			if path is not None:
-				raise ValueError("env cannot contain 'PATH' and b'PATH' keys")
-			path = pathb
-		if isinstance(path, bytes):
-			path = os.fsdecode(path)
+	path = (os.environ if env is None else env).get('PATH')
 	return (os.defpath if path is None else path).split(os.pathsep)
 
 def _files_named(command, dirs):
@@ -1288,13 +1261,13 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	  command's even then, as its arguments and environment travel in the wrapper's.
 	The exec wrapper applies the same rule in the command's process ( see _PGROUP_EXEC ). Popen ( Python 3.11+, or a
 	frozen app ) would try every PATH entry and report one error from any of them, and look them up with
-	os.get_exec_path() ( see _exec_path ), so a bare name is looked up here, one regular file at a time, and Popen
+	os.get_exec_path() ( see _search_dirs ), so a bare name is looked up here, one regular file at a time, and Popen
 	given its path ( executable ).
 	'''
 	command = argv[0]
 	wrapped = _uses_wrapper()
 	bare = _IS_POSIX and os.sep not in command
-	if wrapped and bare and next(_files_named(command, _search_dirs(env, explicit)), None) is None:
+	if wrapped and bare and next(_files_named(command, _search_dirs(env)), None) is None:
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	if wrapped or not bare:
@@ -1313,7 +1286,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 				raise
 			raise _ExecRefused(e.errno, e.strerror, e.filename) from None
 	failure = None
-	for path in _files_named(command, _search_dirs(env, True)):
+	for path in _files_named(command, _search_dirs(env)):
 		try:
 			# ( one that can run by now just runs, as it would have a moment ago )
 			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path, started=started)
