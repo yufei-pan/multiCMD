@@ -782,10 +782,24 @@ def _zombie(pid):
 		return True
 
 
-def _left_running(before, wait=3.0):
+def _describe(pid):
+	'''A child left behind, for the failure message: its state, process group, command line, and whether it is registered'''
+	try:
+		with open(f'/proc/{pid}/stat') as f:
+			fields = f.read().rsplit(')', 1)[1].split()
+		with open(f'/proc/{pid}/cmdline', 'rb') as f:
+			cmdline = f.read().replace(b'\0', b' ')[:80]
+	except OSError as e:
+		return (pid, repr(e))
+	registered = [(proc.returncode, pgid) for proc, pgid in multiCMD._live_procs.copy().items() if proc.pid == pid]
+	return (pid, 'state', fields[0], 'pgrp', fields[2], cmdline, 'registered', registered)
+
+
+def _left_running(before, wait=6.0):
 	'''
 	The children started since before that still run after up to wait seconds, or that are dead but neither
-	reaped nor registered ( kill_all() and the exit hook reap what is registered )
+	reaped nor registered ( kill_all() and the exit hook reap what is registered ). A start the helper undoes is
+	stopped within about 3 s: up to 1 s for take() to give up, then the kill's 2 s; wait leaves room for load.
 	'''
 	deadline = time.monotonic() + wait
 	while True:
@@ -887,13 +901,15 @@ def test_a_ctrl_c_while_the_command_starts_never_loses_it(launcher, monkeypatch,
 			multiCMD._unregister(proc)
 		if lost:
 			break
+	described = [_describe(pid) for pid in lost]
 	for pid in lost:
-		try:
-			os.killpg(pid, signal.SIGKILL)
-		except OSError:
-			pass
+		for kill in (os.killpg, os.kill):
+			try:
+				kill(pid, signal.SIGKILL)
+			except OSError:
+				pass
 	# before ( 0e4d015 ): a command started, unknown to kill_all(), left running
-	assert lost == []
+	assert described == []
 	if hasattr(multiCMD, '_Handoff'):
 		assert any(inside), 'no Ctrl-C landed while the command started'
 
