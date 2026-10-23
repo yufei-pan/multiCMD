@@ -283,3 +283,45 @@ def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, cap
 		multiCMD._live_procs.pop(proc, None)
 		proc.kill()
 		proc.wait(5)
+
+
+def test_a_command_given_up_on_is_named_once_whoever_gives_up_on_it():
+	# ( review of round 11, finding 10 ) two kill_all() at once ( from two threads ) both took it from the registry's
+	# snapshot, and the "show once" guard stored proc itself, so it always said "first": the pid was named twice
+	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	try:
+		lines = []
+		real = multiCMD._write_error
+		multiCMD._write_error = lines.append
+		try:
+			multiCMD._give_up_on([(proc, pgid)])
+			multiCMD._give_up_on([(proc, pgid)])
+		finally:
+			multiCMD._write_error = real
+		# before ( fc0c782 ): twice
+		assert lines == [f'multiCMD: pid {proc.pid} is still running after SIGKILL: no longer tracked']
+	finally:
+		proc.kill()
+		proc.wait(5)
+
+
+@pytest.mark.skipif(not hasattr(signal, 'SIGKILL'), reason='POSIX signals')
+def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, capfd):
+	# ( review of round 11, finding 9 ) kill_all() and the exit hook passed no quiet down, so a command no signal stops
+	# was named on stderr even when every multiCMD call was quiet ( statblk at exit )
+	ran = multiCMD.run_commands([['sleep', '30']], quiet=True, wait_for_return=False, return_object=True)
+	deadline = time.monotonic() + 5
+	while not multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.01)
+	(proc, pgid), = multiCMD._live_procs.copy().items()
+	try:
+		with monkeypatch.context() as m:
+			m.setattr(multiCMD, '_send', lambda *args: None)
+			multiCMD.kill_all()
+			assert proc not in multiCMD._live_procs and proc.poll() is None
+		# before ( fc0c782 ): "multiCMD: pid N is still running after SIGKILL: no longer tracked"
+		assert 'still running' not in capfd.readouterr().err
+	finally:
+		proc.kill()
+		multiCMD.join_threads(timeout=5)
+	assert ran[0].returncode == -signal.SIGKILL

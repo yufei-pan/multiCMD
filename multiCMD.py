@@ -1423,6 +1423,20 @@ def _in_subprocess():
 		frame = frame.f_back
 	return False
 
+def _peek(proc):
+	'''
+	Whether a command has exited, looked at without reaping it ( os.waitid() with WNOWAIT ) ( internal )
+	@returns:
+		None | str: None while it runs ( or where it cannot be looked at so ), 'exited' once it waits to be reaped,
+			'gone' when it is no longer a child this process can reap ( ECHILD: reaped already, by Popen or outside it )
+	'''
+	if not _CAN_PEEK:
+		return None
+	try:
+		return None if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None else 'exited'
+	except OSError:
+		return 'gone'
+
 def _poll(proc):
 	'''
 	proc.poll(), and the command reaped all the same once a jammed Popen lock keeps poll() from it ( internal )
@@ -1445,11 +1459,11 @@ def _poll(proc):
 	lock = getattr(proc, '_waitpid_lock', None)
 	if lock is None or not lock.locked():
 		return None
-	try:
-		if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
-			# still running
-			return None
-	except OSError:
+	state = _peek(proc)
+	if state is None:
+		# still running
+		return None
+	if state == 'gone':
 		# reaped meanwhile, by whoever holds the lock
 		return proc.returncode
 	now = time.monotonic()
@@ -1613,31 +1627,25 @@ def _wait_all(commands, timeout):
 		time.sleep(delay)
 	return True
 
-def _exited(proc):
-	'''Whether a command has exited, reaped or not ( internal ): _poll(), or os.waitid() without reaping'''
-	if _poll(proc) is not None:
-		return True
-	if not _CAN_PEEK:
-		return False
-	try:
-		return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
-	except OSError:
-		# reaped meanwhile
-		return True
-
 def _give_up_on(commands, quiet=False):
 	'''
 	Stop tracking the commands still running after a full kill sequence ( internal; see _kill_commands )
 	One no signal stops ( in uninterruptible sleep, or not ours to signal: EPERM ) would otherwise stay registered for
 	good, and cost every later kill_all() and the exit their full 2 s. It is dropped, with a message naming its pid
-	unless quiet, once.
+	once, unless quiet or the run that started it was quiet ( see _execute: kill_all() and the exit hook know no
+	quiet of their own ). One that has exited stays, reaped or not: whoever may reap it does ( see _poll ). Only
+	running commands are given up on: a draining one ( see _execute ) has exited, and kill_all() only reaches what it
+	left running.
 	'''
 	for proc, _ in commands:
-		if _exited(proc):
+		if _poll(proc) is not None or _peek(proc) is not None:
 			continue
 		_live_procs.pop(proc, None)
-		_draining.pop(proc, None)
-		if not quiet and proc.__dict__.setdefault('_multicmd_given_up', proc) is proc:
+		if quiet or proc.__dict__.get('_multicmd_quiet'):
+			continue
+		# ( once, whoever gives up on it at the same time: setdefault() says who stored first )
+		mine = object()
+		if proc.__dict__.setdefault('_multicmd_given_up', mine) is mine:
 			_write_error(f'multiCMD: pid {proc.pid} is still running after {"SIGKILL" if _IS_POSIX else "kill()"}: '
 				'no longer tracked')
 
@@ -2069,6 +2077,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		else:
 			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
 			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
+		# ( for kill_all() and the exit hook, which know no quiet of their own: see _give_up_on )
+		proc._multicmd_quiet = quiet
 		_register(proc, pgid)
 		if _exiting:
 			# started as the exit hook began: it may not have seen this one ( see _kill_running_at_exit )
@@ -2092,6 +2102,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				proc, pgid = started[-1]
 			if proc is not None:
 				# registered here, so kill_all() and the exit hook reach it whatever cuts the kill short
+				proc._multicmd_quiet = quiet
 				_live_procs[proc] = pgid
 			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
 			pending = streams
