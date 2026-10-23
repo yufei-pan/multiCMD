@@ -502,8 +502,8 @@ def _settle(step, cuts=None, quiet=False):
 		if own:
 			_settling.messages = messages
 		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one, which is left from
-		# inside its try, as a loop's way back is where Python raises one. Neither has a condition: Python 3.12 and 3.13
-		# copy a loop's condition to the end of its body, with a back-jump that no try covers ). An interrupt runs step
+		# inside its try, as a loop's way back is where Python raises one. Neither has a condition: Python 3.13 copies a
+		# loop's condition to the end of its body, with a back-jump that no try covers ). An interrupt runs step
 		# again, one that lands once it has completed included ( on that way back, right after `done = True` ), so step
 		# knows of it
 		while True:
@@ -1454,7 +1454,8 @@ class _Popen(subprocess.Popen):
 	counts, not _child_created: Windows stores it last, once the Popen has its process handle. An interrupt that
 	lands between the fork's return and that store ( _fork_exec, _posixsubprocess.fork_exec or os.posix_spawn has
 	returned the pid, and Python raises the interrupt before the next instruction stores it ) loses the command:
-	nothing but that C call ever knew the pid. That is the only place.
+	nothing but that C call ever knew the pid. Nowhere else does one interrupt lose it ( a second one can, on Python
+	3.6 - 3.10: see _execute ).
 	'''
 	def __init__(self, args, started=None, grouped=False, **kwargs):
 		if started is not None:
@@ -1542,9 +1543,10 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		return proc, (proc.pid if grouped else None)
 	# the mask as it is, read with a call that changes nothing ( an interrupt raised from inside it or as it returns
 	# leaves nothing to undo ): the block is in the try, as it can raise one with the mask already set ( see _sigmask ).
-	# From the block on, an interrupt landing anywhere leaves it set back ( from Python 3.10 Python raises one only as a
-	# call begins or returns, or on a loop's way back, so nothing in the finally comes before its call; on 3.6 - 3.9
-	# only a second one landing as the finally begins could ). The restoring call raises one only once the mask is back
+	# From the block on, an interrupt landing anywhere leaves it set back, but for a second one landing as the finally
+	# begins, the first raised in the try, on Python 3.6 - 3.10: those raise one there, before the restoring call ( 3.10
+	# also at a conditional jump taken, 3.6 - 3.9 at nearly any instruction ). From 3.11 Python raises one only as a call
+	# begins or returns, or on a loop's way back. The restoring call raises one only once the mask is back
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
 	try:
 		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
@@ -2293,9 +2295,12 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands while the command starts stops it like
 	any other, from the moment Popen has stored the child's pid ( see _Popen ). One that Python raises as the fork's
 	C call ( _fork_exec / posix_spawn ) returns, before Popen has stored the pid it returned, loses the command, which
-	then runs on in a process group of its own, unknown to kill_all() and the exit hook, as in multiCMD 1.54; nowhere
-	else is a command lost. Python raises it on the main thread only, and the window is the fork's own length: some
-	60 - 150 us, until the child has exec'd ( a quarter of a run of `true` on Python 3.13, 0.3 % of a 50 ms command ).
+	then runs on in a process group of its own, unknown to kill_all() and the exit hook, as in multiCMD 1.54. Python
+	raises it on the main thread only, and the window is the fork's own length: some 60 - 150 us, until the child has
+	exec'd ( a quarter of a run of `true` on Python 3.13, 0.3 % of a 50 ms command ). Nowhere else does one interrupt
+	lose a command. A second one can, before Python 3.11: one pending as the first reaches the handler that deals with
+	it is raised as that handler begins ( 3.6 - 3.10 ), and on 3.6 - 3.9, which raise one at nearly any instruction,
+	at a few other points of that handling.
 
 	@params:
 		task: The Task
@@ -2360,10 +2365,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		waiting = True
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
-		# nothing here is a call until the loop below is in its try: an interrupt raised before it ( a second Ctrl-C,
-		# or a Ctrl-C a free-threaded build delivers twice, which lands at the next point Python raises one ) would
-		# leave _execute before settle has registered the command, which would run on unknown to kill_all() and the
-		# exit hook. From Python 3.10 Python raises one only as a call begins or returns, or on a loop's way back
+		# nothing here is a call or a conditional jump until the try below: an interrupt raised before it ( a second
+		# Ctrl-C, or a Ctrl-C a free-threaded build delivers twice, which lands at the next point Python raises one ) would
+		# leave _execute before settle has registered the command, which would run on unknown to kill_all() and the exit
+		# hook. From Python 3.11 Python raises one only as a call begins or returns, or on a loop's way back. 3.10 also
+		# raises one as a handler begins, and 3.6 - 3.9 at nearly any instruction: there a second Ctrl-C pending as the
+		# first reaches this handler is raised before it, and loses a command that was starting ( one that was waited
+		# for stays registered, unsignalled )
 		first = e
 		# whether what came is an interrupt, rather than a failure of multiCMD's ( see _is_interrupt; None until the
 		# loop below has looked )
@@ -2989,8 +2997,8 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	A Ctrl-C ( or a signal handler's exception ) that Python raises as the fork returns, before Popen has stored the
 	child's pid, leaves the command running unregistered, unknown to kill_all() and the exit hook, as in 1.54: the
 	window is the fork's own length, some 60 - 150 us per command, and only a serial run ( max_threads=1 ) forks on
-	the main thread, where Python raises them. Anywhere else the command is stopped before the interrupt is re-raised
-	( see _execute ).
+	the main thread, where Python raises them. Anywhere else the command is stopped before the interrupt is re-raised,
+	but for a second one on Python 3.6 - 3.10, which can lose it too ( see _execute ).
 
 	@params:
 		command: The command to run

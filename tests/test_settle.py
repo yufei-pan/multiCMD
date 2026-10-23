@@ -1638,10 +1638,10 @@ def _back_jumps(code):
 	code's loop back-jumps where Python raises a pending interrupt, as { offset: the jump's offset }, for the jump and
 	for the EXTENDED_ARG before it, if any ( up to 3.10 the opcode event of such a jump comes at that EXTENDED_ARG only,
 	from 3.11 at both ): JUMP_BACKWARD from 3.11 ( not JUMP_BACKWARD_NO_INTERRUPT ), a JUMP_ABSOLUTE to an earlier
-	offset before. 3.10 and 3.11 also raise one at a conditional jump back ( POP_JUMP_IF_FALSE,
-	POP_JUMP_BACKWARD_IF_FALSE ... ), only when it is taken, which an opcode event cannot tell ( it comes before the
-	jump ): those are left out. On 3.6 - 3.9 Python raises one after most instructions, so after a JUMP_ABSOLUTE, at
-	its target, with the try blocks of the jump in force
+	offset before. 3.11 also raises one at a conditional jump back ( POP_JUMP_BACKWARD_IF_FALSE ... ), and 3.10 at
+	every conditional jump, back or forward ( POP_JUMP_IF_FALSE ... ), only when it is taken, which an opcode event cannot
+	tell ( it comes before the jump ): those are left out. On 3.6 - 3.9 Python raises one after most instructions, so
+	after a JUMP_ABSOLUTE, at its target, with the try blocks of the jump in force
 	'''
 	jumps = _JUMPS.get(code)
 	if jumps is None:
@@ -1665,11 +1665,17 @@ def _interrupt_at(state, counted, points='calls', collecting=None):
 	from 0. With points 'calls' a profile function, at a Python function's 'call' ( Python raises a pending Ctrl-C as a
 	function starts ), its 'return' ( on 3.6 - 3.10 also as the caller gets the result ), and a C function's 'c_return'
 	( as its caller gets the result ); with 'jumps' a trace function, at the 'opcode' event of a loop back-jump ( see
-	_back_jumps ). That is where Python itself raises a Ctrl-C ( from 3.10 on, only there ), so k from 0 up to the last
-	point puts one at each of them in turn. A hook that raises is unset by Python: one per run. It sets state['n']
-	( points counted so far ), state['where'] ( the one it raised at ) and state['injected']. Nothing is counted inside a
-	finalizer or weakref callback ( a __del__ or a _remove further up the stack ), or while a garbage collection runs
-	( collecting: see _collection_watch, reset here as the run begins ): CPython drops what is raised there.
+	_back_jumps ). From 3.11 on that is where Python itself raises a Ctrl-C, so k from 0 up to the last point puts one at
+	each of them in turn. What this model does not cover: on 3.10 a conditional jump taken, forward or back, and the
+	start of an except or finally handler, where Python raises one too ( see _real_trip, which trips a real one ); on
+	3.6 - 3.9 nearly every instruction. And at a JUMP_BACKWARD it raises before the jump, as 3.13 and 3.14 do, but
+	3.11 and 3.12 jump first and then raise, looking the handler up at the instruction before the target ( often
+	inside the try the jump leaves ): a failure there on 3.11 / 3.12 may be the model's own. A hook that raises is
+	unset by Python: one per run, and it raises nothing more once it has ( a frame keeps it as its local trace
+	function ). It sets state['n'] ( points counted so far ), state['where'] ( the one it raised at ) and
+	state['injected']. Nothing is counted inside a finalizer or weakref callback ( a __del__ or a _remove further up
+	the stack ), or while a garbage collection runs ( collecting: see _collection_watch, reset here as the run
+	begins ): CPython drops what is raised there.
 	'''
 	state.update(n=0, where=None, injected=False)
 	if collecting is not None:
@@ -1686,6 +1692,8 @@ def _interrupt_at(state, counted, points='calls', collecting=None):
 			frame = frame.f_back
 		return False
 	def inject(frame, event, what):
+		if state['injected']:
+			return
 		if state['n'] == state['k']:
 			state['injected'] = True
 			state['where'] = (event, frame.f_code.co_name, frame.f_lineno, what)
@@ -1722,12 +1730,17 @@ def _prime_opcode_events():
 	def loop():
 		for _ in range(2):
 			pass
+	before = sys.gettrace()
 	sys.settrace(trace)
 	try:
 		loop()
 	finally:
-		sys.settrace(None)
+		sys.settrace(before)
 	_PRIMED.append(True)
+
+
+# the profile and trace functions set before _hook set its own ( a coverage tracer, a debugger's ), which _unhook sets back
+_BEFORE_HOOK = []
 
 
 def _hook(hook):
@@ -1735,6 +1748,8 @@ def _hook(hook):
 	Set a hook from _interrupt_at on this thread: a profile function for every frame from here on, a trace function for
 	those and for the frames running already, up to the test's own ( a loop of theirs is traced too )
 	'''
+	if not _BEFORE_HOOK:
+		_BEFORE_HOOK.append((sys.getprofile(), sys.gettrace()))
 	if hook.__name__ == 'profile':
 		sys.setprofile(hook)
 		return
@@ -1749,8 +1764,11 @@ def _hook(hook):
 
 
 def _unhook():
-	sys.setprofile(None)
-	sys.settrace(None)
+	'''Unset _hook's hook, setting back what was set before it; once a hook is unset, again does nothing'''
+	if _BEFORE_HOOK:
+		profile, trace = _BEFORE_HOOK.pop()
+		sys.setprofile(profile)
+		sys.settrace(trace)
 
 
 @pytest.fixture
@@ -2123,6 +2141,7 @@ def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_com
 		state['k'] += 1
 	assert running == [] and returned == []
 	assert state['k'] > 5 and not multiCMD._live_procs
+
 
 @_REAL_TRIPS
 def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_its_group_untracked(launcher, monkeypatch):
