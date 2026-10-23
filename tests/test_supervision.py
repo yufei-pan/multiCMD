@@ -297,3 +297,63 @@ def test_a_ctrl_c_or_a_failure_right_after_the_spawn_still_stops_the_command(mon
 		assert procs[0].stdout.closed and procs[0].stderr.closed
 	finally:
 		multiCMD.kill_all(signal.SIGKILL)
+
+
+_EXIT_ON_SIGTERM = r'''
+import os, signal, subprocess, sys, threading, time
+sys.path.insert(0, sys.argv[1])
+import multiCMD
+pids, how = sys.argv[2], sys.argv[3]
+real = subprocess.Popen._execute_child
+def execute_child(self, *args, **kwargs):
+	real(self, *args, **kwargs)
+	with open(pids, 'a') as f:
+		f.write('%d\n' % self.pid)
+subprocess.Popen._execute_child = execute_child
+def handler(signum, frame):
+	# as kill_all()'s docstring suggests
+	multiCMD.kill_all()
+	sys.exit(143)
+signal.signal(signal.SIGTERM, handler)
+def sender():
+	deadline = time.monotonic() + 10
+	while not multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.01)
+	os.kill(os.getpid(), signal.SIGTERM)
+threading.Thread(target=sender, daemon=True).start()
+commands = [['sleep', '30']] * 20
+if how == 'join_threads':
+	multiCMD.run_commands(commands, quiet=True, wait_for_return=False)
+	multiCMD.join_threads()
+elif how == 'executor':
+	ex = multiCMD.AsyncExecutor(max_threads=1, quiet=True)
+	ex.run_commands(commands)
+	ex.wait()
+else:
+	# the program waits on something of its own: only the exit hook is left to stop them
+	multiCMD.run_commands(commands, quiet=True, wait_for_return=False)
+	threading.Event().wait(30)
+'''
+
+
+@pytest.mark.skipif(not hasattr(signal, 'SIGTERM') or os.name == 'nt', reason='POSIX signals')
+@pytest.mark.parametrize('how', ['join_threads', 'executor', 'its own wait'])
+def test_a_sigterm_handlers_exit_leaves_no_command_running(tmp_path, how):
+	# ( review of round 10, finding 8; probe r10probes/ff_exit2.py ) a program's SIGTERM handler calls kill_all() and
+	# sys.exit(): join_threads() and AsyncExecutor.wait() stopped the commands only on KeyboardInterrupt, so on that
+	# SystemExit the queued commands went on starting, after kill_all() and after the exit hook's snapshot
+	pids = tmp_path / 'pids'
+	proc = subprocess.run([sys.executable, '-c', _EXIT_ON_SIGTERM, str(PACKAGE_ROOT), str(pids), how],
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert proc.returncode == 143, proc.stderr
+	started = [int(pid) for pid in pids.read_text().split()]
+	left = [pid for pid in started if not pid_gone(pid, wait=2)]
+	for pid in left:
+		try:
+			os.kill(pid, signal.SIGKILL)
+		except OSError:
+			pass
+	# before ( fdc45b9 ): one more started after the exit hook had looked, and ran on
+	assert started and left == [], (started, proc.stderr)
+	# and no more start once the exit hook has begun ( without that check, all 20 started, each killed in turn )
+	assert len(started) <= 5, started

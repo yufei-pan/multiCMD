@@ -114,6 +114,8 @@ _draining = {}
 _live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
+# set by the exit hook: from then on no command starts, and one that started meanwhile stops ( see _kill_running_at_exit )
+_exiting = False
 
 #%% objects
 class Task:
@@ -834,13 +836,14 @@ class AsyncExecutor:
 				including the ones the dispatcher starts while waiting
 		@returns:
 			list[threading.Thread]: The threads that are still running
-		A Ctrl-C while it waits stops every command of the executor, waits up to 5 s for them ( a second Ctrl-C
-		ends that wait at once ) and re-raises.
+		A Ctrl-C ( or a SystemExit from a signal handler, as a SIGTERM handler's sys.exit() ) while it waits stops every
+		command of the executor, queued ones skipped, waits up to 5 s for them ( a second Ctrl-C ends that wait at
+		once ) and re-raises.
 		'''
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
 		try:
 			self._wait_until(deadline, threads)
-		except KeyboardInterrupt:
+		except _INTERRUPTS:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its
 			# __context__ ); one that lands while the tasks are stopped is raised by _stop_tasks, before the wait
@@ -1713,8 +1716,19 @@ def _kill_running_at_exit():
 	At interpreter exit, stop the commands that are still running ( internal )
 	What a finished command left running in the background is left alone: a fire-and-forget
 	command may start a long job on purpose ( `btrfs scrub start`, `nohup ...` ).
+	Daemon threads still run meanwhile ( fire-and-forget, executor and pool threads whose caller gave up waiting ),
+	so _exiting is set first: no command starts after it ( see __run_command ), one registered meanwhile stops itself
+	( see _execute ), and the registry is looked at again after each kill, until nothing new is in it.
 	'''
-	_kill_commands(list(_live_procs.copy().items()), signal.SIGTERM)
+	global _exiting
+	_exiting = True
+	killed = set()
+	while True:
+		commands = [(proc, pgid) for proc, pgid in _live_procs.copy().items() if proc not in killed]
+		if not commands:
+			return
+		killed.update(proc for proc, _ in commands)
+		_kill_commands(commands, signal.SIGTERM)
 
 atexit.register(_kill_running_at_exit)
 
@@ -2056,6 +2070,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
 			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
 		_register(proc, pgid)
+		if _exiting:
+			# started as the exit hook began: it may not have seen this one ( see _kill_running_at_exit )
+			task.stop = True
 		# started: a long-lived executor keeps its tasks, not the environments they were started with
 		task._env = task._extra_env = None
 		task.start_time = time.time()
@@ -2172,8 +2189,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		list[str]: The output of the command
 	'''
 	with sem:
-		if task.stop:
-			# stopped before it started: it stays unfinished, like a skipped queued command
+		if task.stop or _exiting:
+			# stopped before it started ( or the interpreter is exiting ): it stays unfinished, like a skipped queued command
+			task.stop = True
 			task._env = task._extra_env = None
 			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
@@ -2728,7 +2746,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		try:
 			for task, decor in zip(tasks, decors):
 				__run_command(task, sem, timeout, quiet, False, decor=decor, use_pty=use_pty)
-		except KeyboardInterrupt:
+		except _INTERRUPTS:
 			_stop_tasks(tasks)
 			raise
 	# return the only the output for the tasks
@@ -2750,9 +2768,10 @@ def join_threads(threads=...,timeout=None):
 	'''
 	Join threads
 
-	A Ctrl-C while it waits stops the commands of the multiCMD threads it waits for ( they run in process groups
-	of their own, so the terminal's Ctrl-C did not reach them ), waits up to 5 s in all for them ( a second
-	Ctrl-C ends that wait at once ) and re-raises, as a waiting run_commands() does.
+	A Ctrl-C ( or a SystemExit from a signal handler, as a SIGTERM handler's sys.exit() ) while it waits stops the
+	commands of the multiCMD threads it waits for ( they run in process groups of their own, so the terminal's
+	Ctrl-C did not reach them ), the ones still queued skipped, waits up to 5 s in all for them ( a second Ctrl-C
+	ends that wait at once ) and re-raises, as a waiting run_commands() does.
 
 	@params:
 		threads: The threads to join ( default: every fire-and-forget thread still running )
@@ -2768,7 +2787,7 @@ def join_threads(threads=...,timeout=None):
 	try:
 		for thread in threads:
 			_join(thread, timeout)
-	except KeyboardInterrupt:
+	except _INTERRUPTS:
 		ours = []
 		def stop():
 			ours[:] = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]

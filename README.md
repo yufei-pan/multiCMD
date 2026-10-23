@@ -395,12 +395,14 @@ every command inherits through any shell.
 
 Because the commands are not in your program's process group, signals sent to that
 group do not reach them. multiCMD handles this for you: a call waiting on the main
-thread that gets Ctrl-C (`join_threads()` and `AsyncExecutor.wait()` included) stops its
-commands before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
+thread that gets Ctrl-C, or the SystemExit of a SIGTERM handler's `sys.exit()`
+(`join_threads()` and `AsyncExecutor.wait()` included), stops its commands, the queued ones
+skipped, before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
 for them at once, a serial run's command still sent SIGTERM; one that lands while multiCMD stops them or forgets the threads that never ran ends
 it too), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
-commands still running when the interpreter exits are killed. A program that handles
+commands still running when the interpreter exits are killed (from then on no queued command
+starts). A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
 arrives), can call `multiCMD.kill_all()` from its handler. A command still running a second
 after SIGKILL (in uninterruptible sleep, or not yours to signal) is no longer tracked, so later

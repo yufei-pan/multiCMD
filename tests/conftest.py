@@ -22,6 +22,8 @@ def restore_module_globals():
 	yield
 	multiCMD.USE_SUDO = saved_use_sudo
 	multiCMD.SUDO_PATH = saved_sudo_path
+	# ( a test that runs the exit hook leaves it set )
+	multiCMD._exiting = False
 	multiCMD.join_threads(timeout=2)
 
 
