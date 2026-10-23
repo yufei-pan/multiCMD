@@ -1521,3 +1521,31 @@ def test_what_a_programs_handler_raises_into_a_serial_run_stops_the_run(monkeypa
 		assert gone
 	assert tasks[0]._finalized and tasks[1].returncode is None and tasks[1].stop
 	assert not multiCMD._live_procs and not multiCMD._draining
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
+def test_no_generator_of_multicmds_is_closed_on_the_main_threads_paths(launcher, tmp_path):
+	# ( found by the free-threaded stress loop of this round ) a generator left suspended is closed as it is dropped,
+	# by GeneratorExit thrown into its frame, and CPython drops as unraisable an interrupt raised there: a Ctrl-C landing
+	# as _spawn() returned from its loop over _files_named(), or as _drain() / _wait_all() / AsyncExecutor.wait() left
+	# their any() / all() over a generator expression, was lost
+	closed = []
+	def tracer(frame, event, arg):
+		if event == 'exception' and arg[0] is GeneratorExit and frame.f_code.co_filename == multiCMD.__file__:
+			closed.append(frame.f_code.co_name)
+		return tracer
+	sys.settrace(tracer)
+	try:
+		# a bare name ( looked up in PATH ), output drained after the command exits, a kill, an executor's wait
+		assert run_commands([['echo', 'a'], ['sh', '-c', 'sleep 0.3 & echo b']], quiet=True) == [['a'], ['b']]
+		proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+		other, other_pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+		multiCMD._kill_commands([(proc, pgid), (other, other_pgid)], signal.SIGTERM)
+		ex = AsyncExecutor(max_threads=2, quiet=True)
+		ex.run_commands([['sleep', '0.2'], ['true']])
+		assert ex.wait(timeout=10) == []
+	finally:
+		sys.settrace(None)
+	# before ( fc0c782 ): _files_named and the <genexpr>s ( on 3.9, 3.13.17, 3.14: Debian's 3.13.5 closes such a
+	# generator without resuming its frame, and passes either way )
+	assert closed == []

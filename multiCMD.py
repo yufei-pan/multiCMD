@@ -348,6 +348,18 @@ class _Thread(threading.Thread):
 				left = 1 if left is None else min(left, 1)
 			super().join(left)
 
+def _any_alive(threads):
+	'''
+	Whether any of the threads is alive ( internal )
+	A loop, not any() over a generator expression: a generator left suspended ( any() returns at the first True ) is
+	closed as it is dropped, by GeneratorExit thrown into its frame, and an interrupt Python raises there is dropped
+	by CPython as unraisable. The waits that use this run on the main thread, where a Ctrl-C would be lost so.
+	'''
+	for thread in threads:
+		if thread.is_alive():
+			return True
+	return False
+
 def _interrupt_in(error, before=None):
 	'''
 	The interrupt ( see _is_interrupt ) error is, or that it was raised while handling, if any ( internal )
@@ -926,8 +938,8 @@ class AsyncExecutor:
 				_join(thread, None if deadline is None else max(0, deadline - time.monotonic()))
 			# once a pass finishes every thread, look again for commands the dispatcher started meanwhile;
 			# stop when nothing new showed up ( a stale entry for a dead thread must not keep this looping ) or time is up
-			if threads is not ... or not pending or any(thread.is_alive() for thread in pending) \
-				or all(thread in joined for thread in pending) or (deadline is not None and time.monotonic() >= deadline):
+			if threads is not ... or not pending or _any_alive(pending) \
+				or joined.issuperset(pending) or (deadline is not None and time.monotonic() >= deadline):
 				return
 			joined.update(pending)
 	
@@ -1284,7 +1296,7 @@ def _search_dirs(env):
 	'''
 	The directories a bare command name is looked up in, as os.get_exec_path() gives them, without calling it ( internal ):
 	the PATH of the command's environment ( None: os.environ ) split on os.pathsep, os.defpath when it has none; an
-	empty entry, and so an empty PATH, is the current directory ( see _files_named ). os.get_exec_path() takes
+	empty entry, and so an empty PATH, is the current directory ( see _file_named ). os.get_exec_path() takes
 	warnings.catch_warnings() around the lookup, which is not thread-safe before Python 3.14 and from 3.14 takes the
 	warnings module's lock with `with`: a Ctrl-C right after the acquire ( a serial run starts its command on the main
 	thread ) leaves it held for good, and every later warning, on any thread, hangs. env is always a str-keyed dict here
@@ -1293,12 +1305,20 @@ def _search_dirs(env):
 	path = (os.environ if env is None else env).get('PATH')
 	return (os.defpath if path is None else path).split(os.pathsep)
 
-def _files_named(command, dirs):
-	'''The regular files by that name in dirs, in order and one at a time ( internal ); '' is the current directory'''
-	for d in dirs:
-		path = os.path.join(d or os.curdir, command)
+def _file_named(command, dirs, start=0):
+	'''
+	The first regular file by that name in dirs[start:] ( internal ); '' is the current directory
+	A plain function, not a generator: a generator left suspended is closed as it is dropped ( when the spawn returns
+	from the loop over it ), and an interrupt Python raises inside that close is dropped by CPython as unraisable,
+	so a Ctrl-C landing there was lost ( seen with the start stress test on 3.13t ).
+	@returns:
+		( int, str ) | ( None, None ): Its index in dirs and its path, or None without one
+	'''
+	for index in range(start, len(dirs)):
+		path = os.path.join(dirs[index] or os.curdir, command)
 		if os.path.isfile(path):
-			yield path
+			return index, path
+	return None, None
 
 def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	'''
@@ -1329,7 +1349,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 	command = argv[0]
 	wrapped = _uses_wrapper()
 	bare = _IS_POSIX and os.sep not in command
-	if wrapped and bare and next(_files_named(command, _search_dirs(env)), None) is None:
+	if wrapped and bare and _file_named(command, _search_dirs(env))[1] is None:
 		# the wrapper would only report a missing command through its exit code; fail like Popen does
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	if wrapped or not bare:
@@ -1348,7 +1368,13 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 				raise
 			raise _ExecRefused(e.errno, e.strerror, e.filename) from None
 	failure = None
-	for path in _files_named(command, _search_dirs(env)):
+	dirs = _search_dirs(env)
+	index = 0
+	while True:
+		index, path = _file_named(command, dirs, index)
+		if path is None:
+			break
+		index += 1
 		try:
 			# ( one that can run by now just runs, as it would have a moment ago )
 			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path, started=started)
@@ -1510,7 +1536,11 @@ def _inside(proc, call, *args):
 def _inside_elsewhere(proc):
 	'''Whether a thread other than this one is inside a call of proc's that may take its Popen lock ( internal; see _inside )'''
 	me = threading.get_ident()
-	return any(ident != me for ident in proc.__dict__.get('_multicmd_inside', {}).copy().values())
+	# ( a loop, not any() over a generator: see _any_alive )
+	for ident in proc.__dict__.get('_multicmd_inside', {}).copy().values():
+		if ident != me:
+			return True
+	return False
 
 def _peek(proc):
 	'''
@@ -1721,13 +1751,18 @@ def _wait_all(commands, timeout):
 	deadline = time.monotonic() + timeout
 	# ( Popen.wait()'s own loop, with _poll )
 	delay = 0.0005
-	while not all(_poll(proc) is not None for proc, _ in commands):
+	while True:
+		# ( a loop, not all() over a generator: see _any_alive )
+		for proc, _ in commands:
+			if _poll(proc) is None:
+				break
+		else:
+			return True
 		remaining = deadline - time.monotonic()
 		if remaining <= 0:
 			return False
 		delay = min(delay * 2, remaining, 0.05)
 		time.sleep(delay)
-	return True
 
 def _give_up_on(commands, quiet=False):
 	'''
@@ -1992,14 +2027,14 @@ def _drain(task, readers, timeout):
 	@returns:
 		None | str: None once all output ended, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
 	'''
-	while any(reader.is_alive() for reader in readers):
+	while _any_alive(readers):
 		if task.stop:
 			return 'stop'
 		for reader in readers:
 			_join(reader, 0.05)
 		# tested after a step, not on entry: a command that exits just past the threshold, before _watch() looked
 		# again, has its output end a moment later, and is not a timeout
-		if timeout > 0 and time.monotonic() - task._last_output > timeout and any(reader.is_alive() for reader in readers):
+		if timeout > 0 and time.monotonic() - task._last_output > timeout and _any_alive(readers):
 			return 'timeout'
 	return None
 
