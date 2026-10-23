@@ -490,6 +490,36 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.55 from 1.54
+
+- New: a per-call environment. `env=` (the whole environment, as `subprocess`'s) and `extra_env=`
+  (added on top; a `None` value removes a variable) on `run_command`, `run_commands` and
+  `AsyncExecutor` (constructor defaults, overridden per call), and `mcmd -e NAME=VALUE` / `-e NAME`;
+  see [Environment per call](#environment-per-call).
+- `quiet=True` now hides every failure line multiCMD prints: `Command path not found` (127) and
+  `Command cannot be executed` (126) included, and the error of a command multiCMD could not run (-1),
+  which 1.54 printed partly on stdout. The reasons are still in `task.stderr`.
+- A Ctrl-C in `join_threads()` stops the commands it waits for, skips the ones still queued, waits up
+  to 5 s for them and re-raises; 1.54 re-raised and left them running. A Ctrl-C that interrupts
+  `AsyncExecutor.run_command(s)` skips that call's commands.
+- A SIGTERM handler's `sys.exit()`, or whatever your own signal handler raises while a call waits for
+  its commands, stops them and records them as stopped before it is raised on, as a Ctrl-C does; 1.54
+  did that only for `KeyboardInterrupt`.
+- A Ctrl-C while a command starts no longer leaves it running unknown to `kill_all()` and the exit
+  hook, and neither does a second one while multiCMD stops what a finished command left running with
+  its output open (but for the limits below). A second Ctrl-C ends the wait for the commands at once;
+  each is still sent SIGTERM, and `kill_all()` and the exit hook finish the kill.
+- Once the interpreter exits, a command queued on one of multiCMD's threads that has not started fails
+  with -1 ("not started: the interpreter is exiting") instead of starting and outliving the program.
+- A command still running a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the
+  exit do not wait for it again; its pid is named on stderr, unless quiet.
+- Known limits (see [Process groups and signals](#process-groups-and-signals)): a Ctrl-C raised just as
+  a command's fork returns, before `Popen` has stored the pid, still loses the command, as in 1.54
+  (serial runs only, some 60-150 µs per command); on Python 3.6-3.10 a second Ctrl-C right after a
+  first one that lands as a command starts can lose it too, and on 3.6-3.9 a second one at a few other
+  moments; on Python 3.6-3.9 and 3.14 a Ctrl-C just as `threading` takes one of its own locks can
+  leave that lock held and hang the program as its threads end (CPython's own).
+
 ## License
 
 GPLv3+ — see the package metadata. Authored by Yufei Pan (<pan@zopyr.us>).

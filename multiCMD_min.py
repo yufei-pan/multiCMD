@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse,atexit,collections,collections.abc,errno,functools,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.54'
+version='1.55'
 __version__=version
-COMMIT_DATE='2026-10-12'
+COMMIT_DATE='2026-10-23'
 __running_threads=set()
 __running_threads_lock=threading.Lock()
 __finished_threads=collections.deque()
@@ -746,37 +746,37 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 			for(i,(stream,_))in enumerate(pending):
 				if stream is not None and(i>=len(readers)or readers[i]._abandon()):stream.close()
 			if cuts and interrupt and proc is not None:_cut_stop(proc,pgid)
-		while True:
-			try:
-				while True:
-					try:
-						if raised:
-							seen=raised.pop(0)
-							if cuts and seen is cuts[0]:settled=True
-							elif _is_interrupt(seen):cuts.append(seen);settled=False
-							else:
-								settled=True
-								if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(seen).__name__}: {seen}")
-						elif settled:break
-						elif interrupt is None:interrupt=waiting or _is_interrupt(first)
-						else:_settle(settle,cuts,quiet);settled=True
-					except BaseException as c:raised.append(c)
-				break
-			except BaseException as c:raised.append(c)
-		cut=cuts[0]if cuts else None
-		if proc is None:
-			if cut is not None:raise cut
+		cut=None
+		try:
+			while True:
+				try:
+					while True:
+						try:
+							if raised:
+								seen=raised.pop(0)
+								if cuts and seen is cuts[0]:settled=True
+								elif _is_interrupt(seen):cuts.append(seen);settled=False
+								else:
+									settled=True
+									if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(seen).__name__}: {seen}")
+							elif settled:break
+							elif interrupt is None:interrupt=waiting or _is_interrupt(first)
+							else:_settle(settle,cuts,quiet);settled=True
+						except BaseException as c:raised.append(c)
+					break
+				except BaseException as c:raised.append(c)
+			cut=cuts[0]if cuts else None
+			if proc is None:
+				if cut is not None:raise cut
+				raise
+			if cut is not None:
+				if interrupt:raise cut
+				first,interrupt=cut,True
+			if not interrupt:_stop_command(proc,pgid,quiet);_unregister(proc);_join_all(readers,1);raise first
+			reason,interrupted='stop',first;_stop_command(proc,pgid,quiet)
+		except BaseException as c:
+			if proc is not None and c is not cut and c is not first:_cut_stop(proc,pgid)
 			raise
-		if cut is not None:
-			if interrupt:raise cut
-			first,interrupt=cut,True
-		if not interrupt:
-			try:_stop_command(proc,pgid,quiet)
-			except BaseException:_cut_stop(proc,pgid);raise
-			_unregister(proc);_join_all(readers,1);raise first
-		reason,interrupted='stop',first
-		try:_stop_command(proc,pgid,quiet)
-		except BaseException:_cut_stop(proc,pgid);raise
 	if reason=='timeout':task.stderr.append('Timeout!')
 	if reason is not None and interrupted is None:
 		try:_stop_command(proc,pgid,quiet)
@@ -784,13 +784,13 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	_unregister(proc);task.returncode=_poll(proc)
 	if reason is None:
 		_draining[proc]=pgid
-		try:reason=_drain(task,readers,timeout)
-		except BaseException as e:reason,interrupted='stop',e
-		finally:_draining.pop(proc,None)
-		if reason=='timeout':task.stderr.append('Timeout!')
-		if reason is not None:
-			try:_stop_command(proc,pgid,quiet)
-			except BaseException:_cut_stop(proc,pgid);raise
+		try:
+			try:reason=_drain(task,readers,timeout)
+			except BaseException as e:reason,interrupted='stop',e
+			if reason=='timeout':task.stderr.append('Timeout!')
+			if reason is not None:_stop_command(proc,pgid,quiet)
+		except BaseException:_live_procs[proc]=pgid;_draining.pop(proc,None);_cut_stop(proc,pgid);raise
+		_draining.pop(proc,None)
 	_join_all(readers,None if reason is None else 1)
 	if reason=='timeout':task.returncode=124
 	elif task.returncode is None:
