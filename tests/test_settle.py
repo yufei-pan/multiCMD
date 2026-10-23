@@ -2056,6 +2056,27 @@ def _real_trip(state, code, lines):
 	return trace
 
 
+def _group_running(pgid, wait):
+	'''Whether anything of process group pgid still runs after up to wait seconds ( a zombie does not )'''
+	deadline = time.monotonic() + wait
+	while True:
+		running = False
+		for name in os.listdir('/proc'):
+			if not name.isdigit():
+				continue
+			try:
+				with open(f'/proc/{name}/stat') as f:
+					fields = f.read().rsplit(')', 1)[1].split()
+			except OSError:
+				continue
+			if int(fields[2]) == pgid and fields[0] != 'Z':
+				running = True
+				break
+		if not running or time.monotonic() > deadline:
+			return running
+		time.sleep(0.05)
+
+
 _REAL_TRIPS = pytest.mark.skipif(not sys.platform.startswith('linux') or sys.version_info < (3, 7)
 	or signal.getsignal(signal.SIGINT) is not signal.default_int_handler,
 	reason='POSIX commands; opcode events need Python 3.7+; the default SIGINT handler')
@@ -2102,3 +2123,52 @@ def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_com
 		state['k'] += 1
 	assert running == [] and returned == []
 	assert state['k'] > 5 and not multiCMD._live_procs
+
+@_REAL_TRIPS
+def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_its_group_untracked(launcher, monkeypatch):
+	# ( review of round 14, item 2 ) a command that exits while something it started holds its output open is drained;
+	# on a Ctrl-C there _execute forgot the group ( _draining.pop(), in a finally ) before it stopped it: a second Ctrl-C
+	# between the two left the background group running, in neither registry, out of kill_all()'s reach. The first
+	# Ctrl-C in the drain, and a real second one tripped at each opcode from there to the end of the stop in turn: the
+	# group is gone soon after, or still tracked
+	code = multiCMD._execute.__code__
+	lines = _lines_of(multiCMD._execute, '_draining[proc] = pgid', '_join_all(readers, None if reason is None else 1)')
+	state = {'k': 0}
+	spawned = []
+	real_spawn = multiCMD._spawn
+	def spawn(*args, **kwargs):
+		result = real_spawn(*args, **kwargs)
+		spawned.append(result)
+		return result
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
+	def drain(task, readers, timeout):
+		_hook(_real_trip(state, code, lines))
+		raise KeyboardInterrupt('first')
+	monkeypatch.setattr(multiCMD, '_drain', drain)
+	lost, returned = [], []
+	while True:
+		del spawned[:]
+		try:
+			try:
+				multiCMD.run_command(['sh', '-c', 'sleep 30 & echo hi'], quiet=True)
+			finally:
+				_unhook()
+			returned.append(state['tripped'])
+		except KeyboardInterrupt:
+			pass
+		proc, pgid = spawned[0]
+		tracked = proc in multiCMD._live_procs or proc in multiCMD._draining
+		if _group_running(pgid, 2) and not tracked:
+			# before ( 8bf868a ): by one tripped in the finally, before or as its _draining.pop() returned
+			lost.append(state['tripped'])
+		try:
+			os.killpg(pgid, signal.SIGKILL)
+		except ProcessLookupError:
+			pass
+		multiCMD._live_procs.pop(proc, None)
+		multiCMD._draining.pop(proc, None)
+		if state['tripped'] is None:
+			break
+		state['k'] += 1
+	assert lost == [] and returned == []
+	assert state['k'] > 5

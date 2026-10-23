@@ -2495,23 +2495,27 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		# the command exited, but something it started may still hold its output open: keep reading,
 		# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
 		_draining[proc] = pgid
+		# ( forgotten only once it is stopped, or once its output has ended: an interrupt that lands before, a second
+		# Ctrl-C while the first is dealt with included, has the group sent SIGTERM, and it stays tracked, as a command
+		# does whose stop is cut short: registered again, so the exit hook reaches it too )
 		try:
-			reason = _drain(task, readers, timeout)
-		except BaseException as e:
-			# _drain only waits ( joins, no I/O of its own ): whatever is raised into it is an interrupt, a SIGTERM
-			# handler's SystemExit or another signal handler's exception, and the background group is stopped before
-			# it is raised
-			reason, interrupted = 'stop', e
-		finally:
-			_draining.pop(proc, None)
-		if reason == 'timeout':
-			task.stderr.append('Timeout!')
-		if reason is not None:
 			try:
+				reason = _drain(task, readers, timeout)
+			except BaseException as e:
+				# _drain only waits ( joins, no I/O of its own ): whatever is raised into it is an interrupt, a SIGTERM
+				# handler's SystemExit or another signal handler's exception, and the background group is stopped before
+				# it is raised
+				reason, interrupted = 'stop', e
+			if reason == 'timeout':
+				task.stderr.append('Timeout!')
+			if reason is not None:
 				_stop_command(proc, pgid, quiet)
-			except BaseException:
-				_cut_stop(proc, pgid)
-				raise
+		except BaseException:
+			_live_procs[proc] = pgid
+			_draining.pop(proc, None)
+			_cut_stop(proc, pgid)
+			raise
+		_draining.pop(proc, None)
 	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124
