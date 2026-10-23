@@ -1077,3 +1077,37 @@ def test_a_thread_start_error_while_the_caller_handles_a_ctrl_c_is_not_that_ctrl
 			# before ( fdc45b9 ): the Ctrl-C being handled was raised again, and the tasks never ran
 			pytest.fail('the Ctrl-C the caller handles was raised again')
 	assert len(calls) == 4 and [task.returncode for task in tasks] == [0] * 4
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
+def test_a_second_ctrl_c_pending_as_a_serial_run_settles_the_first_still_has_it_settled(monkeypatch):
+	# ( review of round 10, finding 9: _execute settles through _settle ) the first Ctrl-C before the command is
+	# registered, the second pending as _settle is called, so that it is raised from the call before the step runs:
+	# the step runs all the same, knowing of it, and the command is registered and sent SIGTERM before it is re-raised
+	procs = []
+	real_register = multiCMD._register
+	def register(proc, pgid):
+		procs.append(proc)
+		raise KeyboardInterrupt('first')
+	monkeypatch.setattr(multiCMD, '_register', register)
+	real_settle = multiCMD._settle
+	calls = []
+	def settle(step, *args, **kwargs):
+		calls.append(step)
+		if len(calls) == 1:
+			raise KeyboardInterrupt('second, pending')
+		return real_settle(step, *args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_settle', settle)
+	try:
+		with pytest.raises(KeyboardInterrupt) as raised:
+			multiCMD.run_command(['sleep', '30'], quiet=True)
+		assert str(raised.value) == 'second, pending' and len(calls) >= 2
+		# left registered, for kill_all() and the exit hook, and sent SIGTERM ( not the kill's SIGINT: no wait for it )
+		assert procs and procs[0] in multiCMD._live_procs
+		assert procs[0].wait(5) == -signal.SIGTERM
+	finally:
+		monkeypatch.undo()
+		multiCMD.kill_all()
+		for proc in procs:
+			proc.wait(5)
+			multiCMD._unregister(proc)

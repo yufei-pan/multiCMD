@@ -361,7 +361,7 @@ _INTERRUPTS = (KeyboardInterrupt, SystemExit)
 # per thread: the failure messages to show once the outermost _settle() on that thread is done ( None: show at once )
 _settling = threading.local()
 
-def _settle(step):
+def _settle(step, cuts=None):
 	'''
 	Run step() to its end, whatever interrupt lands meanwhile ( internal )
 
@@ -375,9 +375,16 @@ def _settle(step):
 	and a wait the caller would start next is skipped, as a second Ctrl-C during it would end it. The failure
 	messages step shows ( see _show_error ) are shown after it, each once: a step run again shows nothing twice.
 	An interrupt pending as _settle is called can still be raised before step starts ( from the call itself: no
-	Python code can take it earlier ).
+	Python code can take it earlier ); a caller that must have step run then calls it again with that interrupt in
+	cuts ( see _execute ).
+	@params:
+		step: The step ( called with no arguments )
+		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
+			was ( None: one of its own ). The last one in it is raised once step has completed, one it held
+			already included.
 	'''
-	cut = None
+	if cuts is None:
+		cuts = []
 	own = False
 	try:
 		if getattr(_settling, 'messages', None) is None:
@@ -391,17 +398,17 @@ def _settle(step):
 						step()
 						break
 					except _INTERRUPTS as e:
-						cut = e
+						cuts.append(e)
 				break
 			except _INTERRUPTS as e:
-				cut = e
+				cuts.append(e)
 	finally:
 		if own:
 			messages, _settling.messages = getattr(_settling, 'messages', None), None
 			for text in (messages or {}).values():
 				_write_error(text)
-	if cut is not None:
-		raise cut
+	if cuts:
+		raise cuts[-1]
 
 def _abandon_all(threads, forget=None):
 	'''
@@ -2014,7 +2021,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		first = e
-		cut = None
+		# the interrupts that cut settle short ( see _settle )
+		cuts = []
 		def settle():
 			nonlocal proc, pgid
 			if started:
@@ -2034,24 +2042,22 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			for i, (stream, _) in enumerate(pending):
 				if stream is not None and (i >= len(readers) or readers[i]._abandon()):
 					stream.close()
-			if cut is not None and isinstance(first, _INTERRUPTS) and proc is not None:
+			if cuts and isinstance(first, _INTERRUPTS) and proc is not None:
 				# a second interrupt ( of any kind ) while the first is dealt with: it ends the wait for the command,
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_send(proc, pgid, signal.SIGTERM)
 				_send(proc, pgid, signal.SIGCONT)
-		# settle runs to its end whatever interrupt lands meanwhile, as in _settle, but here, so that one pending
-		# already is taken too, and settle runs again knowing of it
 		while True:
 			try:
-				while True:
-					try:
-						settle()
-						break
-					except _INTERRUPTS as c:
-						cut = c
+				_settle(settle, cuts)
 				break
 			except _INTERRUPTS as c:
-				cut = c
+				if cuts and c is cuts[-1]:
+					# raised by _settle, once settle has completed
+					break
+				# pending as _settle was called, so settle never ran ( or landing as it returned ): it runs again, knowing of it
+				cuts.append(c)
+		cut = cuts[-1] if cuts else None
 		if proc is None:
 			# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
 			if cut is not None:
