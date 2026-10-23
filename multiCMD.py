@@ -350,7 +350,7 @@ class _Thread(threading.Thread):
 
 def _interrupt_in(error, before=None):
 	'''
-	The KeyboardInterrupt or SystemExit error is, or that it was raised while handling, if any ( internal )
+	The interrupt ( see _is_interrupt ) error is, or that it was raised while handling, if any ( internal )
 	The walk down error's __context__ chain stops at before: what the caller was handling already ( sys.exc_info()
 	before the call that raised error ), whose own context is older still. A Ctrl-C the caller is handling, from its
 	except block, is not one that landed during the call.
