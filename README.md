@@ -419,10 +419,10 @@ program can meet it; Python 3.10-3.13 do not leave the lock held.
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). A Ctrl-C that lands while multiCMD does its bookkeeping on the rare paths (a thread that
 cannot start, stopping commands after a Ctrl-C or a failure, cancelling a batch, recording a command
-that cannot be run) makes that bookkeeping run again from the start, and the KeyboardInterrupt is
-raised once it is complete, so it neither cuts that short nor gets lost. Your handler, if you installed
-one, is called with every Ctrl-C as it lands, and C-level hooks on SIGINT (`faulthandler.register`,
-`signal.siginterrupt`) stay as they are.
+that cannot be run) makes that bookkeeping run again from the start, and the KeyboardInterrupt (or
+whatever your own handler raised) is raised once it is complete, so it neither cuts that short nor gets
+lost. Your handler, if you installed one, is called with every Ctrl-C as it lands, and C-level hooks on
+SIGINT (`faulthandler.register`, `signal.siginterrupt`) stay as they are.
 
 ## Key functions and objects
 

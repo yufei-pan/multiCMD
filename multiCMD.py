@@ -356,9 +356,10 @@ def _interrupt_in(error, before=None):
 		error = error.__context__
 	return None
 
-# what cuts a settled step short, and runs it again ( see _settle ): a Ctrl-C, or a SystemExit from a signal handler
-# ( mcmd's own SIGTERM / SIGHUP one )
+# a KeyboardInterrupt ( a Ctrl-C ), or a SystemExit from a signal handler ( mcmd's own SIGTERM / SIGHUP one )
 _INTERRUPTS = (KeyboardInterrupt, SystemExit)
+# how many errors other than _INTERRUPTS a settled step may raise before it is taken to fail on its own ( see _settle )
+_STEP_FAILURES = 3
 
 # per thread: the failure messages to show once the outermost _settle() on that thread is done ( None: show at once )
 _settling = threading.local()
@@ -368,11 +369,13 @@ def _settle(step, cuts=None):
 	Run step() to its end, whatever interrupt lands meanwhile ( internal )
 
 	For multiCMD's rare paths only: a thread that cannot start, stopping commands, cancelling or abandoning a batch,
-	recording a task that failed. Nothing here touches signal state: a KeyboardInterrupt ( a Ctrl-C, on the main
-	thread ) or a SystemExit ( from a signal handler ) that cuts step short makes it run again from the start, and
-	is raised once step has completed, so step must give the same result run again after being cut short anywhere
-	( idempotent ), and must take no lock an interrupt could leave held ( a Python-level __enter__, as
-	threading.Event's or a Semaphore's: see _Done ). A program's own SIGINT handler is called as the Ctrl-C lands.
+	recording a task that failed. Nothing here touches signal state: whatever a signal handler raises into step cuts it
+	short ( a KeyboardInterrupt from a Ctrl-C, on the main thread; a SystemExit from a handler such as mcmd's SIGTERM
+	one; anything a program's own SIGINT handler raises ), and makes it run again from the start. The first such
+	exception is raised once step has completed, so step must give the same result run again after being cut short
+	anywhere ( idempotent ), and must take no lock an interrupt could leave held ( none at all: see _Done ). A
+	program's own SIGINT handler is called as the Ctrl-C lands. A step that fails on its own ( _STEP_FAILURES errors
+	other than a KeyboardInterrupt or SystemExit, one per run ) is not run again: the first exception is raised then.
 	Anything step records ( a return code ) is recorded before the interrupt is raised, so it is raised from here
 	and a wait the caller would start next is skipped, as a second Ctrl-C during it would end it. The failure
 	messages step shows ( see _show_error ) are shown after it, each once: a step run again shows nothing twice.
@@ -381,36 +384,41 @@ def _settle(step, cuts=None):
 	cuts ( see _execute ).
 	@params:
 		step: The step ( called with no arguments )
-		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
-			was ( None: one of its own ). The last one in it is raised once step has completed, one it held
-			already included.
+		cuts: A list each exception that cuts step short is appended to before step runs again, so step can tell it
+			was ( None: one of its own ). The first one in it is raised once step has completed, one it held already
+			included.
 	'''
 	if cuts is None:
 		cuts = []
+	failures = 0
 	own = False
 	try:
 		if getattr(_settling, 'messages', None) is None:
 			own = True
 			_settling.messages = {}
 		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one )
-		while True:
+		while failures < _STEP_FAILURES:
 			try:
-				while True:
+				while failures < _STEP_FAILURES:
 					try:
 						step()
 						break
-					except _INTERRUPTS as e:
+					except BaseException as e:
 						cuts.append(e)
+						if not isinstance(e, _INTERRUPTS):
+							failures += 1
 				break
-			except _INTERRUPTS as e:
+			except BaseException as e:
 				cuts.append(e)
+				if not isinstance(e, _INTERRUPTS):
+					failures += 1
 	finally:
 		if own:
 			messages, _settling.messages = getattr(_settling, 'messages', None), None
 			for text in (messages or {}).values():
 				_write_error(text)
 	if cuts:
-		raise cuts[-1]
+		raise cuts[0]
 
 def _abandon_all(threads, forget=None):
 	'''
@@ -487,9 +495,9 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None, w
 				abort()
 		try:
 			_settle(settle)
-		except KeyboardInterrupt:
+		except BaseException:
 			# an interrupt meanwhile: the first one ( after a failure ) is waited for as any, a second one ends the wait
-			if wait is not None and not isinstance(e, KeyboardInterrupt):
+			if wait is not None and not isinstance(e, _INTERRUPTS):
 				wait()
 			raise
 		if wait is not None:
@@ -1947,12 +1955,12 @@ def _child_env(task, pager=False):
 def _stop_command(proc, pgid):
 	'''
 	Kill a command with everything it started ( _kill_commands ) ( internal )
-	An interrupt that ends the wait for it ( a second Ctrl-C ) leaves it sent SIGTERM at least, and still
-	registered: kill_all() and the exit hook do the rest.
+	An interrupt that ends the wait for it ( a second Ctrl-C, or whatever a signal handler raises ) leaves it sent
+	SIGTERM at least, and still registered: kill_all() and the exit hook do the rest.
 	'''
 	try:
 		_kill_commands([(proc, pgid)], signal.SIGINT)
-	except _INTERRUPTS:
+	except BaseException:
 		_send(proc, pgid, signal.SIGTERM)
 		_send(proc, pgid, signal.SIGCONT)
 		raise
@@ -2054,13 +2062,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			try:
 				_settle(settle, cuts)
 				break
-			except _INTERRUPTS as c:
-				if cuts and c is cuts[-1]:
+			except BaseException as c:
+				if cuts and c is cuts[0]:
 					# raised by _settle, once settle has completed
 					break
 				# pending as _settle was called, so settle never ran ( or landing as it returned ): it runs again, knowing of it
 				cuts.append(c)
-		cut = cuts[-1] if cuts else None
+		cut = cuts[0] if cuts else None
 		if proc is None:
 			# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
 			if cut is not None:

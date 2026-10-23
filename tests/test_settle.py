@@ -1287,3 +1287,86 @@ def test_a_lock_a_ctrl_c_left_held_never_hangs_a_settled_step(mode):
 		stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
 	# before ( fdc45b9 ): still stuck after 6 Ctrl-Cs
 	assert (proc.returncode, proc.stdout.strip()) == (0, 'returned with KeyboardInterrupt'), proc.stderr
+
+
+class _Cancelled(Exception):
+	'''What a program's own SIGINT handler raises instead of KeyboardInterrupt'''
+
+
+@pytest.fixture
+def cancelling_handler(request):
+	'''A program's SIGINT handler that raises _Cancelled, an Exception; it counts the Ctrl-Cs it gets'''
+	calls = []
+	def handler(signum, frame):
+		calls.append(signum)
+		raise _Cancelled(len(calls))
+	previous = signal.signal(signal.SIGINT, handler)
+	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
+	return calls
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_whatever_a_programs_handler_raises_into_a_settled_step_runs_it_again(cancelling_handler, another_thread):
+	# ( review of round 10, finding 6 ) a real Ctrl-C while the executor's stop() asks its tasks to stop, its handler
+	# raising an Exception: the step was cut short, and the tasks after the first were never asked
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	sent = []
+	class Stopping(multiCMD.Task):
+		def __setattr__(self, name, value):
+			super().__setattr__(name, value)
+			if name == 'stop' and value and not sent:
+				sent.append(1)
+				_ctrl_c()
+	ex.tasks.append(Stopping(['x']))
+	ex.tasks.extend(multiCMD.Task(['y']) for _ in range(3))
+	with pytest.raises(_Cancelled):
+		ex.stop()
+	# before ( fdc45b9 ): only the first was asked to stop
+	assert sent and cancelling_handler == [signal.SIGINT]
+	assert all(task.stop for task in ex.tasks)
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_whatever_a_programs_handler_raises_while_a_pool_fails_its_tasks_leaves_none_unrecorded(monkeypatch, cancelling_handler, another_thread):
+	# ( review of round 10, finding 6 ) no pool worker can start, and a real Ctrl-C lands as the second of the tasks
+	# is failed, its handler raising an Exception: before, the step was cut short there, and the tasks after it were
+	# left with returncode None, never run nor failed
+	_failing_worker_starts(monkeypatch, set(range(1, 10)))
+	real_fail = multiCMD._fail_task
+	count = [0]
+	def fail(*args, **kwargs):
+		count[0] += 1
+		if count[0] == 2:
+			_ctrl_c()
+		real_fail(*args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_fail_task', fail)
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	with pytest.raises(_Cancelled):
+		run_commands([['true']] * 4, max_threads=2, quiet=True)
+	assert cancelling_handler == [signal.SIGINT]
+	# before ( fdc45b9 ): [-1, None, None, None]
+	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._finalized for task in tasks)
+
+
+def test_a_settled_step_that_fails_on_its_own_is_not_run_for_ever():
+	# what it raises every time is raised after a few runs, the first one
+	runs = []
+	def step():
+		runs.append(1)
+		raise ValueError(len(runs))
+	with pytest.raises(ValueError) as raised:
+		multiCMD._settle(step)
+	assert len(runs) == multiCMD._STEP_FAILURES and raised.value.args == (1,)
+	# an interrupt among them is raised first, and does not count as a failure
+	runs[:] = []
+	def step2():
+		runs.append(1)
+		if len(runs) == 1:
+			raise KeyboardInterrupt
+		if len(runs) == 2:
+			raise ValueError
+	with pytest.raises(KeyboardInterrupt):
+		multiCMD._settle(step2)
+	assert len(runs) == 3
