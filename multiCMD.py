@@ -1423,6 +1423,27 @@ def _in_subprocess():
 		frame = frame.f_back
 	return False
 
+def _inside(proc, call, *args):
+	'''
+	call(*args): a call of proc's that may take its Popen lock ( poll(), send_signal() ), with this thread marked as
+	inside it meanwhile, so that _poll() on another thread knows the lock is held for real ( internal; see _poll )
+	The mark is one dict entry per call, set inside the try that removes it: an interrupt before it leaves none. Only
+	a second interrupt landing just as the call returns, before the finally removes it, can leave one behind: that
+	Popen is then never reaped behind a jammed lock by other threads, only by this one.
+	'''
+	marks = proc.__dict__.setdefault('_multicmd_inside', {})
+	token = object()
+	try:
+		marks[token] = threading.get_ident()
+		return call(*args)
+	finally:
+		marks.pop(token, None)
+
+def _inside_elsewhere(proc):
+	'''Whether a thread other than this one is inside a call of proc's that may take its Popen lock ( internal; see _inside )'''
+	me = threading.get_ident()
+	return any(ident != me for ident in proc.__dict__.get('_multicmd_inside', {}).copy().values())
+
 def _peek(proc):
 	'''
 	Whether a command has exited, looked at without reaping it ( os.waitid() with WNOWAIT ) ( internal )
@@ -1450,13 +1471,16 @@ def _poll(proc):
 	is reaped here, with os.waitpid(), and its returncode set; poll() and wait() look at returncode before the lock.
 	Never while this thread runs inside subprocess's own code further up its stack: a signal handler that calls
 	kill_all() as it lands in an interrupted Popen.wait() or poll(), which holds that lock and is about to reap, would
-	leave it ECHILD, which Popen records as returncode 0. Another thread holds the lock for real only for the
-	microseconds of one poll, and finds the returncode set as it goes on. The lock itself is only looked at.
+	leave it ECHILD, which Popen records as returncode 0. Nor while another thread is inside a poll() or send_signal()
+	multiCMD made ( see _inside ): one whose signal handler runs as it holds the lock ( kill_all() takes 2 s ) is
+	about to reap the command as well. multiCMD calls nothing else of Popen's that takes the lock, and nothing else
+	has its commands' Popens, so a lock held that long by no such call is jammed; a thread that does hold it for real
+	finds the returncode set as it goes on. The lock itself is only looked at.
 	A command reaped outside Popen ( SIGCHLD ignored, which has the kernel reap it; a waitpid() of the program's
 	own ) is no longer a child to reap ( ECHILD ): poll() records returncode 0 then, as its status is lost, and so
 	does this, once the lock has kept poll() from it for _JAMMED_AFTER seconds.
 	'''
-	returncode = proc.poll()
+	returncode = _inside(proc, proc.poll)
 	if returncode is not None or not _CAN_PEEK:
 		return returncode
 	lock = getattr(proc, '_waitpid_lock', None)
@@ -1468,7 +1492,8 @@ def _poll(proc):
 		return None
 	now = time.monotonic()
 	# ( since when poll() is kept from it: an exited command whose lock is free is reaped by poll() itself )
-	if now - proc.__dict__.setdefault('_multicmd_unreaped_since', now) < _JAMMED_AFTER or _in_subprocess():
+	if now - proc.__dict__.setdefault('_multicmd_unreaped_since', now) < _JAMMED_AFTER or _in_subprocess() \
+		or _inside_elsewhere(proc):
 		# ( 'gone': reaped meanwhile by whoever holds the lock, which sets returncode as it goes on )
 		return proc.returncode
 	if state == 'exited':
@@ -1598,7 +1623,8 @@ def _send(proc, pgid, sig):
 			except ProcessLookupError:
 				pass
 		if _poll(proc) is None:
-			proc.send_signal(sig)
+			# ( send_signal() polls first, from Python 3.9 )
+			_inside(proc, proc.send_signal, sig)
 	except OSError:
 		# already gone, or not ours to signal ( a root command under sudo: sudo relays the signal )
 		pass

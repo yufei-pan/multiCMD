@@ -353,3 +353,42 @@ def test_a_command_reaped_outside_popen_while_its_lock_is_jammed_is_recorded_as_
 			multiCMD._live_procs.pop(proc, None)
 	finally:
 		signal.signal(signal.SIGCHLD, previous)
+
+
+@pytest.mark.skipif(not multiCMD._CAN_PEEK, reason='needs os.waitid() with WNOWAIT')
+def test_a_poll_whose_signal_handler_runs_long_keeps_other_threads_from_reaping_its_command(launcher):
+	# ( review of round 11, finding 11 ) a signal handler ( kill_all(), some 2 s ) lands in the main thread's poll() as
+	# it holds the Popen lock: another thread's _poll() saw the lock held past _JAMMED_AFTER and reaped the command,
+	# and the interrupted poll() then got ECHILD, which Popen records as returncode 0
+	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		multiCMD._send(proc, pgid, signal.SIGTERM)
+		assert pid_gone(proc.pid)
+		other = []
+		real_lock = proc._waitpid_lock
+		class Lock:
+			'''The Popen lock, whose first acquire runs what a signal handler landing right after it would'''
+			def acquire(self, *args):
+				got = real_lock.acquire(*args)
+				if got and not other:
+					# the handler, inside Popen's own poll(), the lock held: meanwhile another thread waits for the command
+					thread = threading.Thread(target=lambda: other.append(multiCMD._wait_all([(proc, pgid)], multiCMD._JAMMED_AFTER + 0.5)))
+					thread.start()
+					thread.join(10)
+				return got
+			def release(self):
+				real_lock.release()
+			def locked(self):
+				return real_lock.locked()
+			__enter__ = acquire
+			def __exit__(self, *exc_info):
+				self.release()
+		proc._waitpid_lock = Lock()
+		# before ( fc0c782 ): the other thread reaped it ( [True] ), and the interrupted poll() recorded 0
+		assert multiCMD._poll(proc) == -signal.SIGTERM and other == [False]
+		assert not proc._multicmd_inside
+	finally:
+		multiCMD._live_procs.pop(proc, None)
+		if proc.returncode is None:
+			proc.kill()
