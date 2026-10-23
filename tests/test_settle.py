@@ -1422,3 +1422,60 @@ def test_a_popen_is_handed_over_before_it_forks(launcher, monkeypatch):
 	finally:
 		proc.kill()
 		proc.wait(5)
+
+
+def test_a_settled_step_that_fails_on_its_own_once_is_not_raised_once_it_completes(capfd):
+	# ( review of round 11, finding 5 ) a failure of the step's own that a run again got past was raised all the same
+	runs = []
+	def step():
+		runs.append(1)
+		if len(runs) == 1:
+			raise OSError('transient')
+	# before ( fc0c782 ): raised OSError
+	multiCMD._settle(step)
+	assert len(runs) == 2
+	err = capfd.readouterr().err
+	assert err.count('OSError: transient') == 1, err
+	runs[:] = []
+	multiCMD._settle(step, quiet=True)
+	assert len(runs) == 2 and capfd.readouterr().err == ''
+
+
+def test_a_ctrl_c_whose_clean_up_fails_on_its_own_once_is_still_a_ctrl_c(monkeypatch, capfd):
+	# ( review of round 11, finding 5 ) _settle() put the step's own failures in cuts with the interrupts: in _execute,
+	# a clean-up after a Ctrl-C that failed once on its own was taken for a second Ctrl-C ( the SIGTERM shortcut, no
+	# wait ), and `raise cut` raised that failure instead of the KeyboardInterrupt, which __run_command recorded as -1
+	# and swallowed: the run went on as if no Ctrl-C had come
+	procs = []
+	real_register = multiCMD._register
+	def register(proc, pgid):
+		procs.append(proc)
+		real_register(proc, pgid)
+		if len(procs) == 1:
+			raise KeyboardInterrupt
+	monkeypatch.setattr(multiCMD, '_register', register)
+	real_settle = multiCMD._settle
+	def settle(step, *args, **kwargs):
+		if getattr(step, '__name__', '') == 'settle' and 'readers' in step.__code__.co_freevars:
+			failed = []
+			def flaky():
+				if not failed:
+					failed.append(1)
+					raise OSError('flaky clean-up')
+				step()
+			return real_settle(flaky, *args, **kwargs)
+		return real_settle(step, *args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_settle', settle)
+	tasks = []
+	real_build = multiCMD._build_tasks
+	monkeypatch.setattr(multiCMD, '_build_tasks', lambda *a, **k: (lambda built: (tasks.extend(built[0]), built)[1])(real_build(*a, **k)))
+	try:
+		# before ( fc0c782 ): the OSError was recorded as -1 and the run returned, the second command run
+		with pytest.raises(KeyboardInterrupt):
+			run_commands([['sleep', '30'], ['true']], quiet=True)
+		# the Ctrl-C's own stop: the command killed by the kill sequence, waited for, and the next one skipped
+		assert procs[0].returncode == -signal.SIGINT and tasks[0].returncode == -signal.SIGINT and not tasks[0]._error
+		assert tasks[1].returncode is None and tasks[1].stop
+		assert procs[0] not in multiCMD._live_procs
+	finally:
+		multiCMD.kill_all(signal.SIGKILL)

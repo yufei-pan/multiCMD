@@ -9,6 +9,7 @@ import atexit
 import collections
 import collections.abc
 import errno
+import functools
 import io
 import itertools
 import math
@@ -356,7 +357,7 @@ def _interrupt_in(error, before=None):
 	'''
 	seen = set()
 	while error is not None and error is not before and id(error) not in seen:
-		if isinstance(error, _INTERRUPTS):
+		if _is_interrupt(error):
 			return error
 		seen.add(id(error))
 		error = error.__context__
@@ -364,60 +365,113 @@ def _interrupt_in(error, before=None):
 
 # a KeyboardInterrupt ( a Ctrl-C ), or a SystemExit from a signal handler ( mcmd's own SIGTERM / SIGHUP one )
 _INTERRUPTS = (KeyboardInterrupt, SystemExit)
-# how many errors other than _INTERRUPTS a settled step may raise before it is taken to fail on its own ( see _settle )
+# how many times a settled step may fail on its own before it is not run again ( see _settle )
 _STEP_FAILURES = 3
+
+def _handler_codes():
+	'''The code objects of the Python signal handlers installed now ( internal; see _is_interrupt )'''
+	codes = set()
+	signums = signal.valid_signals() if hasattr(signal, 'valid_signals') else range(1, getattr(signal, 'NSIG', 65))
+	for signum in signums:
+		try:
+			handler = signal.getsignal(signum)
+		except (ValueError, OSError):
+			continue
+		# ( a functools.partial or a bound method: the function it calls )
+		for _ in range(8):
+			if isinstance(handler, functools.partial):
+				handler = handler.func
+			elif hasattr(handler, '__func__'):
+				handler = handler.__func__
+			else:
+				break
+		code = getattr(handler, '__code__', None)
+		if code is None:
+			# an object with a __call__ method
+			code = getattr(getattr(type(handler), '__call__', None), '__code__', None)
+		if code is not None:
+			codes.add(code)
+	return codes
+
+def _is_interrupt(error):
+	'''
+	Whether error is an interrupt rather than a failure of multiCMD's own code ( internal ): a KeyboardInterrupt, a
+	SystemExit, or anything a Python signal handler raised
+	The last is told by the handler's frame in error's traceback: a frame running the code of a handler installed now
+	( signal.getsignal(), for every signal; only looked at once error is neither of the first two ). A handler that
+	is no longer installed when this looks ( one that restores the previous handler before it raises ) is not seen:
+	what it raised then counts as a failure. The traceback covers the frames from where error was caught down to
+	where it was raised, so a failure of multiCMD's own code called from a handler ( a kill_all() in it ) is not
+	taken for the handler's: the handler's frame is above the code that caught it.
+	'''
+	if isinstance(error, _INTERRUPTS):
+		return True
+	tb = getattr(error, '__traceback__', None)
+	if tb is None:
+		return False
+	codes = _handler_codes()
+	while tb is not None:
+		if tb.tb_frame.f_code in codes:
+			return True
+		tb = tb.tb_next
+	return False
 
 # per thread: the failure messages to show once the outermost _settle() on that thread is done ( None: show at once )
 _settling = threading.local()
 
-def _settle(step, cuts=None):
+def _settle(step, cuts=None, quiet=False):
 	'''
 	Run step() to its end, whatever interrupt lands meanwhile ( internal )
 
 	For multiCMD's rare paths only: a thread that cannot start, stopping commands, cancelling or abandoning a batch,
-	recording a task that failed. Nothing here touches signal state: whatever a signal handler raises into step cuts it
-	short ( a KeyboardInterrupt from a Ctrl-C, on the main thread; a SystemExit from a handler such as mcmd's SIGTERM
-	one; anything a program's own SIGINT handler raises ), and makes it run again from the start. The first such
-	exception is raised once step has completed, so step must give the same result run again after being cut short
-	anywhere ( idempotent ), and must take no lock an interrupt could leave held ( none at all: see _Done ). A
-	program's own SIGINT handler is called as the Ctrl-C lands. A step that fails on its own ( _STEP_FAILURES errors
-	other than a KeyboardInterrupt or SystemExit, one per run ) is not run again: the first exception is raised then.
-	Anything step records ( a return code ) is recorded before the interrupt is raised, so it is raised from here
-	and a wait the caller would start next is skipped, as a second Ctrl-C during it would end it. The failure
-	messages step shows ( see _show_error ) are shown after it, each once: a step run again shows nothing twice.
-	An interrupt pending as _settle is called can still be raised before step starts ( from the call itself: no
-	Python code can take it earlier ); a caller that must have step run then calls it again with that interrupt in
-	cuts ( see _execute ).
+	recording a task that failed. Nothing here touches signal state: whatever cuts step short makes it run again
+	from the start, so step must give the same result run again after being cut short anywhere ( idempotent ), and
+	must take no lock an interrupt could leave held ( none at all: see _Done ). A program's own SIGINT handler is
+	called as the Ctrl-C lands. What cuts it short is either an interrupt ( see _is_interrupt: a KeyboardInterrupt
+	from a Ctrl-C, on the main thread; a SystemExit from a handler such as mcmd's SIGTERM one; anything a program's own
+	signal handler raises ) or a failure of step's own, and the two are kept apart:
+	- the first interrupt is raised once step has completed. Anything step records ( a return code ) is recorded
+	  before it is raised, so it is raised from here and a wait the caller would start next is skipped, as a second
+	  Ctrl-C during it would end it;
+	- a failure of its own that a run again got past is not raised: it is shown once on stderr unless quiet. A step
+	  that fails on its own _STEP_FAILURES times is not run again, and the first failure is raised then ( an
+	  interrupt meanwhile is raised instead, and the failure shown unless quiet ).
+	The failure messages step shows ( see _show_error ) are shown after it, each once: a step run again shows
+	nothing twice. An interrupt pending as _settle is called can still be raised before step starts ( from the call
+	itself: no Python code can take it earlier ); a caller that must have step run then calls it again with that
+	interrupt in cuts ( see _execute ).
 	@params:
 		step: The step ( called with no arguments )
-		cuts: A list each exception that cuts step short is appended to before step runs again, so step can tell it
+		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
 			was ( None: one of its own ). The first one in it is raised once step has completed, one it held already
-			included.
+			included. A failure of step's own is never put in it.
+		quiet: Whether to say nothing of a failure of step's own that is not raised
 	'''
 	if cuts is None:
 		cuts = []
-	failures = 0
+	# step's own failures, and whether it has completed
+	failures = []
+	done = False
 	own = False
 	try:
 		if getattr(_settling, 'messages', None) is None:
 			own = True
 			_settling.messages = {}
 		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one )
-		while failures < _STEP_FAILURES:
+		while not done and len(failures) < _STEP_FAILURES:
 			try:
-				while failures < _STEP_FAILURES:
+				while not done and len(failures) < _STEP_FAILURES:
 					try:
 						step()
-						break
+						done = True
 					except BaseException as e:
-						cuts.append(e)
-						if not isinstance(e, _INTERRUPTS):
-							failures += 1
-				break
+						(cuts if _is_interrupt(e) else failures).append(e)
 			except BaseException as e:
-				cuts.append(e)
-				if not isinstance(e, _INTERRUPTS):
-					failures += 1
+				(cuts if _is_interrupt(e) else failures).append(e)
+		if failures and (done or cuts) and not quiet:
+			error = failures[0]
+			_show_error(f'multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again'
+				+ ('' if done else f' {len(failures)} times, without completing'))
 	finally:
 		if own:
 			messages, _settling.messages = getattr(_settling, 'messages', None), None
@@ -425,6 +479,8 @@ def _settle(step, cuts=None):
 				_write_error(text)
 	if cuts:
 		raise cuts[0]
+	if not done:
+		raise failures[0]
 
 def _abandon_all(threads, forget=None):
 	'''
@@ -503,7 +559,7 @@ def _start_threads(threads, register=None, forget=None, fail=None, abort=None, w
 			_settle(settle)
 		except BaseException:
 			# an interrupt meanwhile: the first one ( after a failure ) is waited for as any, a second one ends the wait
-			if wait is not None and not isinstance(e, _INTERRUPTS):
+			if wait is not None and not _is_interrupt(e):
 				wait()
 			raise
 		if wait is not None:
@@ -2187,7 +2243,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		first = e
-		# the interrupts that cut settle short ( see _settle )
+		# whether what came is an interrupt, rather than a failure ( see _is_interrupt )
+		interrupt = _is_interrupt(first)
+		# the interrupts that cut settle short ( see _settle ): never a failure of settle's own
 		cuts = []
 		def settle():
 			nonlocal proc, pgid
@@ -2215,18 +2273,24 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			for i, (stream, _) in enumerate(pending):
 				if stream is not None and (i >= len(readers) or readers[i]._abandon()):
 					stream.close()
-			if cuts and isinstance(first, _INTERRUPTS) and proc is not None:
+			if cuts and interrupt and proc is not None:
 				# a second interrupt ( of any kind ) while the first is dealt with: it ends the wait for the command,
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_send(proc, pgid, signal.SIGTERM)
 				_send(proc, pgid, signal.SIGCONT)
 		while True:
 			try:
-				_settle(settle, cuts)
+				_settle(settle, cuts, quiet)
 				break
 			except BaseException as c:
 				if cuts and c is cuts[0]:
 					# raised by _settle, once settle has completed
+					break
+				if not _is_interrupt(c):
+					# settle failed on its own, every time it ran ( see _settle ): what it did not do is left to the
+					# stop below, kill_all() and the exit hook
+					if not quiet:
+						_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: {type(c).__name__}: {c}')
 					break
 				# pending as _settle was called, so settle never ran ( or landing as it returned ): it runs again, knowing of it
 				cuts.append(c)
@@ -2237,7 +2301,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				raise cut
 			raise
 		if cut is not None:
-			if isinstance(first, _INTERRUPTS):
+			if interrupt:
+				# a second interrupt: it ends the wait for the command ( sent SIGTERM by settle )
 				raise cut
 			# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
 			first = cut
@@ -2323,12 +2388,12 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 				_execute(task, timeout, quiet, decor, use_pty)
 			# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
 			except FileNotFoundError as e:
-				_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet))
+				_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet), quiet=quiet)
 			except (PermissionError, _ExecRefused) as e:
 				# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-				_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet))
+				_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet), quiet=quiet)
 			except Exception as e:
-				_settle(lambda: _fail_task(task, str(e), e, quiet))
+				_settle(lambda: _fail_task(task, str(e), e, quiet), quiet=quiet)
 			finally:
 				task._finalized = True
 				# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
@@ -2710,7 +2775,7 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 		running = _start_threads(workers, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5), early=early)
 		error = next(iter(failed.values()), None)
 		if not running:
-			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet) for task in tasks])
+			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet) for task in tasks], quiet=quiet)
 			return
 		if len(running) < wanted and not quiet:
 			# commands that must run at the same time may then wait on each other for good: say so
