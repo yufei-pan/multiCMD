@@ -2047,31 +2047,126 @@ def _lines_of(func, first, last):
 	return start + lo, start + texts.index(last, lo + 1)
 
 
-def _real_trip(state, code, lines):
+# up to Python 3.9 ( see _real_trip ), from their ceval.c: the opcodes that leave by FAST_DISPATCH(), after which
+# CPython does not check for a pending interrupt as the next one begins ( a conditional jump does so only for a bool,
+# taken here as always ), and the ones it never checks before
+_NO_CHECK_AFTER = {
+	(3, 7): {'DUP_TOP', 'DUP_TOP_TWO', 'JUMP_FORWARD', 'LOAD_CONST', 'LOAD_FAST', 'NOP', 'POP_TOP', 'ROT_THREE', 'ROT_TWO',
+		'STORE_FAST'},
+	(3, 8): {'BEGIN_FINALLY', 'CALL_FINALLY', 'DUP_TOP', 'DUP_TOP_TWO', 'END_ASYNC_FOR', 'END_FINALLY', 'JUMP_FORWARD',
+		'LOAD_CONST', 'LOAD_FAST', 'NOP', 'POP_TOP', 'ROT_FOUR', 'ROT_THREE', 'ROT_TWO', 'STORE_FAST'},
+	(3, 9): {'CONTAINS_OP', 'DUP_TOP', 'DUP_TOP_TWO', 'END_ASYNC_FOR', 'IS_OP', 'JUMP_FORWARD', 'LOAD_ASSERTION_ERROR',
+		'LOAD_CONST', 'LOAD_FAST', 'NOP', 'POP_TOP', 'ROT_FOUR', 'ROT_THREE', 'ROT_TWO', 'STORE_FAST'},
+}.get(sys.version_info[:2], set()) | {'POP_JUMP_IF_FALSE', 'POP_JUMP_IF_TRUE', 'JUMP_IF_FALSE_OR_POP', 'JUMP_IF_TRUE_OR_POP'}
+_NO_CHECK_BEFORE = {'SETUP_FINALLY', 'SETUP_WITH', 'BEFORE_ASYNC_WITH', 'YIELD_FROM'}
+# whether _real_trip leaves out the points those Pythons never raise at
+_TRIP_FILTERED = sys.version_info < (3, 10)
+
+
+def _gc_runs():
+	'''How many garbage collections have run in this process'''
+	return sum(generation['collections'] for generation in gc.get_stats())
+
+
+def _real_trip(state, code, lines, collecting=None):
 	'''
-	A trace function ( for _hook ) that trips a real pending SIGINT at the state['k']-th opcode event of code on the
-	lines ( lo, hi ), counting from 0, unlike _interrupt_at, which raises from the hook: _thread.interrupt_main() is
-	called from C ( a defaultdict's default_factory, so that no point where Python raises one runs in the trace
-	function ) with tracing off, and CPython raises it at its own next such point, whatever the Python version ( on
-	3.10 a conditional jump taken, or the start of a handler, included ). It sets state['tripped'] ( the line and
-	offset, None when the k-th event never came ) and state['n'].
+	A trace function ( for _hook ) that trips a real pending SIGINT at the state['k']-th point of code on the lines
+	( lo, hi ), counting from 0, unlike _interrupt_at, which raises from the hook: _thread.interrupt_main() is called from
+	C ( a defaultdict's default_factory ) with tracing off. From Python 3.10 no point where Python raises one runs in the
+	trace function after that, and CPython raises it at its own next such point ( on 3.10 a conditional jump taken, or
+	the start of a handler, included ): every opcode event is a point. Up to 3.9 the trace function's own instructions
+	are such points, so it is raised from the trace function, at the traced instruction, before that one runs: as a real
+	one only where CPython checks for one as that instruction begins, which is not after an instruction that leaves by
+	FAST_DISPATCH(), nor before SETUP_FINALLY, SETUP_WITH, BEFORE_ASYNC_WITH or YIELD_FROM ( their ceval.c ). Those
+	opcode events are not points there ( see _NO_CHECK_AFTER ), so a trip is one a real Ctrl-C could make. Nothing is
+	tripped while a garbage collection runs ( collecting: see _collection_watch, reset here ). It sets state['tripped']
+	( the line and offset, None when the k-th point never came ), state['n'] and state['gcs'] ( _gc_runs() as it
+	tripped: one that ran after it may have run a finalizer that took the interrupt, which CPython drops ).
 	'''
-	state.update(n=0, tripped=None)
+	state.update(n=0, tripped=None, gcs=None, prev=None)
+	if collecting is not None:
+		collecting[2]()
 	trip = collections.defaultdict(_thread.interrupt_main)
+	# offset -> ( its opcode, the one an EXTENDED_ARG there extends, which is the one that leaves: its event comes at
+	# the EXTENDED_ARG only, up to 3.10 )
+	ops = {}
+	if _TRIP_FILTERED:
+		pending = []
+		for x in dis.get_instructions(code):
+			pending.append(x)
+			if x.opname != 'EXTENDED_ARG':
+				for y in pending:
+					ops[y.offset] = (y.opname, x.opname)
+				pending = []
 	lo, hi = lines
 	def trace(frame, event, arg):
 		frame.f_trace_opcodes = True
+		if event != 'opcode' or frame.f_code is not code or state['tripped']:
+			return trace
+		if _TRIP_FILTERED:
+			# ( the first event after the hook is set follows a call's return, a point )
+			(op, leaves), prev = ops.get(frame.f_lasti, (None, None)), state['prev']
+			state['prev'] = leaves
+			if prev in _NO_CHECK_AFTER or op in _NO_CHECK_BEFORE:
+				return trace
 		# ( f_lineno is None at an instruction of no line, such as a handler's first from 3.11 )
 		line = frame.f_lineno
-		if event != 'opcode' or frame.f_code is not code or line is None or not lo <= line <= hi or state['tripped']:
+		if line is None or not lo <= line <= hi or collecting is not None and collecting[0]():
 			return trace
 		if state['n'] != state['k']:
 			state['n'] += 1
 			return trace
 		state['tripped'] = (line, frame.f_lasti)
+		state['gcs'] = _gc_runs()
 		sys.settrace(None)
 		return trip[0]
 	return trace
+
+
+def _record_unraisable(monkeypatch):
+	'''The KeyboardInterrupts CPython drops as unraisable from here on, as a list ( from Python 3.8 ); others go on'''
+	dropped = []
+	if hasattr(sys, 'unraisablehook'):
+		real = sys.unraisablehook
+		def hook(unraisable):
+			if issubclass(unraisable.exc_type, KeyboardInterrupt):
+				dropped.append(unraisable.exc_type)
+			else:
+				real(unraisable)
+		monkeypatch.setattr(sys, 'unraisablehook', hook)
+	return dropped
+
+
+def _trip_dropped(state, dropped):
+	'''
+	Whether CPython may have dropped what _real_trip tripped, in a finalizer ( a collection's, or a __del__: see
+	_record_unraisable )
+	'''
+	return state['tripped'] is not None and (bool(dropped) or _gc_runs() > state['gcs'])
+
+
+def _bare_points(func, try_end, between):
+	'''
+	Up to Python 3.9 the points of func outside every try where a first Ctrl-C leaves its command registered but not
+	signalled, the documented window of those Pythons ( see the README ), as offsets: on the line whose text is try_end,
+	the instructions that leave its try ( POP_BLOCK and the jump after it ), and every instruction on the line whose text
+	is between ( the statement between that try and the next one )
+	'''
+	if not _TRIP_FILTERED:
+		return set()
+	lines, start = inspect.getsourcelines(func)
+	texts = [line.strip() for line in lines]
+	end_line = start + texts.index(try_end)
+	between_line = start + texts.index(between) if between in texts else None
+	points = set()
+	line = None
+	for x in dis.get_instructions(func.__code__):
+		if x.starts_line:
+			line = x.starts_line
+		leaving = x.opname in ('POP_BLOCK', 'JUMP_FORWARD', 'JUMP_ABSOLUTE', 'EXTENDED_ARG')
+		if line == between_line or line == end_line and leaving:
+			points.add(x.offset)
+	return points
 
 
 def _group_running(pgid, wait):
@@ -2101,7 +2196,7 @@ _REAL_TRIPS = pytest.mark.skipif(not sys.platform.startswith('linux') or sys.ver
 
 
 @_REAL_TRIPS
-def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_command_stopped(launcher, monkeypatch):
+def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_command_stopped(launcher, monkeypatch, collecting):
 	# ( review of round 14, item 1 ) once its loops had settled the first Ctrl-C, _execute decided what to raise
 	# ( `cut = cuts[0] if cuts else None`, `if proc is None:` ... ) outside every try, before the stop's. Python 3.10
 	# raises a pending Ctrl-C at every conditional jump taken there ( 3.6 - 3.9 at nearly any instruction ): a second
@@ -2111,21 +2206,24 @@ def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_com
 	code = multiCMD._execute.__code__
 	lines = _lines_of(multiCMD._execute, 'cut = cuts[0] if cuts else None', "reason, interrupted = 'stop', first")
 	state = {'k': 0}
+	dropped = _record_unraisable(monkeypatch)
 	real_execute_child = subprocess.Popen._execute_child
 	def execute_child(self, *args, **kwargs):
 		real_execute_child(self, *args, **kwargs)
 		state['proc'] = self
-		_hook(_real_trip(state, code, lines))
+		_hook(_real_trip(state, code, lines, collecting))
 		raise KeyboardInterrupt('first')
 	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
 	running, returned = [], []
 	while True:
+		del dropped[:]
 		try:
 			try:
 				multiCMD.run_command(['sleep', '30'], quiet=True)
 			finally:
 				_unhook()
-			returned.append(state['tripped'])
+			if not _trip_dropped(state, dropped):
+				returned.append(state['tripped'])
 		except KeyboardInterrupt:
 			pass
 		proc = state['proc']
@@ -2140,11 +2238,12 @@ def test_a_real_second_ctrl_c_as_execute_decides_what_to_raise_still_has_the_com
 			break
 		state['k'] += 1
 	assert running == [] and returned == []
-	assert state['k'] > 5 and not multiCMD._live_procs
+	# ( up to 3.9 only the points a real one can land at: a few, see _real_trip )
+	assert state['k'] > (2 if _TRIP_FILTERED else 5) and not multiCMD._live_procs
 
 
 @_REAL_TRIPS
-def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_its_group_untracked(launcher, monkeypatch):
+def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_its_group_untracked(launcher, monkeypatch, collecting):
 	# ( review of round 14, item 2 ) a command that exits while something it started holds its output open is drained;
 	# on a Ctrl-C there _execute forgot the group ( _draining.pop(), in a finally ) before it stopped it: a second Ctrl-C
 	# between the two left the background group running, in neither registry, out of kill_all()'s reach. The first
@@ -2153,6 +2252,7 @@ def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_it
 	code = multiCMD._execute.__code__
 	lines = _lines_of(multiCMD._execute, '_draining[proc] = pgid', '_join_all(readers, None if reason is None else 1)')
 	state = {'k': 0}
+	dropped = _record_unraisable(monkeypatch)
 	spawned = []
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
@@ -2161,18 +2261,19 @@ def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_it
 		return result
 	monkeypatch.setattr(multiCMD, '_spawn', spawn)
 	def drain(task, readers, timeout):
-		_hook(_real_trip(state, code, lines))
+		_hook(_real_trip(state, code, lines, collecting))
 		raise KeyboardInterrupt('first')
 	monkeypatch.setattr(multiCMD, '_drain', drain)
 	lost, returned = [], []
 	while True:
-		del spawned[:]
+		del spawned[:], dropped[:]
 		try:
 			try:
 				multiCMD.run_command(['sh', '-c', 'sleep 30 & echo hi'], quiet=True)
 			finally:
 				_unhook()
-			returned.append(state['tripped'])
+			if not _trip_dropped(state, dropped):
+				returned.append(state['tripped'])
 		except KeyboardInterrupt:
 			pass
 		proc, pgid = spawned[0]
@@ -2194,7 +2295,7 @@ def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_it
 
 
 @_REAL_TRIPS
-def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(launcher, monkeypatch):
+def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(launcher, monkeypatch, collecting):
 	# ( review of round 15, a ) once _watch() had returned 'timeout', _execute noted it ( task.stderr.append ) before
 	# the stop's try: a Ctrl-C raised as append() returned ( on 3.10 also at that conditional jump, taken for a stop )
 	# left _execute with the command registered, never signalled. The only Ctrl-C of the run, tripped for real at each
@@ -2202,7 +2303,10 @@ def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(l
 	# run_command() raises
 	code = multiCMD._execute.__code__
 	lines = _lines_of(multiCMD._execute, 'reason = _watch(task, proc, timeout)', '_join_all(readers, None if reason is None else 1)')
+	# ( up to 3.9: the documented window there, a first Ctrl-C between _execute's trys, see _bare_points )
+	bare = _bare_points(multiCMD._execute, 'reason = _watch(task, proc, timeout)', 'draining = reason is None')
 	state = {'k': 0}
+	dropped = _record_unraisable(monkeypatch)
 	procs = []
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
@@ -2213,25 +2317,29 @@ def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(l
 	real_watch = multiCMD._watch
 	def watch(*args):
 		reason = real_watch(*args)
-		_hook(_real_trip(state, code, lines))
+		_hook(_real_trip(state, code, lines, collecting))
 		return reason
 	monkeypatch.setattr(multiCMD, '_watch', watch)
-	running, returned = [], []
+	running, returned, excused = [], [], []
 	while True:
-		del procs[:]
+		del procs[:], dropped[:]
 		try:
 			try:
 				multiCMD.run_command(['sleep', '30'], timeout=0.1, quiet=True)
 			finally:
 				_unhook()
-			if state['tripped'] is not None:
+			if state['tripped'] is not None and not _trip_dropped(state, dropped):
 				returned.append(state['tripped'])
 		except KeyboardInterrupt:
 			pass
 		proc = procs[0]
 		if not multiCMD._wait_all([(proc, None)], 2):
-			# before ( 3c0e49b ): registered and running, by one raised as `task.stderr.append('Timeout!')` returned
-			running.append((state['tripped'], proc in multiCMD._live_procs))
+			registered = proc in multiCMD._live_procs
+			if registered and state['tripped'][1] in bare:
+				excused.append(state['tripped'])
+			else:
+				# before ( 3c0e49b ): registered and running, by one raised as `task.stderr.append('Timeout!')` returned
+				running.append((state['tripped'], registered))
 			proc.kill()
 		multiCMD._wait_all([(proc, None)], 5)
 		multiCMD._unregister(proc)
@@ -2239,11 +2347,12 @@ def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(l
 			break
 		state['k'] += 1
 	assert running == [] and returned == []
-	assert state['k'] > 5 and not multiCMD._live_procs
+	# ( the window is a few instructions: the try's exit, and on 3.8 `draining = reason is None`'s store )
+	assert len(excused) <= 3 and state['k'] > 5 and not multiCMD._live_procs
 
 
 @_REAL_TRIPS
-def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_stopped(launcher, monkeypatch):
+def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_stopped(launcher, monkeypatch, collecting):
 	# ( review of round 15, b ) a command that exits while something it started holds its output open left the live
 	# registry ( _unregister ) before _execute tracked its group as draining: a Ctrl-C between the two ( as _unregister()
 	# or _poll() returned ) left the group running, in neither registry, and one before them ( on 3.10 at the
@@ -2252,7 +2361,10 @@ def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_
 	# gone soon after. ( An inactivity timeout ends each drain, so one tripped after it does not wait for the sleep )
 	code = multiCMD._execute.__code__
 	lines = _lines_of(multiCMD._execute, 'reason = _watch(task, proc, timeout)', '_join_all(readers, None if reason is None else 1)')
+	# ( up to 3.9: the documented window there, a first Ctrl-C between _execute's trys, see _bare_points )
+	bare = _bare_points(multiCMD._execute, 'reason = _watch(task, proc, timeout)', 'draining = reason is None')
 	state = {'k': 0}
+	dropped = _record_unraisable(monkeypatch)
 	spawned = []
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
@@ -2263,26 +2375,30 @@ def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_
 	real_watch = multiCMD._watch
 	def watch(*args):
 		reason = real_watch(*args)
-		_hook(_real_trip(state, code, lines))
+		_hook(_real_trip(state, code, lines, collecting))
 		return reason
 	monkeypatch.setattr(multiCMD, '_watch', watch)
-	lost, returned = [], []
+	lost, returned, excused = [], [], []
 	while True:
-		del spawned[:]
+		del spawned[:], dropped[:]
 		try:
 			try:
 				multiCMD.run_command(['sh', '-c', 'sleep 30 & echo hi'], timeout=0.3, quiet=True)
 			finally:
 				_unhook()
-			if state['tripped'] is not None:
+			if state['tripped'] is not None and not _trip_dropped(state, dropped):
 				returned.append(state['tripped'])
 		except KeyboardInterrupt:
 			pass
 		proc, pgid = spawned[0]
 		if _group_running(pgid, 2):
-			# before ( 3c0e49b ): by one raised as _unregister() or _poll() returned, in neither registry; on 3.10 by one
-			# at a conditional jump before them, registered and never signalled
-			lost.append((state['tripped'], proc in multiCMD._live_procs or proc in multiCMD._draining))
+			tracked = proc in multiCMD._live_procs or proc in multiCMD._draining
+			if tracked and state['tripped'][1] in bare:
+				excused.append(state['tripped'])
+			else:
+				# before ( 3c0e49b ): by one raised as _unregister() or _poll() returned, in neither registry; on 3.10 by
+				# one at a conditional jump before them, registered and never signalled
+				lost.append((state['tripped'], tracked))
 		try:
 			os.killpg(pgid, signal.SIGKILL)
 		except ProcessLookupError:
@@ -2293,4 +2409,4 @@ def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_
 			break
 		state['k'] += 1
 	assert lost == [] and returned == []
-	assert state['k'] > 5
+	assert len(excused) <= 3 and state['k'] > 5
