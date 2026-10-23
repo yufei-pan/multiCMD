@@ -1050,3 +1050,30 @@ def test_a_ctrl_c_that_thread_start_turns_into_another_error_is_still_raised(mon
 		multiCMD.run_command(['sleep', '2'], quiet=True)
 	# before: the command ran to its end and the call returned
 	assert time.monotonic() - started < 1.5 and not multiCMD._live_procs
+
+
+# ---- review of round 10
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_thread_start_error_while_the_caller_handles_a_ctrl_c_is_not_that_ctrl_c(monkeypatch, another_thread):
+	# ( finding 3; probe r10probes/stale_ctx.py ) a program cleans up after a real Ctrl-C it caught, running commands
+	# from its except block, and one pool worker cannot start ( EAGAIN ): that RuntimeError has the Ctrl-C being
+	# handled as its context, and was taken for a Ctrl-C that landed during the start
+	real_start = threading.Thread.start
+	calls = []
+	def start(self):
+		if getattr(self, '_target', None) is not None and getattr(self._target, '__name__', '') == 'worker':
+			calls.append(self)
+			if len(calls) == 1:
+				raise RuntimeError("can't start new thread")
+		real_start(self)
+	monkeypatch.setattr(threading.Thread, 'start', start)
+	try:
+		_ctrl_c()
+	except KeyboardInterrupt:
+		try:
+			tasks = run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
+		except KeyboardInterrupt:
+			# before ( fdc45b9 ): the Ctrl-C being handled was raised again, and the tasks never ran
+			pytest.fail('the Ctrl-C the caller handles was raised again')
+	assert len(calls) == 4 and [task.returncode for task in tasks] == [0] * 4

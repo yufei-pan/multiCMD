@@ -287,12 +287,15 @@ class _Thread(threading.Thread):
 		self._claim = {}
 
 	def start(self):
+		# what the caller is handling already ( an except or finally block ): an error raised while handling it is not
+		# one raised during this start
+		handling = sys.exc_info()[1]
 		try:
 			super().start()
 		except BaseException as e:
 			# it cannot start, or a Ctrl-C landed while start() waited for it to come up: it runs if it got that far
 			self._abandon()
-			interrupt = _interrupt_in(e)
+			interrupt = _interrupt_in(e, handling)
 			if interrupt is not None and interrupt is not e:
 				# a Ctrl-C that start()'s wait turned into another error: Condition.wait() releases its lock on the
 				# way out, and when the Ctrl-C cut short the _acquire_restore() that takes it back, that release
@@ -336,10 +339,15 @@ class _Thread(threading.Thread):
 				left = 1 if left is None else min(left, 1)
 			super().join(left)
 
-def _interrupt_in(error):
-	'''The KeyboardInterrupt or SystemExit error is, or that it was raised while handling, if any ( internal )'''
+def _interrupt_in(error, before=None):
+	'''
+	The KeyboardInterrupt or SystemExit error is, or that it was raised while handling, if any ( internal )
+	The walk down error's __context__ chain stops at before: what the caller was handling already ( sys.exc_info()
+	before the call that raised error ), whose own context is older still. A Ctrl-C the caller is handling, from its
+	except block, is not one that landed during the call.
+	'''
 	seen = set()
-	while error is not None and id(error) not in seen:
+	while error is not None and error is not before and id(error) not in seen:
 		if isinstance(error, _INTERRUPTS):
 			return error
 		seen.add(id(error))
