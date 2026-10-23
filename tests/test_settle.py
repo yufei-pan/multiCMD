@@ -1649,3 +1649,53 @@ def test_a_ctrl_c_anywhere_in_a_start_leaves_the_signal_mask_as_it_was(launcher)
 		state['k'] += 1
 	assert state['k'] > 5
 
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
+def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_it(launcher, monkeypatch):
+	# ( matrix of round 12, finding 3 ) _execute() began its handling of an interrupt with _is_interrupt(first), a call
+	# before the loop that settles: a second Ctrl-C raised as it began ( the next point where Python raises one, so
+	# where a signal delivered twice lands ) left _execute before settle had registered the command, which ran on in
+	# its own process group, unknown to kill_all() and the exit hook, and was left a zombie ( seen on 3.13t and 3.14t
+	# in the start stress test, outside the fork ). A first Ctrl-C once Popen has the pid, and a second one at each
+	# point of multiCMD's code in turn until the command is registered: it is registered, or it is gone
+	state = {'k': 0}
+	def counted(frame, event):
+		proc = state.get('proc')
+		if proc is not None and proc in multiCMD._live_procs:
+			# registered: nothing after this can lose it
+			state['registered'] = True
+			sys.setprofile(None)
+			return False
+		mine = multiCMD.__file__
+		return frame.f_code.co_filename == mine or frame.f_back is not None and frame.f_back.f_code.co_filename == mine
+	real_execute_child = subprocess.Popen._execute_child
+	def execute_child(self, *args, **kwargs):
+		real_execute_child(self, *args, **kwargs)
+		# the first Ctrl-C, inside Popen once it has the pid; the second one from here on
+		state['proc'] = self
+		sys.setprofile(_interrupt_at(state, counted))
+		raise KeyboardInterrupt('first')
+	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
+	lost = []
+	while True:
+		state.pop('proc', None)
+		state['registered'] = False
+		try:
+			with pytest.raises(KeyboardInterrupt):
+				multiCMD.run_command(['sleep', '30'], quiet=True)
+		finally:
+			sys.setprofile(None)
+		proc = state['proc']
+		if proc in multiCMD._live_procs:
+			# what a second Ctrl-C left registered: kill_all() and the exit hook reach it
+			multiCMD.kill_all(signal.SIGKILL)
+		elif proc.returncode is None:
+			# before ( f891332 ): lost by a second Ctrl-C as _is_interrupt() began, returned, or as its isinstance() did
+			lost.append(state['where'])
+			proc.kill()
+			proc.wait(10)
+		if not state['injected']:
+			break
+		state['k'] += 1
+	assert lost == []
+	assert state['k'] > 5 and state['registered']

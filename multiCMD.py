@@ -2334,11 +2334,19 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		waiting = True
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
+		# nothing here is a call until the loop below is in its try: an interrupt raised before it ( a second Ctrl-C,
+		# or a Ctrl-C a free-threaded build delivers twice, which lands at the next point Python raises one ) would
+		# leave _execute before settle has registered the command, which would run on unknown to kill_all() and the
+		# exit hook. From Python 3.10 Python raises one only as a call begins or returns, or on a loop's way back
 		first = e
-		# whether what came is an interrupt, rather than a failure of multiCMD's ( see _is_interrupt )
-		interrupt = waiting or _is_interrupt(first)
-		# the interrupts that cut settle short ( see _settle ): never a failure of settle's own
+		# whether what came is an interrupt, rather than a failure of multiCMD's ( see _is_interrupt; None until the
+		# loop below has looked )
+		interrupt = None
+		# the interrupts that cut settle short ( see _settle ), or that came around it: never a failure of settle's own
 		cuts = []
+		# what the _settle() calls below raised that the loop has not looked at yet, and whether it is done
+		raised = []
+		settled = False
 		def settle():
 			nonlocal proc, pgid
 			found = _started_command(started)
@@ -2370,22 +2378,37 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_send(proc, pgid, signal.SIGTERM)
 				_send(proc, pgid, signal.SIGCONT)
-		while True:
+		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
+		# is taken by the outer one )
+		while not settled:
 			try:
-				_settle(settle, cuts, quiet)
-				break
+				while not settled:
+					try:
+						if raised:
+							seen = raised.pop()
+							if cuts and seen is cuts[0]:
+								# raised by _settle, once settle has completed
+								settled = True
+							elif _is_interrupt(seen):
+								# pending as _settle was called, so settle never ran, or landing as it returned, or while
+								# this loop looked: it runs again, knowing of it
+								cuts.append(seen)
+							else:
+								# settle failed on its own, every time it ran ( see _settle ): what it did not do is left
+								# to the stop below, kill_all() and the exit hook
+								settled = True
+								if not quiet:
+									_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: '
+										f'{type(seen).__name__}: {seen}')
+						elif interrupt is None:
+							interrupt = waiting or _is_interrupt(first)
+						else:
+							_settle(settle, cuts, quiet)
+							settled = True
+					except BaseException as c:
+						raised.append(c)
 			except BaseException as c:
-				if cuts and c is cuts[0]:
-					# raised by _settle, once settle has completed
-					break
-				if not _is_interrupt(c):
-					# settle failed on its own, every time it ran ( see _settle ): what it did not do is left to the
-					# stop below, kill_all() and the exit hook
-					if not quiet:
-						_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: {type(c).__name__}: {c}')
-					break
-				# pending as _settle was called, so settle never ran ( or landing as it returned ): it runs again, knowing of it
-				cuts.append(c)
+				raised.append(c)
 		cut = cuts[0] if cuts else None
 		if proc is None:
 			# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
