@@ -2489,24 +2489,27 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# ( a stop cut short, or kept from beginning: see _stop_command )
 				_cut_stop(proc, pgid)
 			raise
-	if reason == 'timeout':
-		task.stderr.append('Timeout!')
-	if reason is not None and interrupted is None:
-		try:
+	# whether the command exited of itself: what it started may still hold its output open, and is read to its end
+	draining = reason is None
+	# from here to the end of the stop, or of the output: an interrupt that lands has the command ( a stop or the
+	# timeout ) or its group ( once it exited ) sent SIGTERM, still tracked, and is raised on. A group is forgotten only
+	# once it is stopped, or once its output has ended; one whose stop is cut short stays tracked, as a command does:
+	# registered again, so the exit hook reaches it too. ( Its output may end just as one lands: what it left running
+	# is then sent SIGTERM all the same )
+	try:
+		if draining:
+			# tracked as draining before it leaves the live registry ( a Ctrl-C between the two would leave it in neither )
+			_draining[proc] = pgid
+		elif interrupted is None:
+			# a stop or the timeout, the note in the try too ( a Ctrl-C as append() returns would leave it unsignalled )
+			if reason == 'timeout':
+				task.stderr.append('Timeout!')
 			_stop_command(proc, pgid, quiet)
-		except BaseException:
-			_cut_stop(proc, pgid)
-			raise
-	_unregister(proc)
-	task.returncode = _poll(proc)
-	if reason is None:
-		# the command exited, but something it started may still hold its output open: keep reading,
-		# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
-		_draining[proc] = pgid
-		# ( forgotten only once it is stopped, or once its output has ended: an interrupt that lands before, a second
-		# Ctrl-C while the first is dealt with included, has the group sent SIGTERM, and it stays tracked, as a command
-		# does whose stop is cut short: registered again, so the exit hook reaches it too )
-		try:
+		_unregister(proc)
+		task.returncode = _poll(proc)
+		if draining:
+			# the command exited, but something it started may still hold its output open: keep reading,
+			# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
 			try:
 				reason = _drain(task, readers, timeout)
 			except BaseException as e:
@@ -2518,12 +2521,13 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				task.stderr.append('Timeout!')
 			if reason is not None:
 				_stop_command(proc, pgid, quiet)
-		except BaseException:
+	except BaseException:
+		if draining:
 			_live_procs[proc] = pgid
 			_draining.pop(proc, None)
-			_cut_stop(proc, pgid)
-			raise
-		_draining.pop(proc, None)
+		_cut_stop(proc, pgid)
+		raise
+	_draining.pop(proc, None)
 	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124

@@ -505,10 +505,11 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 - A SIGTERM handler's `sys.exit()`, or whatever your own signal handler raises while a call waits for
   its commands, stops them and records them as stopped before it is raised on, as a Ctrl-C does; 1.54
   did that only for `KeyboardInterrupt`.
-- A Ctrl-C while a command starts no longer leaves it running unknown to `kill_all()` and the exit
-  hook, and neither does a second one while multiCMD stops what a finished command left running with
-  its output open (but for the limits below). A second Ctrl-C ends the wait for the commands at once;
-  each is still sent SIGTERM, and `kill_all()` and the exit hook finish the kill.
+- A Ctrl-C while a command starts, times out or is stopped, or while multiCMD reads the output that
+  a finished command's background processes still hold open, no longer leaves the command or those
+  processes running unknown to `kill_all()` and the exit hook, or known to them but never signalled
+  (but for the limits below). A second Ctrl-C ends the wait for the commands at once; each is still
+  sent SIGTERM, and `kill_all()` and the exit hook finish the kill.
 - Once the interpreter exits, a command queued on one of multiCMD's threads that has not started fails
   with -1 ("not started: the interpreter is exiting") instead of starting and outliving the program.
 - A command still running a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the

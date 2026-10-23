@@ -2191,3 +2191,106 @@ def test_a_real_second_ctrl_c_while_a_drained_command_is_stopped_never_leaves_it
 		state['k'] += 1
 	assert lost == [] and returned == []
 	assert state['k'] > 5
+
+
+@_REAL_TRIPS
+def test_the_only_real_ctrl_c_as_a_timed_out_command_is_stopped_has_it_stopped(launcher, monkeypatch):
+	# ( review of round 15, a ) once _watch() had returned 'timeout', _execute noted it ( task.stderr.append ) before
+	# the stop's try: a Ctrl-C raised as append() returned ( on 3.10 also at that conditional jump, taken for a stop )
+	# left _execute with the command registered, never signalled. The only Ctrl-C of the run, tripped for real at each
+	# opcode of _execute from _watch()'s return to the end of the run in turn: the command is dead soon after, and
+	# run_command() raises
+	code = multiCMD._execute.__code__
+	lines = _lines_of(multiCMD._execute, 'reason = _watch(task, proc, timeout)', '_join_all(readers, None if reason is None else 1)')
+	state = {'k': 0}
+	procs = []
+	real_spawn = multiCMD._spawn
+	def spawn(*args, **kwargs):
+		result = real_spawn(*args, **kwargs)
+		procs.append(result[0])
+		return result
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
+	real_watch = multiCMD._watch
+	def watch(*args):
+		reason = real_watch(*args)
+		_hook(_real_trip(state, code, lines))
+		return reason
+	monkeypatch.setattr(multiCMD, '_watch', watch)
+	running, returned = [], []
+	while True:
+		del procs[:]
+		try:
+			try:
+				multiCMD.run_command(['sleep', '30'], timeout=0.1, quiet=True)
+			finally:
+				_unhook()
+			if state['tripped'] is not None:
+				returned.append(state['tripped'])
+		except KeyboardInterrupt:
+			pass
+		proc = procs[0]
+		if not multiCMD._wait_all([(proc, None)], 2):
+			# before ( 3c0e49b ): registered and running, by one raised as `task.stderr.append('Timeout!')` returned
+			running.append((state['tripped'], proc in multiCMD._live_procs))
+			proc.kill()
+		multiCMD._wait_all([(proc, None)], 5)
+		multiCMD._unregister(proc)
+		if state['tripped'] is None:
+			break
+		state['k'] += 1
+	assert running == [] and returned == []
+	assert state['k'] > 5 and not multiCMD._live_procs
+
+
+@_REAL_TRIPS
+def test_the_only_real_ctrl_c_as_a_command_that_exited_is_drained_has_its_group_stopped(launcher, monkeypatch):
+	# ( review of round 15, b ) a command that exits while something it started holds its output open left the live
+	# registry ( _unregister ) before _execute tracked its group as draining: a Ctrl-C between the two ( as _unregister()
+	# or _poll() returned ) left the group running, in neither registry, and one before them ( on 3.10 at the
+	# conditional jumps after _watch() returned ) left it registered, never signalled. The only Ctrl-C of the run,
+	# tripped for real at each opcode of _execute from _watch()'s return to the end of the run in turn: the group is
+	# gone soon after. ( An inactivity timeout ends each drain, so one tripped after it does not wait for the sleep )
+	code = multiCMD._execute.__code__
+	lines = _lines_of(multiCMD._execute, 'reason = _watch(task, proc, timeout)', '_join_all(readers, None if reason is None else 1)')
+	state = {'k': 0}
+	spawned = []
+	real_spawn = multiCMD._spawn
+	def spawn(*args, **kwargs):
+		result = real_spawn(*args, **kwargs)
+		spawned.append(result)
+		return result
+	monkeypatch.setattr(multiCMD, '_spawn', spawn)
+	real_watch = multiCMD._watch
+	def watch(*args):
+		reason = real_watch(*args)
+		_hook(_real_trip(state, code, lines))
+		return reason
+	monkeypatch.setattr(multiCMD, '_watch', watch)
+	lost, returned = [], []
+	while True:
+		del spawned[:]
+		try:
+			try:
+				multiCMD.run_command(['sh', '-c', 'sleep 30 & echo hi'], timeout=0.3, quiet=True)
+			finally:
+				_unhook()
+			if state['tripped'] is not None:
+				returned.append(state['tripped'])
+		except KeyboardInterrupt:
+			pass
+		proc, pgid = spawned[0]
+		if _group_running(pgid, 2):
+			# before ( 3c0e49b ): by one raised as _unregister() or _poll() returned, in neither registry; on 3.10 by one
+			# at a conditional jump before them, registered and never signalled
+			lost.append((state['tripped'], proc in multiCMD._live_procs or proc in multiCMD._draining))
+		try:
+			os.killpg(pgid, signal.SIGKILL)
+		except ProcessLookupError:
+			pass
+		multiCMD._live_procs.pop(proc, None)
+		multiCMD._draining.pop(proc, None)
+		if state['tripped'] is None:
+			break
+		state['k'] += 1
+	assert lost == [] and returned == []
+	assert state['k'] > 5
