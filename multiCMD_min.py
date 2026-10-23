@@ -777,21 +777,22 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		except BaseException as c:
 			if proc is not None and c is not cut and c is not first:_cut_stop(proc,pgid)
 			raise
-	if reason=='timeout':task.stderr.append('Timeout!')
-	if reason is not None and interrupted is None:
-		try:_stop_command(proc,pgid,quiet)
-		except BaseException:_cut_stop(proc,pgid);raise
-	_unregister(proc);task.returncode=_poll(proc)
-	if reason is None:
-		_draining[proc]=pgid
-		try:
+	draining=reason is None
+	try:
+		if draining:_draining[proc]=pgid
+		elif interrupted is None:
+			if reason=='timeout':task.stderr.append('Timeout!')
+			_stop_command(proc,pgid,quiet)
+		_unregister(proc);task.returncode=_poll(proc)
+		if draining:
 			try:reason=_drain(task,readers,timeout)
 			except BaseException as e:reason,interrupted='stop',e
 			if reason=='timeout':task.stderr.append('Timeout!')
 			if reason is not None:_stop_command(proc,pgid,quiet)
-		except BaseException:_live_procs[proc]=pgid;_draining.pop(proc,None);_cut_stop(proc,pgid);raise
-		_draining.pop(proc,None)
-	_join_all(readers,None if reason is None else 1)
+	except BaseException:
+		if draining:_live_procs[proc]=pgid;_draining.pop(proc,None)
+		_cut_stop(proc,pgid);raise
+	_draining.pop(proc,None);_join_all(readers,None if reason is None else 1)
 	if reason=='timeout':task.returncode=124
 	elif task.returncode is None:
 		if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
