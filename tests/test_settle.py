@@ -864,11 +864,14 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	# whether a Ctrl-C raises: only while a run goes on ( one that lands after it is only recorded )
 	armed = [False]
 	def handler(signum, frame):
+		# a finalizer or weakref callback ( a lambda one of the standard library's, as threading has ) that the garbage
+		# collector ran wherever it ran, which CPython drops what it raises from
+		innermost = frame is not None and frame.f_code.co_name == '<lambda>' and frame.f_code.co_filename != multiCMD.__file__
 		names = []
 		while frame is not None:
 			names.append(frame.f_code.co_name if 'unraisable' not in frame.f_code.co_filename else 'unraisable')
 			frame = frame.f_back
-		landed.append((bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
+		landed.append((innermost or bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
 		if armed[0]:
 			raise KeyboardInterrupt
 	previous = signal.signal(signal.SIGINT, handler)
@@ -945,7 +948,8 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 		else:
 			# CPython drops a KeyboardInterrupt its handler raises inside a __del__ or a weakref callback ( a Popen or
 			# a Thread collected on the main thread, a lambda weakref callback of threading's ): that Ctrl-C never
-			# reached multiCMD, and it is the only excuse ( told by the unraisable hook, or before 3.8 by the frames )
+			# reached multiCMD, and it is the only excuse ( told by the unraisable hook, or by the frames: not every
+			# such drop reaches the hook on free-threaded 3.13t )
 			assert landed and (unraisable.count(KeyboardInterrupt) >= len(landed)
 				or all(dropped for dropped, _, _ in landed)), (landed, unraisable)
 		inside = any(inside for _, inside, _ in landed)
