@@ -471,3 +471,30 @@ def test_a_command_started_as_the_exit_hook_begins_is_still_stopped(tmp_path):
 			pass
 	# before ( fc0c782 ): all three ran on
 	assert len(started) == 3 and left == [], (started, left, proc.stderr)
+
+
+@linux_only
+def test_a_sigterm_handlers_exit_while_a_serial_run_drains_output_stops_what_holds_it(tmp_path, request):
+	# ( review of round 11, finding 3; probe drain_exit.py ) the command exited, and what it started in the background
+	# holds its output open: _drain() stopped that on KeyboardInterrupt only, so a SIGTERM handler's sys.exit() left
+	# the background group running
+	previous = signal.signal(signal.SIGTERM, lambda *args: sys.exit(143))
+	request.addfinalizer(lambda: signal.signal(signal.SIGTERM, previous))
+	pidfile = tmp_path / 'pid'
+	main = threading.main_thread().ident
+	def sender():
+		deadline = time.monotonic() + 10
+		while not (multiCMD._draining or time.monotonic() > deadline):
+			time.sleep(0.01)
+		time.sleep(0.2)
+		signal.pthread_kill(main, signal.SIGTERM)
+	threading.Thread(target=sender, daemon=True).start()
+	with pytest.raises(SystemExit) as raised:
+		run_command(['sh', '-c', f'sleep 30 & echo $! > {pidfile}; echo hi'], quiet=True)
+	assert raised.value.code == 143
+	pid = int(pidfile.read_text())
+	gone = pid_gone(pid, wait=2)
+	if not gone:
+		os.kill(pid, signal.SIGKILL)
+	# before ( fc0c782 ): the background sleep ran on
+	assert gone and not multiCMD._draining

@@ -2148,7 +2148,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	started = []
 	streams = []
 	readers = []
-	interrupted = False
+	# the interrupt to raise once the command is dead ( see below )
+	interrupted = None
 	# from the pty on, an interrupt or any failure closes it; from the spawn on, it still stops the command, which runs
 	# in a process group of its own
 	try:
@@ -2245,7 +2246,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			_unregister(proc)
 			_join_all(readers, 1)
 			raise first
-		reason, interrupted = 'stop', True
+		reason, interrupted = 'stop', first
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
 	if reason is not None:
@@ -2258,8 +2259,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		_draining[proc] = pgid
 		try:
 			reason = _drain(task, readers, timeout)
-		except KeyboardInterrupt:
-			reason, interrupted = 'stop', True
+		except _INTERRUPTS as e:
+			# ( a SystemExit from a SIGTERM handler as well: the background group is stopped before it is raised )
+			reason, interrupted = 'stop', e
 		finally:
 			_draining.pop(proc, None)
 		if reason == 'timeout':
@@ -2278,8 +2280,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			task._error = True
 	task.end_time = time.time()
 	task._finalized = True
-	if interrupted:
-		raise KeyboardInterrupt
+	if interrupted is not None:
+		raise interrupted
 
 def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=False,decor=('', '', ''),use_pty=False):
 	'''
