@@ -30,8 +30,10 @@ from pprint import pformat
 version = '1.54'
 __version__ = version
 COMMIT_DATE = '2026-10-12'
-# fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on
+# fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
+# lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
+# unused: multiCMD 1.54 took it around __running_threads. Kept only for code that imported it; never take it
 __running_threads_lock = threading.Lock()
 # fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
 __finished_threads = collections.deque()
@@ -597,11 +599,12 @@ class AsyncExecutor:
 		self.env = None if env is None else env.copy()
 		# an empty one ( which _check_env reduces to None ) stays a dict to add to, like env
 		self.extra_env = None if extra_env is None else dict(extra or {})
+		# held while tasks, _queue and _dispatching change together; never by a settled step ( see _settle )
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
 		self._dispatching = False
-		# started threads not yet joined, in start order ( dict used as an ordered set )
+		# started threads not yet joined, in start order ( dict used as an ordered set; no lock, see _track )
 		self._threads = {}
 		# threads append themselves here when done, so _reap() joins them without scanning
 		self._finished = collections.deque()
@@ -629,8 +632,7 @@ class AsyncExecutor:
 			list[threading.Thread]: The unfinished threads
 		'''
 		self._reap()
-		with self._lock:
-			return list(self._threads)
+		return list(self._threads.copy())
 
 	def _reap(self):
 		'''
@@ -648,32 +650,31 @@ class AsyncExecutor:
 			finally:
 				# also when the join is interrupted ( Ctrl-C ): the item is already off _finished, and
 				# a finished thread needs no join to be forgotten, joining only frees its stack
-				with self._lock:
-					self._threads.pop(thread, None)
-					# a finished Thread object costs ~2 KB, and the task outlives it in self.tasks
-					if task is not None and task.thread is thread:
-						task.thread = None
+				self._threads.pop(thread, None)
+				# a finished Thread object costs ~2 KB, and the task outlives it in self.tasks
+				if task is not None and task.thread is thread:
+					task.thread = None
 
 	def _track(self, thread):
 		'''
 		Track a _Thread about to start until it reports itself finished ( internal; register for _start_threads )
 		Tracked before it starts, so it is tracked before it can report itself finished, and its task has it
-		before it runs, so _reap() never sees the task without its thread.
+		before it runs, so _reap() never sees the task without its thread. _threads takes no lock ( one dict operation
+		each, and dict.copy() snapshots ), so no Ctrl-C can leave _track, _untrack or _reap blocking: _untrack is a
+		settled step's ( see _settle ).
 		'''
-		with self._lock:
-			self._threads[thread] = None
-			if thread.task is not None:
-				thread.task.thread = thread
+		self._threads[thread] = None
+		if thread.task is not None:
+			thread.task.thread = thread
 
 	def _untrack(self, thread):
 		'''
 		Stop tracking a thread that never runs its target, as it never reports itself finished ( internal; forget for _start_threads )
 		Its task drops it as a finished one does: an executor task has a thread only while it runs.
 		'''
-		with self._lock:
-			self._threads.pop(thread, None)
-			if thread.task is not None and thread.task.thread is thread:
-				thread.task.thread = None
+		self._threads.pop(thread, None)
+		if thread.task is not None and thread.task.thread is thread:
+			thread.task.thread = None
 
 	def _dispatch(self):
 		'''
@@ -782,8 +783,10 @@ class AsyncExecutor:
 			if start_dispatcher and (dispatcher is None or dispatcher._abandon()):
 				if dispatcher is not None:
 					self._untrack(dispatcher)
-				with self._lock:
-					self._dispatching = False
+				# ( no dispatcher runs, so nothing else clears it; one store, without the lock, which a settled step
+				# never takes: a run_commands() from another thread that saw it still set leaves its commands queued
+				# for the next one, as it would have had it taken the lock first )
+				self._dispatching = False
 		try:
 			with self._lock:
 				first = len(self.tasks) + 1
@@ -2253,8 +2256,7 @@ def __reap_finished_threads():
 			thread.join()
 		finally:
 			# also when the join is interrupted ( Ctrl-C ): the thread is already off __finished_threads
-			with __running_threads_lock:
-				__running_threads.discard(thread)
+			__running_threads.discard(thread)
 
 def _split_command(command):
 	'''
@@ -2657,8 +2659,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 		def forget(thread):
 			# it never runs: untracked, as it never reports itself finished, and its task keeps it ( done, so
 			# task.thread.join() returns at once ) but not its environment
-			with __running_threads_lock:
-				__running_threads.discard(thread)
+			__running_threads.discard(thread)
 			thread.task.thread = thread
 			thread.task._env = thread.task._extra_env = None
 		def fail(thread, error):
@@ -2670,8 +2671,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 				thread.task.thread = thread
 			# the whole batch is tracked before any starts, so a thread is registered before it reports itself finished
 			# and a join_threads() from another thread meanwhile waits for all of it ( see _Thread )
-			with __running_threads_lock:
-				__running_threads.update(threads)
+			__running_threads.update(threads)
 			# a Ctrl-C while they start: the commands not started yet never will ( skipped ), the others are stopped
 			# and waited for ( see _start_threads: a second Ctrl-C ends that wait )
 			_start_threads(threads, forget=forget, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(threads, 5), early=early)
@@ -2721,8 +2721,7 @@ def join_threads(threads=...,timeout=None):
 		None
 	'''
 	if threads is ...:
-		with __running_threads_lock:
-			threads = list(__running_threads)
+		threads = list(__running_threads.copy())
 	else:
 		threads = list(threads)
 	try:

@@ -4,6 +4,7 @@ never lost; the failure messages a step shows appear once, after it
 '''
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -12,7 +13,7 @@ import _thread
 import pytest
 
 import multiCMD
-from conftest import pid_gone, sigint_main_after
+from conftest import PACKAGE_ROOT, pid_gone, sigint_main_after
 from multiCMD import AsyncExecutor, run_commands
 from test_async_executor import _fail_nth_start, _global_threads, _join_threads_returns_within, _runs
 
@@ -1111,3 +1112,178 @@ def test_a_second_ctrl_c_pending_as_a_serial_run_settles_the_first_still_has_it_
 		for proc in procs:
 			proc.wait(5)
 			multiCMD._unregister(proc)
+
+
+class _WatchedLock:
+	'''A lock for multiCMD that records each acquire made by a settled step, or any at all with always ( see below )'''
+	def __init__(self, taken, real, always=False):
+		self._real = real
+		self._taken = taken
+		self._always = always
+
+	def acquire(self, *args, **kwargs):
+		if self._always or getattr(_in_settled_step, 'depth', 0):
+			# ( for the old registry locks, any acquire at all )
+			import traceback
+			self._taken.append(''.join(traceback.format_stack(limit=6)))
+		return self._real.acquire(*args, **kwargs)
+
+	def __enter__(self):
+		self.acquire()
+		return self
+
+	def __exit__(self, *exc_info):
+		self._real.release()
+
+	def release(self):
+		self._real.release()
+
+	def locked(self):
+		return self._real.locked()
+
+
+class _WatchedThreading:
+	'''multiCMD's threading module: its locks and semaphores are _WatchedLocks, the rest is threading's own'''
+	def __init__(self, taken):
+		self._taken = taken
+
+	def Lock(self):
+		return _WatchedLock(self._taken, threading.Lock())
+
+	def RLock(self):
+		return _WatchedLock(self._taken, threading.RLock())
+
+	def Semaphore(self, value=1):
+		return _WatchedLock(self._taken, threading.Semaphore(value))
+
+	def __getattr__(self, name):
+		return getattr(threading, name)
+
+
+_in_settled_step = threading.local()
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_no_settled_step_takes_a_lock(monkeypatch, capfd):
+	# ( review of round 10, finding 5; probe r10probes/settle_jam.py ) a settled step runs again after any interrupt
+	# that cuts it short, so one that takes a lock with `with` on the main thread, which a Ctrl-C right after the
+	# acquire leaves held ( 3.6 - 3.9, 3.14 ), blocks on it every time it runs again: a hang only SIGKILL ends. Every
+	# lock and semaphore multiCMD makes here is watched, and every path that settles is taken
+	taken, old = [], []
+	monkeypatch.setattr(multiCMD, 'threading', _WatchedThreading(taken))
+	monkeypatch.setattr(multiCMD, '_display', multiCMD._Display())
+	# the old registry locks: multiCMD never takes them at all
+	for name in ('__running_threads_lock', '_live_procs_lock'):
+		monkeypatch.setitem(multiCMD.__dict__, name, _WatchedLock(old, threading.Lock(), always=True))
+	real_settle = multiCMD._settle
+	steps = []
+	def settle(step, *args, **kwargs):
+		def watched():
+			steps.append(step)
+			_in_settled_step.depth = getattr(_in_settled_step, 'depth', 0) + 1
+			try:
+				step()
+			finally:
+				_in_settled_step.depth -= 1
+		return real_settle(watched, *args, **kwargs)
+	monkeypatch.setattr(multiCMD, '_settle', settle)
+	# a command that cannot be run, and one multiCMD fails to run
+	assert multiCMD.run_command(['mcmd-no-such-command-xyz'], quiet=False, return_code_only=True) == 127
+	with monkeypatch.context() as m:
+		m.setattr(multiCMD, '_spawn', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('cannot spawn')))
+		assert multiCMD.run_command(['true'], quiet=False, return_code_only=True) == -1
+	# pool workers that cannot start: one, and all of them
+	with monkeypatch.context() as m:
+		_failing_worker_starts(m, {1})
+		assert run_commands([['true']] * 3, max_threads=3, quiet=True, return_code_only=True) == [0] * 3
+	with monkeypatch.context() as m:
+		_failing_worker_starts(m, set(range(1, 10)))
+		assert run_commands([['true']] * 3, max_threads=3, quiet=True, return_code_only=True) == [-1] * 3
+	# a fire-and-forget thread that cannot start, and a Ctrl-C while they start
+	with monkeypatch.context() as m:
+		_fail_nth_start(m, getattr(multiCMD, '__run_tracked_command'), 2)
+		run_commands([['true']] * 3, quiet=True, wait_for_return=False)
+		multiCMD.join_threads()
+	with monkeypatch.context() as m:
+		_fail_nth_start(m, getattr(multiCMD, '__run_tracked_command'), 2, KeyboardInterrupt())
+		with pytest.raises(KeyboardInterrupt):
+			run_commands([['sleep', '5']] * 3, quiet=True, wait_for_return=False)
+	# a Ctrl-C before an executor's dispatcher runs, and its stop() while commands run and wait
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	with monkeypatch.context() as m:
+		_fail_nth_start(m, ex._dispatch, 1, KeyboardInterrupt())
+		with pytest.raises(KeyboardInterrupt):
+			ex.run_commands([['sleep', '5']] * 2)
+	ex.run_commands([['sleep', '5']] * 2)
+	ex.stop()
+	# a Ctrl-C while a serial run ( pipes and pty ), a pool, join_threads() and an executor's wait() wait
+	for kwargs in ({}, {'pty': True}, {'max_threads': 2}):
+		with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+			run_commands([['sleep', '5']] * 2, quiet=True, **kwargs)
+	run_commands([['sleep', '5']] * 2, quiet=True, wait_for_return=False)
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+		multiCMD.join_threads()
+	ex = AsyncExecutor(max_threads=2, quiet=True)
+	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
+		ex.run_commands([['sleep', '5']] * 3)
+		ex.wait()
+	monkeypatch.undo()
+	assert _join_threads_returns_within(5) and not multiCMD._live_procs
+	assert len(steps) >= 15
+	# before ( fdc45b9 ): an executor's _untrack took its _lock, and a fire-and-forget thread's forget took
+	# __running_threads_lock, which run_commands() and join_threads() took too
+	assert taken == [], taken[0]
+	assert old == [], old[0]
+
+
+_SETTLE_JAM = r'''
+import os, signal, sys, threading, time, _thread
+sys.path.insert(0, sys.argv[1])
+import multiCMD
+mode = sys.argv[2]
+if mode == 'fire-and-forget':
+	# its forget took __running_threads_lock
+	lock = multiCMD.__dict__['__running_threads_lock']
+	target = multiCMD.__dict__['__run_tracked_command']
+else:
+	ex = multiCMD.AsyncExecutor(max_threads=1, quiet=True)
+	# its _untrack took the executor's _lock
+	lock = ex._lock
+	target = ex._dispatch
+real_start = multiCMD._Thread.start
+def start(self):
+	if getattr(self, '_target', None) == target:
+		# the first Ctrl-C lands as the thread starts, and a second one right after the lock's acquire left it held
+		lock.acquire()
+		raise KeyboardInterrupt
+	real_start(self)
+multiCMD._Thread.start = start
+main = threading.main_thread().ident
+def sender():
+	for i in range(6):
+		time.sleep(0.3)
+		signal.pthread_kill(main, signal.SIGINT)
+	time.sleep(0.5)
+	print('still stuck after 6 Ctrl-Cs', flush=True)
+	os._exit(3)
+_thread.start_new_thread(sender, ())
+try:
+	if mode == 'fire-and-forget':
+		multiCMD.run_commands([['true']] * 2, quiet=True, wait_for_return=False)
+	else:
+		ex.run_commands([['true']] * 2)
+except BaseException as e:
+	print('returned with', type(e).__name__, flush=True)
+	os._exit(0)
+'''
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_kill'), reason='POSIX signals')
+@pytest.mark.parametrize('mode', ['fire-and-forget', 'executor'])
+def test_a_lock_a_ctrl_c_left_held_never_hangs_a_settled_step(mode):
+	# ( review of round 10, finding 5; probe r10probes/settle_jam.py ) with the lock a settled step took jammed, every
+	# later Ctrl-C ( a real SIGINT from another thread, 6 of them ) ran the step again into the held lock
+	proc = subprocess.run([sys.executable, '-c', _SETTLE_JAM, str(PACKAGE_ROOT), mode], stdout=subprocess.PIPE,
+		stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	# before ( fdc45b9 ): still stuck after 6 Ctrl-Cs
+	assert (proc.returncode, proc.stdout.strip()) == (0, 'returned with KeyboardInterrupt'), proc.stderr
