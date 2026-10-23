@@ -873,10 +873,12 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 			raise KeyboardInterrupt
 	previous = signal.signal(signal.SIGINT, handler)
 	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
+	# the KeyboardInterrupts CPython dropped as unraisable ( from Python 3.8 )
+	unraisable = []
 	if hasattr(sys, 'unraisablehook'):
 		# those dropped KeyboardInterrupts are expected here: not pytest's to report ( a second Ctrl-C landing in
 		# its report fails the test )
-		monkeypatch.setattr(sys, 'unraisablehook', lambda unraisable: None)
+		monkeypatch.setattr(sys, 'unraisablehook', lambda dropped: unraisable.append(dropped.exc_type))
 	if _WITH_MAY_JAM:
 		real_start = threading.Thread.start
 		def start(self):
@@ -922,7 +924,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 					signal.pthread_kill(main, signal.SIGINT)
 			finally:
 				sent.append(1)
-		del landed[:]
+		del landed[:], unraisable[:]
 		try:
 			try:
 				# ( a bare thread: Thread.start() and join() take threading's own locks with `with`, which a Ctrl-C
@@ -942,8 +944,10 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 			pass
 		else:
 			# CPython drops a KeyboardInterrupt its handler raises inside a __del__ or a weakref callback ( a Popen or
-			# a Thread collected on the main thread ): that Ctrl-C never reached multiCMD, and it is the only excuse
-			assert landed and all(dropped for dropped, _, _ in landed), landed
+			# a Thread collected on the main thread, a lambda weakref callback of threading's ): that Ctrl-C never
+			# reached multiCMD, and it is the only excuse ( told by the unraisable hook, or before 3.8 by the frames )
+			assert landed and (unraisable.count(KeyboardInterrupt) >= len(landed)
+				or all(dropped for dropped, _, _ in landed)), (landed, unraisable)
 		inside = any(inside for _, inside, _ in landed)
 		left = _left_running(before, wait=0 if inside else 6.0)
 		if inside and len(left) <= 1:
