@@ -458,8 +458,7 @@ def test_an_interrupt_between_the_spawn_and_the_registration_leaves_no_half_star
 	finally:
 		# the interrupt came before the command was reaped: reap this test's own and unregister it, nothing else
 		for proc in procs:
-			with multiCMD._live_procs_lock:
-				multiCMD._live_procs.pop(proc, None)
+			multiCMD._live_procs.pop(proc, None)
 			proc.kill()
 			proc.wait(timeout=10)
 			proc.stdout.close()

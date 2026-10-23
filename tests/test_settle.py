@@ -325,8 +325,7 @@ def test_a_ctrl_c_before_the_registration_still_registers_the_command_while_it_i
 	real_kill = multiCMD._kill_commands
 	def kill(commands, first_signal, *args):
 		commands = list(commands)
-		with multiCMD._live_procs_lock:
-			registered.extend(proc in multiCMD._live_procs for proc, _ in commands)
+		registered.extend(proc in multiCMD._live_procs for proc, _ in commands)
 		real_kill(commands, first_signal, *args)
 	monkeypatch.setattr(multiCMD, '_kill_commands', kill)
 	with pytest.raises(KeyboardInterrupt):
@@ -1227,6 +1226,13 @@ def test_no_settled_step_takes_a_lock(monkeypatch, capfd):
 	with pytest.raises(KeyboardInterrupt), sigint_main_after(0.3):
 		ex.run_commands([['sleep', '5']] * 3)
 		ex.wait()
+	# and kill_all() and the exit hook with a command running ( for the old registry locks )
+	run_commands([['sleep', '5']], quiet=True, wait_for_return=False)
+	deadline = time.monotonic() + 5
+	while not multiCMD._live_procs and time.monotonic() < deadline:
+		time.sleep(0.01)
+	multiCMD.kill_all()
+	multiCMD._kill_running_at_exit()
 	monkeypatch.undo()
 	assert _join_threads_returns_within(5) and not multiCMD._live_procs
 	assert len(steps) >= 15

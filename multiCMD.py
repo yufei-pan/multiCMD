@@ -110,7 +110,8 @@ _draining = {}
 # multiCMD takes no lock for these: each update is one dict operation and each snapshot one dict.copy(), atomic
 # with the GIL and under the dict's own lock without it. A `with lock:` on the main thread can be left holding the
 # lock by a Ctrl-C landing right after the acquire ( Python 3.6 - 3.9 and 3.14 ), which would hang kill_all() and
-# the exit hook. ( Kept for code that took it to read them. )
+# the exit hook.
+# unused: multiCMD 1.54 took it around _live_procs and _draining. Kept only for code that imported it; never take it
 _live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False

@@ -256,26 +256,6 @@ def test_a_signal_handler_that_stops_the_commands_inside_a_popen_wait_leaves_it_
 			proc.kill()
 
 
-def test_the_registry_takes_no_lock_a_ctrl_c_could_leave_held():
-	# ( found with the free-threaded stress loops ) a Ctrl-C right after a `with lock:` acquire on the main thread
-	# leaves the lock held on Python 3.6 - 3.9 and 3.14 ( r10/withlock.py: about a third of such Ctrl-Cs ); held,
-	# _live_procs_lock hung every registration, kill_all() and the exit hook
-	assert multiCMD._live_procs_lock.acquire(False)
-	try:
-		done = []
-		def run():
-			done.append(multiCMD.run_command(['true'], quiet=True, return_code_only=True))
-			multiCMD.kill_all()
-			done.append('killed')
-		worker = threading.Thread(target=run, daemon=True)
-		worker.start()
-		worker.join(10)
-		# before: blocked for good on the lock
-		assert done == [0, 'killed']
-	finally:
-		multiCMD._live_procs_lock.release()
-
-
 @pytest.mark.parametrize('quiet', [False, True])
 def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, capfd, quiet):
 	# ( review of round 10, finding 7 ) one in uninterruptible sleep, or not ours to signal ( EPERM, which _send
