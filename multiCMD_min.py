@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
+import argparse,atexit,collections,collections.abc,errno,functools,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
 version='1.54'
 __version__=version
@@ -25,7 +25,7 @@ _live_procs_lock=threading.Lock()
 _PTY_WARNED=False
 _exiting=False
 class Task:
-	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False;self._error=False;self._env=None;self._extra_env=None
+	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False;self._error=False;self._env=None;self._extra_env=None;self._at_exit=False
 	def __iter__(self):yield from(('command',self.command),('returncode',self.returncode),('stdout',self.stdout),('stderr',self.stderr))
 	def __repr__(self):return f"""Task(command={pformat(self.command)},
 returncode={self.returncode!r},
@@ -90,35 +90,58 @@ class _Thread(threading.Thread):
 			left=None if deadline is None else max(0,deadline-time.monotonic())
 			if _JOIN_MAY_HANG:left=1 if left is None else min(left,1)
 			super().join(left)
+def _any_alive(threads):
+	for thread in threads:
+		if thread.is_alive():return True
+	return False
 def _interrupt_in(error,before=None):
 	seen=set()
 	while error is not None and error is not before and id(error)not in seen:
-		if isinstance(error,_INTERRUPTS):return error
+		if _is_interrupt(error):return error
 		seen.add(id(error));error=error.__context__
 _INTERRUPTS=KeyboardInterrupt,SystemExit
 _STEP_FAILURES=3
+def _handler_codes():
+	codes=set();signums=signal.valid_signals()if hasattr(signal,'valid_signals')else range(1,getattr(signal,'NSIG',65))
+	for signum in signums:
+		try:handler=signal.getsignal(signum)
+		except(ValueError,OSError):continue
+		for _ in range(8):
+			if isinstance(handler,functools.partial):handler=handler.func
+			elif hasattr(handler,'__func__'):handler=handler.__func__
+			else:break
+		code=getattr(handler,'__code__',None)
+		if code is None:code=getattr(getattr(type(handler),'__call__',None),'__code__',None)
+		if code is not None:codes.add(code)
+	return codes
+def _is_interrupt(error):
+	if isinstance(error,_INTERRUPTS):return True
+	tb=getattr(error,'__traceback__',None)
+	if tb is None:return False
+	codes=_handler_codes()
+	while tb is not None:
+		if tb.tb_frame.f_code in codes:return True
+		tb=tb.tb_next
+	return False
 _settling=threading.local()
-def _settle(step,cuts=None):
+def _settle(step,cuts=None,quiet=False):
 	if cuts is None:cuts=[]
-	failures=0;own=False
+	failures=[];done=False;own=False
 	try:
 		if getattr(_settling,'messages',None)is None:own=True;_settling.messages={}
-		while failures<_STEP_FAILURES:
+		while not done and len(failures)<_STEP_FAILURES:
 			try:
-				while failures<_STEP_FAILURES:
-					try:step();break
-					except BaseException as e:
-						cuts.append(e)
-						if not isinstance(e,_INTERRUPTS):failures+=1
-				break
-			except BaseException as e:
-				cuts.append(e)
-				if not isinstance(e,_INTERRUPTS):failures+=1
+				while not done and len(failures)<_STEP_FAILURES:
+					try:step();done=True
+					except BaseException as e:(cuts if _is_interrupt(e)else failures).append(e)
+			except BaseException as e:(cuts if _is_interrupt(e)else failures).append(e)
+		if failures and(done or cuts)and not quiet:error=failures[0];_show_error(f"multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again"+(''if done else f" {len(failures)} times, without completing"))
 	finally:
 		if own:
 			messages,_settling.messages=getattr(_settling,'messages',None),None
 			for text in(messages or{}).values():_write_error(text)
 	if cuts:raise cuts[0]
+	if not done:raise failures[0]
 def _abandon_all(threads,forget=None):
 	for thread in threads:
 		if thread._abandon()and forget is not None:forget(thread)
@@ -147,7 +170,7 @@ def _start_threads(threads,register=None,forget=None,fail=None,abort=None,wait=N
 			if abort is not None:abort()
 		try:_settle(settle)
 		except BaseException:
-			if wait is not None and not isinstance(e,_INTERRUPTS):wait()
+			if wait is not None and not _is_interrupt(e):wait()
 			raise
 		if wait is not None:wait()
 		raise
@@ -247,14 +270,16 @@ class AsyncExecutor:
 	def wait(self,timeout=None,threads=...):
 		deadline=None if timeout is None or timeout<0 else time.monotonic()+timeout
 		try:self._wait_until(deadline,threads)
-		except _INTERRUPTS:_stop_tasks(self.tasks);self._wait_until(time.monotonic()+5);raise
+		except BaseException as e:
+			if not _is_interrupt(e):raise
+			_stop_tasks(self.tasks);self._wait_until(time.monotonic()+5);raise
 		return[thread for thread in self.runningThreads if thread.is_alive()]
 	def _wait_until(self,deadline,threads=...):
 		joined=set()
 		while True:
 			pending=self.runningThreads if threads is...else list(threads)
 			for thread in pending:_join(thread,None if deadline is None else max(0,deadline-time.monotonic()))
-			if threads is not...or not pending or any(thread.is_alive()for thread in pending)or all(thread in joined for thread in pending)or deadline is not None and time.monotonic()>=deadline:return
+			if threads is not...or not pending or _any_alive(pending)or joined.issuperset(pending)or deadline is not None and time.monotonic()>=deadline:return
 			joined.update(pending)
 	def stop(self,timeout=None):_stop_tasks(self.tasks);self.wait(timeout);return self.tasks
 	def cleanup(self,timeout=None):
@@ -376,28 +401,15 @@ def set_sudo(use_sudo):
 	else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);USE_SUDO=False
 class _ExecRefused(OSError):0
 def _uses_wrapper():return _IS_POSIX and not _HAS_PROCESS_GROUP and bool(sys.executable)and not getattr(sys,'frozen',False)
-def _search_dirs(env,explicit):
-	if explicit:return _exec_path(env)
-	path=(env if env is not None else os.environ).get('PATH');return(os.defpath if path is None else path).split(os.pathsep)
-def _exec_path(env):
-	if env is None:env=os.environ
-	try:path=env.get('PATH')
-	except(TypeError,BytesWarning):path=None
-	if os.supports_bytes_environ:
-		try:pathb=env[b'PATH']
-		except(KeyError,TypeError,BytesWarning):pass
-		else:
-			if path is not None:raise ValueError("env cannot contain 'PATH' and b'PATH' keys")
-			path=pathb
-		if isinstance(path,bytes):path=os.fsdecode(path)
-	return(os.defpath if path is None else path).split(os.pathsep)
-def _files_named(command,dirs):
-	for d in dirs:
-		path=os.path.join(d or os.curdir,command)
-		if os.path.isfile(path):yield path
+def _search_dirs(env):path=(os.environ if env is None else env).get('PATH');return(os.defpath if path is None else path).split(os.pathsep)
+def _file_named(command,dirs,start=0):
+	for index in range(start,len(dirs)):
+		path=os.path.join(dirs[index]or os.curdir,command)
+		if os.path.isfile(path):return index,path
+	return None,None
 def _spawn(argv,stdout,stderr,env=None,explicit=False,started=None):
 	command=argv[0];wrapped=_uses_wrapper();bare=_IS_POSIX and os.sep not in command
-	if wrapped and bare and next(_files_named(command,_search_dirs(env,explicit)),None)is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
+	if wrapped and bare and _file_named(command,_search_dirs(env))[1]is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
 	if wrapped or not bare:
 		try:return _spawn_process(argv,stdout,stderr,env,explicit,started=started)
 		except OSError as e:
@@ -407,8 +419,11 @@ def _spawn(argv,stdout,stderr,env=None,explicit=False,started=None):
 				raise
 			if e.filename is None or isinstance(e,(FileNotFoundError,PermissionError)):raise
 			raise _ExecRefused(e.errno,e.strerror,e.filename)from None
-	failure=None
-	for path in _files_named(command,_search_dirs(env,True)):
+	failure=None;dirs=_search_dirs(env);index=0
+	while True:
+		index,path=_file_named(command,dirs,index)
+		if path is None:break
+		index+=1
 		try:return _spawn_process(argv,stdout,stderr,env,explicit,executable=path,started=started)
 		except OSError as e:
 			if e.filename is None:raise
@@ -419,16 +434,16 @@ def _spawn(argv,stdout,stderr,env=None,explicit=False,started=None):
 	raise _ExecRefused(failure.errno,failure.strerror,command)
 class _Popen(subprocess.Popen):
 	def __init__(self,args,started=None,grouped=False,**kwargs):
-		try:super().__init__(args,**kwargs)
-		finally:
-			if started is not None:
-				try:pid,returncode=self.pid,self.returncode
-				except AttributeError:pid=None
-				if pid is not None and returncode is None:started.append((self,pid if grouped else None))
+		if started is not None:started.append((self,grouped))
+		super().__init__(args,**kwargs)
+def _started_command(started):
+	for(proc,grouped)in reversed(started):
+		pid=getattr(proc,'pid',None)
+		if pid is not None and getattr(proc,'returncode',None)is None:return proc,pid if grouped else None
 def _popen(argv,started=None,grouped=False,**kwargs):
 	if subprocess.Popen is _Popen.__base__:return _Popen(argv,started=started,grouped=grouped,**kwargs)
 	proc=subprocess.Popen(argv,**kwargs)
-	if started is not None:started.append((proc,proc.pid if grouped else None))
+	if started is not None:started.append((proc,grouped))
 	return proc
 def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None,started=None):
 	kwargs={'stdin':subprocess.DEVNULL,'stdout':stdout,'stderr':stderr,'env':env}
@@ -457,19 +472,35 @@ def _in_subprocess():
 		if frame.f_globals.get('__name__')=='subprocess':return True
 		frame=frame.f_back
 	return False
+def _inside(proc,call,*args):
+	marks=proc.__dict__.setdefault('_multicmd_inside',{});token=object()
+	try:marks[token]=threading.get_ident();return call(*args)
+	finally:marks.pop(token,None)
+def _inside_elsewhere(proc):
+	me=threading.get_ident()
+	for ident in proc.__dict__.get('_multicmd_inside',{}).copy().values():
+		if ident!=me:return True
+	return False
+def _peek(proc):
+	if not _CAN_PEEK:return
+	try:return None if os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)is None else'exited'
+	except OSError:return'gone'
 def _poll(proc):
-	returncode=proc.poll()
+	returncode=_inside(proc,proc.poll)
 	if returncode is not None or not _CAN_PEEK:return returncode
 	lock=getattr(proc,'_waitpid_lock',None)
 	if lock is None or not lock.locked():return
-	try:
-		if os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)is None:return
-	except OSError:return proc.returncode
+	state=_peek(proc)
+	if state is None:return
 	now=time.monotonic()
-	if now-proc.__dict__.setdefault('_multicmd_unreaped_since',now)<_JAMMED_AFTER or _in_subprocess():return
-	try:pid,status=os.waitpid(proc.pid,os.WNOHANG)
-	except OSError:return proc.returncode
-	if pid==proc.pid and proc.returncode is None:proc.returncode=_exit_code(status)
+	if now-proc.__dict__.setdefault('_multicmd_unreaped_since',now)<_JAMMED_AFTER or _in_subprocess()or _inside_elsewhere(proc):return proc.returncode
+	if state=='exited':
+		try:pid,status=os.waitpid(proc.pid,os.WNOHANG)
+		except ChildProcessError:state='gone'
+		except OSError:return proc.returncode
+		else:
+			if pid==proc.pid and proc.returncode is None:proc.returncode=_exit_code(status)
+	if state=='gone'and proc.returncode is None:proc.returncode=0
 	return proc.returncode
 def _stdout_isatty():
 	try:return sys.stdout.isatty()
@@ -504,7 +535,7 @@ def _send(proc,pgid,sig):
 		if pgid is not None:
 			try:os.killpg(pgid,sig);return
 			except ProcessLookupError:pass
-		if _poll(proc)is None:proc.send_signal(sig)
+		if _poll(proc)is None:_inside(proc,proc.send_signal,sig)
 	except OSError:pass
 def _group_alive(proc,pgid):
 	if pgid is None:return _poll(proc)is None
@@ -514,21 +545,20 @@ def _group_alive(proc,pgid):
 	return True
 def _wait_all(commands,timeout):
 	deadline=time.monotonic()+timeout;delay=.0005
-	while not all(_poll(proc)is not None for(proc,_)in commands):
+	while True:
+		for(proc,_)in commands:
+			if _poll(proc)is None:break
+		else:return True
 		remaining=deadline-time.monotonic()
 		if remaining<=0:return False
 		delay=min(delay*2,remaining,.05);time.sleep(delay)
-	return True
-def _exited(proc):
-	if _poll(proc)is not None:return True
-	if not _CAN_PEEK:return False
-	try:return os.waitid(os.P_PID,proc.pid,os.WEXITED|os.WNOHANG|os.WNOWAIT)is not None
-	except OSError:return True
 def _give_up_on(commands,quiet=False):
 	for(proc,_)in commands:
-		if _exited(proc):continue
-		_live_procs.pop(proc,None);_draining.pop(proc,None)
-		if not quiet and proc.__dict__.setdefault('_multicmd_given_up',proc)is proc:_write_error(f"multiCMD: pid {proc.pid} is still running after {'SIGKILL'if _IS_POSIX else'kill()'}: no longer tracked")
+		if _poll(proc)is not None or _peek(proc)is not None:continue
+		_live_procs.pop(proc,None)
+		if quiet or proc.__dict__.get('_multicmd_quiet'):continue
+		mine=object()
+		if proc.__dict__.setdefault('_multicmd_given_up',mine)is mine:_write_error(f"multiCMD: pid {proc.pid} is still running after {'SIGKILL'if _IS_POSIX else'kill()'}: no longer tracked")
 def _kill_commands(commands,first_signal,quiet=False):
 	commands=list(commands)
 	if not commands:return
@@ -543,6 +573,7 @@ def _kill_commands(commands,first_signal,quiet=False):
 					try:proc.kill()
 					except OSError:pass
 			if not _wait_all(commands,1):_give_up_on(commands,quiet)
+		for(proc,_)in commands:_unregister(proc)
 		return
 	for(proc,pgid)in commands:_send(proc,pgid,first_signal)
 	time.sleep(.01)
@@ -550,9 +581,15 @@ def _kill_commands(commands,first_signal,quiet=False):
 	_wait_all(commands,1);leftovers=[(proc,pgid)for(proc,pgid)in commands if _group_alive(proc,pgid)]
 	for(proc,pgid)in leftovers:_send(proc,pgid,signal.SIGKILL)
 	if not _wait_all(leftovers,1):_give_up_on(leftovers,quiet)
+	for(proc,_)in commands:_unregister(proc)
 def kill_all(sig=None):commands=list(_live_procs.copy().items())+list(_draining.copy().items());_kill_commands(commands,signal.SIGTERM if sig is None else sig)
+def _cut_by_exit(task):return _exiting and not task._at_exit and threading.current_thread()is not threading.main_thread()
+_starting={}
+_EXIT_START_WAIT=1.
 def _kill_running_at_exit():
-	global _exiting;_exiting=True;killed=set()
+	global _exiting;_exiting=True;deadline=time.monotonic()+_EXIT_START_WAIT
+	while _starting and time.monotonic()<deadline:time.sleep(.005)
+	killed=set()
 	while True:
 		commands=[(proc,pgid)for(proc,pgid)in _live_procs.copy().items()if proc not in killed]
 		if not commands:return
@@ -564,15 +601,22 @@ def _resolve_pty(pty):
 	if _IS_POSIX:return True
 	if not _PTY_WARNED:_PTY_WARNED=True;print('multiCMD: pty mode needs a POSIX system, using pipes',file=sys.stderr)
 	return False
-def _open_pty(reserved=0):
+def _open_pty(reserved=0,fds=None):
 	global _PTY_WARNED
-	try:import pty as _pty_module;master,slave=_pty_module.openpty()
+	if fds is None:fds={}
+	try:import pty as _pty_module;fds['master'],fds['slave']=_pty_module.openpty();master,slave=fds['master'],fds['slave']
 	except(ImportError,OSError)as e:
 		if not _PTY_WARNED:_PTY_WARNED=True;print(f"multiCMD: cannot open a pty ({e}), using pipes",file=sys.stderr)
 		return None,None
 	try:import fcntl,struct,termios;attrs=termios.tcgetattr(slave);attrs[1]&=~termios.OPOST;termios.tcsetattr(slave,termios.TCSANOW,attrs);columns,rows=get_terminal_size()[:2];fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',rows,max(columns-reserved,20),0,0))
 	except Exception:pass
 	return master,slave
+def _close_fds(fds):
+	for name in list(fds):
+		fd=fds.pop(name,None)
+		if fd is not None:
+			try:os.close(fd)
+			except OSError:pass
 def _watch(task,proc,timeout):
 	sleep_time=1e-07
 	while _poll(proc)is None:
@@ -587,10 +631,10 @@ def _join(thread,timeout=None):
 		if not thread.is_alive():return True
 		if step<=0:return False
 def _drain(task,readers,timeout):
-	while any(reader.is_alive()for reader in readers):
+	while _any_alive(readers):
 		if task.stop:return'stop'
 		for reader in readers:_join(reader,.05)
-		if timeout>0 and time.monotonic()-task._last_output>timeout and any(reader.is_alive()for reader in readers):return'timeout'
+		if timeout>0 and time.monotonic()-task._last_output>timeout and _any_alive(readers):return'timeout'
 def _join_all(threads,limit):
 	deadline=None if limit is None else time.monotonic()+limit
 	for thread in threads:_join(thread,None if deadline is None else max(0,deadline-time.monotonic()))
@@ -658,55 +702,57 @@ def _stop_command(proc,pgid,quiet=False):
 	try:_kill_commands([(proc,pgid)],signal.SIGINT,quiet)
 	except BaseException:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT);raise
 def _execute(task,timeout,quiet,decor,use_pty=False):
-	explicit=task._env is not None or task._extra_env is not None;master=slave=pty_out=None
-	if use_pty:master,slave=_open_pty(len(decor[0]))
-	if master is not None:
-		try:pty_out=io.open(master,'rb')
-		except BaseException:os.close(slave);raise
-	proc=pgid=None;started=[];streams=[];readers=[];interrupted=False
+	explicit=task._env is not None or task._extra_env is not None;fds={};wrapped=[];proc=pgid=None;started=[];streams=[];readers=[];interrupted=None;waiting=False
 	try:
-		if pty_out is not None:
-			try:proc,pgid=_spawn(task.command,slave,slave,_child_env(task,pager=True),explicit,started)
-			finally:os.close(slave)
-			task._pty=True;streams.append((pty_out,task.stdout))
+		if use_pty:_open_pty(len(decor[0]),fds)
+		if fds:
+			wrapped.extend(map(io.open,(fds['master'],),('rb',)));fds.pop('master',None)
+			try:proc,pgid=_spawn(task.command,fds['slave'],fds['slave'],_child_env(task,pager=True),explicit,started)
+			finally:_close_fds(fds)
+			task._pty=True;streams.append((wrapped[0],task.stdout))
 		else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit,started);streams.extend(((proc.stdout,task.stdout),(proc.stderr,task.stderr)))
-		_register(proc,pgid)
-		if _exiting:task.stop=True
-		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);reason=_watch(task,proc,timeout)
+		proc._multicmd_quiet=quiet;_register(proc,pgid);_starting.pop(task,None)
+		if _cut_by_exit(task):task.stop=True
+		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers.extend(_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams);_start_threads(readers);waiting=True;reason=_watch(task,proc,timeout)
 	except BaseException as e:
-		first=e;cuts=[]
+		first=e;interrupt=waiting or _is_interrupt(first);cuts=[]
 		def settle():
-			nonlocal proc,pgid
-			if started:proc,pgid=started[-1]
-			if proc is not None:_live_procs[proc]=pgid
-			pending=streams
+			nonlocal proc,pgid;found=_started_command(started)
+			if found is not None:proc,pgid=found
+			if proc is not None:proc._multicmd_quiet=quiet;_live_procs[proc]=pgid
+			_starting.pop(task,None)
+			if wrapped:fds.pop('master',None)
+			_close_fds(fds);pending=streams
 			if not pending:
-				if pty_out is not None:pending=[(pty_out,None)]
+				if wrapped:pending=[(wrapped[0],None)]
 				elif proc is not None:pending=[(proc.stdout,None),(proc.stderr,None)]
 			for(i,(stream,_))in enumerate(pending):
 				if stream is not None and(i>=len(readers)or readers[i]._abandon()):stream.close()
-			if cuts and isinstance(first,_INTERRUPTS)and proc is not None:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT)
+			if cuts and interrupt and proc is not None:_send(proc,pgid,signal.SIGTERM);_send(proc,pgid,signal.SIGCONT)
 		while True:
-			try:_settle(settle,cuts);break
+			try:_settle(settle,cuts,quiet);break
 			except BaseException as c:
 				if cuts and c is cuts[0]:break
+				if not _is_interrupt(c):
+					if not quiet:_show_error(f"multiCMD: cannot clean up after {type(first).__name__}: {type(c).__name__}: {c}")
+					break
 				cuts.append(c)
 		cut=cuts[0]if cuts else None
 		if proc is None:
 			if cut is not None:raise cut
 			raise
 		if cut is not None:
-			if isinstance(first,_INTERRUPTS):raise cut
-			first=cut
-		if not isinstance(first,KeyboardInterrupt):_stop_command(proc,pgid,quiet);_unregister(proc);_join_all(readers,1);raise first
-		reason,interrupted='stop',True
+			if interrupt:raise cut
+			first,interrupt=cut,True
+		if not interrupt:_stop_command(proc,pgid,quiet);_unregister(proc);_join_all(readers,1);raise first
+		reason,interrupted='stop',first
 	if reason=='timeout':task.stderr.append('Timeout!')
 	if reason is not None:_stop_command(proc,pgid,quiet)
 	_unregister(proc);task.returncode=_poll(proc)
 	if reason is None:
 		_draining[proc]=pgid
 		try:reason=_drain(task,readers,timeout)
-		except KeyboardInterrupt:reason,interrupted='stop',True
+		except BaseException as e:reason,interrupted='stop',e
 		finally:_draining.pop(proc,None)
 		if reason=='timeout':task.stderr.append('Timeout!')
 		if reason is not None:_stop_command(proc,pgid,quiet)
@@ -716,20 +762,26 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):task.returncode=137
 		else:task.returncode=-1;task._error=True
 	task.end_time=time.time();task._finalized=True
-	if interrupted:raise KeyboardInterrupt
+	if interrupted is not None:raise interrupted
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,decor=('','',''),use_pty=False):
 	with sem:
-		if task.stop or _exiting:task.stop=True;task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
 		try:
-			if dry_run:
-				if not quiet:_display.message(_dry_run_line(task))
-				return task.stdout+task.stderr if with_stdErr else task.stdout
-			if not quiet:_display.message('Running command: '+_quote_command(task.command),decor);_display.message('-'*100,decor)
-			_execute(task,timeout,quiet,decor,use_pty)
-		except FileNotFoundError as e:_settle(lambda:_cannot_run(task,127,'Command path not found',e,quiet))
-		except(PermissionError,_ExecRefused)as e:_settle(lambda:_cannot_run(task,126,'Command cannot be executed',e,quiet))
-		except Exception as e:_settle(lambda:_fail_task(task,str(e),e,quiet))
-		finally:task._finalized=True;task._env=task._extra_env=None
+			_starting[task]=None
+			if task.stop:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
+			try:
+				if _cut_by_exit(task):raise RuntimeError('not started: the interpreter is exiting')
+				if dry_run:
+					if not quiet:_display.message(_dry_run_line(task))
+					return task.stdout+task.stderr if with_stdErr else task.stdout
+				if not quiet:_display.message('Running command: '+_quote_command(task.command),decor);_display.message('-'*100,decor)
+				_execute(task,timeout,quiet,decor,use_pty)
+			except Exception as e:
+				if task._finalized:raise
+				if isinstance(e,FileNotFoundError):_settle(lambda:_cannot_run(task,127,'Command path not found',e,quiet),quiet=quiet)
+				elif isinstance(e,(PermissionError,_ExecRefused)):_settle(lambda:_cannot_run(task,126,'Command cannot be executed',e,quiet),quiet=quiet)
+				else:_settle(lambda:_fail_task(task,str(e),e,quiet),quiet=quiet)
+			finally:task._finalized=True;task._env=task._extra_env=None
+		finally:_starting.pop(task,None)
 		if not quiet:_display.message('-'*100,decor);_display.message(f"Process exited with return code {task.returncode}",decor)
 		if with_stdErr:return task.stdout+task.stderr
 		else:return task.stdout
@@ -789,8 +841,8 @@ def _build_tasks(commands,parse=False,use_sudo=...,shell=False,env=None,extra_en
 	variables={};formatedCommands=[]
 	for command in commands:formatedCommands.extend(__format_command(command,expand=parse,shell=shell,variables=variables))
 	if use_sudo:formatedCommands=[[SUDO_PATH]+command for command in formatedCommands]
-	env=_check_env(env,'env',drop_empty=True);extra_env=_check_env(extra_env,'extra_env',allow_none=True);tasks=[Task(command)for command in formatedCommands]
-	for task in tasks:task._env=env;task._extra_env=extra_env
+	env=_check_env(env,'env',drop_empty=True);extra_env=_check_env(extra_env,'extra_env',allow_none=True);tasks=[Task(command)for command in formatedCommands];at_exit=_exiting and threading.current_thread()is threading.main_thread()
+	for task in tasks:task._env=env;task._extra_env=extra_env;task._at_exit=at_exit
 	return tasks,bool(use_sudo)
 def _validate_sudo():
 	try:subprocess.run([SUDO_PATH,'-v'])
@@ -848,7 +900,7 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 	early=[]
 	try:
 		workers.extend(_Thread(worker)for _ in range(wanted));running=_start_threads(workers,fail=fail,abort=lambda:_stop_tasks(tasks),wait=lambda:_join_all(workers,5),early=early);error=next(iter(failed.values()),None)
-		if not running:_settle(lambda:[_fail_task(task,f"cannot start a thread to run it: {error}",error,quiet)for task in tasks]);return
+		if not running:_settle(lambda:[_fail_task(task,f"cannot start a thread to run it: {error}",error,quiet)for task in tasks],quiet=quiet);return
 		if len(running)<wanted and not quiet:_show_error(f"multiCMD: started {len(running)} of {wanted} threads: {error}")
 		for thread in running:_join(thread)
 	except BaseException:_stop_and_wait(tasks,workers,0 if early else 5);raise
@@ -876,7 +928,7 @@ def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with
 	else:
 		try:
 			for(task,decor)in zip(tasks,decors):__run_command(task,sem,timeout,quiet,False,decor=decor,use_pty=use_pty)
-		except _INTERRUPTS:_stop_tasks(tasks);raise
+		except BaseException:_stop_tasks(tasks);raise
 	if raise_error:
 		failed=[task for task in tasks if task.returncode not in(0,None)]
 		if failed:raise CommandError(failed,total=len(tasks))
@@ -889,7 +941,8 @@ def join_threads(threads=...,timeout=None):
 	else:threads=list(threads)
 	try:
 		for thread in threads:_join(thread,timeout)
-	except _INTERRUPTS:
+	except BaseException as e:
+		if not _is_interrupt(e):raise
 		ours=[]
 		def stop():ours[:]=[thread for thread in threads if isinstance(thread,_Thread)and thread.task is not None];_stop_tasks([thread.task for thread in ours])
 		_settle(stop);_join_all(ours,5);raise
