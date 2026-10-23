@@ -2,12 +2,14 @@
 A Ctrl-C while multiCMD settles its bookkeeping: the step runs again to its end and the Ctrl-C is raised after it,
 never lost; the failure messages a step shows appear once, after it
 '''
+import gc
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+import weakref
 import _thread
 
 import pytest
@@ -837,6 +839,22 @@ def _hook_the_fork(monkeypatch, in_fork, forked):
 		monkeypatch.setattr(os, 'posix_spawn', hooked(os.posix_spawn))
 
 
+def _collection_watch():
+	'''
+	A function that says whether a garbage collection runs on this thread now ( from its gc.callbacks start to its stop ),
+	and one that stops watching. A collection runs finalizers and weakref callbacks from C, wherever it was triggered,
+	and CPython drops what is raised there: reported to the unraisable hook, or to stderr before 3.8, or not at all
+	( an io object's close() as it is collected, up to 3.12 ). Free-threaded 3.13t also runs a signal handler from within
+	a collection, outside any finalizer, with the frame that triggered it as the current one, and drops the
+	KeyboardInterrupt it raises silently
+	'''
+	collecting = {}
+	def phase(name, info):
+		collecting[threading.get_ident()] = name == 'start'
+	gc.callbacks.append(phase)
+	return (lambda: collecting.get(threading.get_ident(), False)), (lambda: gc.callbacks.remove(phase))
+
+
 # on Python 3.6 - 3.9 and 3.14 a Ctrl-C right after a C lock's acquire in a `with lock:` leaves the lock held, and
 # Thread.start() takes threading's own _active_limbo_lock so: every thread then hangs as it ends ( CPython's own, see
 # the README ). The stress test below keeps its Ctrl-Cs out of the output readers' Thread.start() there: one that would
@@ -859,19 +877,25 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	forked = []
 	_hook_the_fork(monkeypatch, in_fork, forked)
 	# per Ctrl-C: whether it landed in a finalizer ( a __del__ or a weakref callback, or pytest's report of one
-	# dropped ), whether inside the fork, and where
+	# dropped, or anything else that runs during a collection, see _collection_watch ), whether inside the fork, and where
 	landed = []
+	# whether a garbage collection runs on this thread now ( see _collection_watch )
+	collecting, unwatch = _collection_watch()
+	request.addfinalizer(unwatch)
 	# whether a Ctrl-C raises: only while a run goes on ( one that lands after it is only recorded )
 	armed = [False]
 	def handler(signum, frame):
 		# a finalizer or weakref callback ( a lambda one of the standard library's, as threading has ) that the garbage
-		# collector ran wherever it ran, which CPython drops what it raises from
+		# collector ran wherever it ran, or anything else that runs during a collection, which CPython drops what it
+		# raises from ( see _collection_watch ): on 3.6, with no unraisable hook to count it, two Ctrl-Cs landed in
+		# functions a collection ran inside os.path.isfile(), _remove and reset, and the second was taken for one
+		# multiCMD lost; on 3.13t so was one whose handler a collection itself ran, in Popen.__init__ or _execute_child
 		innermost = frame is not None and frame.f_code.co_name == '<lambda>' and frame.f_code.co_filename != multiCMD.__file__
 		names = []
 		while frame is not None:
 			names.append(frame.f_code.co_name if 'unraisable' not in frame.f_code.co_filename else 'unraisable')
 			frame = frame.f_back
-		landed.append((innermost or bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
+		landed.append((innermost or collecting() or bool({'__del__', '_remove', 'unraisable'} & set(names)), in_fork[0], names[:12]))
 		if armed[0]:
 			raise KeyboardInterrupt
 	previous = signal.signal(signal.SIGINT, handler)
@@ -949,7 +973,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 			# CPython drops a KeyboardInterrupt its handler raises inside a __del__ or a weakref callback ( a Popen or
 			# a Thread collected on the main thread, a lambda weakref callback of threading's ): that Ctrl-C never
 			# reached multiCMD, and it is the only excuse ( told by the unraisable hook, or by the frames: not every
-			# such drop reaches the hook on free-threaded 3.13t )
+			# such drop reaches the hook on free-threaded 3.13t, see _collection_watch )
 			assert landed and (unraisable.count(KeyboardInterrupt) >= len(landed)
 				or all(dropped for dropped, _, _ in landed)), (landed, unraisable)
 		inside = any(inside for _, inside, _ in landed)
@@ -987,6 +1011,43 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 	# before ( this test with 0e4d015's _Popen gone ): a command cut short inside Popen after the fork, or before the
 	# spawn returned, left running unknown to kill_all()
 	assert described == [], (len(forks), len(recovered))
+
+
+def test_the_stress_tests_excuse_is_only_what_runs_during_a_collection():
+	# ( matrix of round 12, finding 4 ) on 3.6 two Ctrl-Cs landed in functions run from C inside os.path.isfile(), a
+	# WeakSet's _remove and one named reset, and on 3.13t one's handler ran in Popen.__init__ and _execute_child with no
+	# finalizer frame above it, and CPython dropped them all; the stress test knew only __del__, _remove and lambdas,
+	# and took them for interrupts multiCMD lost. They ran during a garbage collection, which _collection_watch() tells
+	# from gc.callbacks: a weakref callback a collection runs is excused, and the same callback run otherwise is not,
+	# nor is a function called by the run itself
+	collecting, unwatch = _collection_watch()
+	seen = []
+	try:
+		class Box:
+			pass
+		def reset(ref):
+			seen.append(('reset', collecting()))
+		def on_the_path():
+			seen.append(('on_the_path', collecting()))
+		# a cycle only a collection frees, its weakref callback run by it
+		gc.disable()
+		try:
+			box = Box()
+			box.cycle = box
+			ref = weakref.ref(box, reset)
+			del box
+			gc.collect()
+			# the same callback as the last reference goes, outside any collection
+			other = Box()
+			other_ref = weakref.ref(other, reset)
+			del other
+		finally:
+			gc.enable()
+		on_the_path()
+	finally:
+		unwatch()
+	assert seen == [('reset', True), ('reset', False), ('on_the_path', False)]
+	assert ref() is None and other_ref() is None
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='reads /proc/<pid>/status')
@@ -1739,3 +1800,4 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 		state['k'] += 1
 	assert running == []
 	assert state['k'] > 40 and not multiCMD._live_procs
+
