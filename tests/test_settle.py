@@ -878,11 +878,12 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_the_fork(launche
 		real_start = threading.Thread.start
 		def start(self):
 			if getattr(self, '_target', None) is multiCMD._read_stream:
-				old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+				# ( unblocked whatever happens: a Ctrl-C that landed before the block is raised right after it )
 				try:
+					signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
 					real_start(self)
 				finally:
-					signal.pthread_sigmask(signal.SIG_SETMASK, old)
+					signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
 			else:
 				real_start(self)
 		monkeypatch.setattr(threading.Thread, 'start', start)
