@@ -1864,11 +1864,16 @@ def test_a_second_ctrl_c_anywhere_before_the_command_is_registered_never_loses_i
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
-def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(launcher, monkeypatch, collecting):
+@pytest.mark.parametrize('points', _POINTS)
+def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(launcher, monkeypatch, collecting, points):
 	# ( matrix of round 12, with finding 3 ) a second Ctrl-C ends the wait for the command, which is sent SIGTERM at
 	# least: _stop_command() did that in a try of its own, and one that landed as the call to it began, before that try,
 	# left the command registered but running, unsignalled. A first Ctrl-C once Popen has the pid, and a second one at
-	# each point of multiCMD's code in turn, to the end of the run: the command is dead soon after either way
+	# each point of multiCMD's code in turn, to the end of the run: the command is dead soon after either way. ( review
+	# of round 13, B2 ) at the loop back-jumps too: one landing on _settle's inner loop's way back, right after
+	# `done = True` ( a check point on 3.14, and on 3.6 - 3.9 ), was taken by its outer loop and raised as cuts[0], but
+	# settle had completed without knowing of it and never sent the SIGTERM; and one landing on the way back of
+	# _execute's outer loop, as its inner one had ended, left _execute before the command was stopped
 	state = {'k': 0}
 	def counted(frame, event):
 		mine = multiCMD.__file__
@@ -1877,7 +1882,7 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 	def execute_child(self, *args, **kwargs):
 		real_execute_child(self, *args, **kwargs)
 		state['proc'] = self
-		_hook(_interrupt_at(state, counted, collecting=collecting))
+		_hook(_interrupt_at(state, counted, points, collecting))
 		raise KeyboardInterrupt('first')
 	monkeypatch.setattr(subprocess.Popen, '_execute_child', execute_child)
 	running = []
@@ -1889,7 +1894,9 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 			_unhook()
 		proc = state['proc']
 		if not multiCMD._wait_all([(proc, None)], 2):
-			# before ( f891332 ): left running by a second Ctrl-C as _stop_command() began, registered; or lost
+			# before ( f891332 ): left running by a second Ctrl-C as _stop_command() began, registered; or lost. Before
+			# ( cf4a7c1 ): by one on _settle's inner loop's way back after `done = True`, or on _execute's outer loop's
+			# way back, registered
 			running.append((state['where'], proc in multiCMD._live_procs))
 			proc.kill()
 		multiCMD._wait_all([(proc, None)], 5)
@@ -1898,7 +1905,7 @@ def test_a_second_ctrl_c_anywhere_after_the_first_still_has_the_command_stopped(
 			break
 		state['k'] += 1
 	assert running == []
-	assert state['k'] > 40 and not multiCMD._live_procs
+	assert state['k'] > (40 if points == 'calls' else 5) and not multiCMD._live_procs
 
 
 # ( a Ctrl-C inside Thread.start()'s wait can leave that thread's Event inconsistent, CPython's own: the thread, which

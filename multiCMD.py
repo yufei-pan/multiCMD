@@ -481,8 +481,11 @@ def _settle(step, cuts=None, quiet=False):
 	@params:
 		step: The step ( called with no arguments )
 		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
-			was ( None: one of its own ). The first one in it is raised once step has completed, one it held already
-			included. A failure of step's own is never put in it.
+			was ( None: one of its own ). One that lands once step has completed is put in it too, and step runs
+			again: when this raises the first one in it, step has completed knowing of each ( one it held already
+			included ). An interrupt this raises instead, one that lands as it returns, or a second one in its own
+			handling, may never have been seen by step: a caller that must have step see it calls this again with
+			it in cuts ( see _execute ). A failure of step's own is never put in it.
 		quiet: Whether to say nothing of a failure of step's own that is not raised
 	'''
 	if cuts is None:
@@ -496,17 +499,28 @@ def _settle(step, cuts=None, quiet=False):
 	try:
 		if own:
 			_settling.messages = messages
-		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one )
-		while not done and len(failures) < _STEP_FAILURES:
+		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one, which is left from
+		# inside its try, as a loop's way back is where Python raises one ). An interrupt runs step again, one that lands
+		# once it has completed included ( on that way back, right after `done = True` ), so step knows of it
+		while True:
 			try:
 				while not done and len(failures) < _STEP_FAILURES:
 					try:
 						step()
 						done = True
 					except BaseException as e:
-						(cuts if _is_interrupt(e) else failures).append(e)
+						if _is_interrupt(e):
+							cuts.append(e)
+							done = False
+						else:
+							failures.append(e)
+				break
 			except BaseException as e:
-				(cuts if _is_interrupt(e) else failures).append(e)
+				if _is_interrupt(e):
+					cuts.append(e)
+					done = False
+				else:
+					failures.append(e)
 		if failures and (done or cuts) and not quiet:
 			error = failures[0]
 			_show_error(f'multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again'
@@ -2383,8 +2397,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
 				_cut_stop(proc, pgid)
 		# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
-		# is taken by the outer one )
-		while not settled:
+		# is taken by the outer one, which is left from inside its try )
+		while True:
 			try:
 				while not settled:
 					try:
@@ -2411,6 +2425,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 							settled = True
 					except BaseException as c:
 						raised.append(c)
+				# ( not the loop's way back: an interrupt landing there would leave _execute, the command not stopped )
+				break
 			except BaseException as c:
 				raised.append(c)
 		cut = cuts[0] if cuts else None
