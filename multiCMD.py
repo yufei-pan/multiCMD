@@ -1798,7 +1798,7 @@ def _resolve_pty(pty):
 		print('multiCMD: pty mode needs a POSIX system, using pipes', file=sys.stderr)
 	return False
 
-def _open_pty(reserved=0):
+def _open_pty(reserved=0, fds=None):
 	'''
 	Open a pseudo-terminal for a command's output ( internal )
 	Output post-processing is off, so bytes arrive exactly as written ( no '\n' to '\r\n' ), and
@@ -1806,13 +1806,18 @@ def _open_pty(reserved=0):
 	The pty is only the command's output, never its controlling terminal.
 	@params:
 		reserved: Columns to take off the terminal width
+		fds: A dict the descriptors are stored in, as 'master' and 'slave', the moment openpty() returns them, so the
+			caller can close them whatever interrupts the setup ( see _close_fds )
 	@returns:
 		( int, int ) | ( None, None ): The master and slave file descriptors, or None when no pty can be opened
 	'''
 	global _PTY_WARNED
+	if fds is None:
+		fds = {}
 	try:
 		import pty as _pty_module
-		master, slave = _pty_module.openpty()
+		fds['master'], fds['slave'] = _pty_module.openpty()
+		master, slave = fds['master'], fds['slave']
 	except (ImportError, OSError) as e:
 		if not _PTY_WARNED:
 			_PTY_WARNED = True
@@ -1830,6 +1835,20 @@ def _open_pty(reserved=0):
 	except Exception:
 		pass
 	return master, slave
+
+def _close_fds(fds):
+	'''
+	Close the file descriptors in a dict, taking each out first ( internal ); idempotent, for a settled step
+	Taken out before it is closed, so an interrupt in between leaks it rather than have it closed twice ( by then
+	the number may be another file's ).
+	'''
+	for name in list(fds):
+		fd = fds.pop(name, None)
+		if fd is not None:
+			try:
+				os.close(fd)
+			except OSError:
+				pass
 
 def _watch(task, proc, timeout):
 	'''
@@ -2091,33 +2110,36 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
 	# whether the caller gave this command an environment ( rather than only the pty's pager defaults )
 	explicit = task._env is not None or task._extra_env is not None
-	master = slave = pty_out = None
-	if use_pty:
-		master, slave = _open_pty(len(decor[0]))
-	if master is not None:
-		# the pty's side, wrapped in its file object before anything starts, and only ever closed through it
-		try:
-			pty_out = io.open(master, 'rb')
-		except BaseException:
-			# ( master is the file object's as soon as there is one, which closes it as it goes: never closed here )
-			os.close(slave)
-			raise
+	# the pty's descriptors that no file object owns yet, from the moment they exist ( see _open_pty ): closed by
+	# _close_fds whatever cuts the start short ( each taken out of here before it is closed ), the master taken out
+	# once its file object has it
+	fds = {}
+	# the pty's file object, once there is one ( see below )
+	wrapped = []
 	proc = pgid = None
 	# the command as soon as it may run, before _spawn returns ( see _Popen )
 	started = []
 	streams = []
 	readers = []
 	interrupted = False
-	# from the spawn on, an interrupt or any failure still stops the command, which runs in a process group of its own
+	# from the pty on, an interrupt or any failure closes it; from the spawn on, it still stops the command, which runs
+	# in a process group of its own
 	try:
-		if pty_out is not None:
+		if use_pty:
+			_open_pty(len(decor[0]), fds)
+		if fds:
+			# the pty's side, wrapped in its file object before anything starts, and only ever closed through it. The
+			# file object is made and kept in one step ( list.extend() runs map's io.open() in C, where no interrupt
+			# lands ): whatever cuts this short, it is either in wrapped, owning the master, or was never made
+			wrapped.extend(map(io.open, (fds['master'],), ('rb',)))
+			fds.pop('master', None)
 			try:
-				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit, started)
+				proc, pgid = _spawn(task.command, fds['slave'], fds['slave'], _child_env(task, pager=True), explicit, started)
 			finally:
 				# only the command keeps the terminal side open, so the master sees EIO once it is gone
-				os.close(slave)
+				_close_fds(fds)
 			task._pty = True
-			streams.append((pty_out, task.stdout))
+			streams.append((wrapped[0], task.stdout))
 		else:
 			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
 			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
@@ -2149,11 +2171,15 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# registered here, so kill_all() and the exit hook reach it whatever cuts the kill short
 				proc._multicmd_quiet = quiet
 				_live_procs[proc] = pgid
-			# a stream no reader reads is closed here ( a reader closes its own; closing again does nothing )
+			# the pty's descriptors no file object owns yet, and a stream no reader reads, are closed here ( a reader
+			# closes its own; closing a file object again does nothing )
+			if wrapped:
+				fds.pop('master', None)
+			_close_fds(fds)
 			pending = streams
 			if not pending:
-				if pty_out is not None:
-					pending = [(pty_out, None)]
+				if wrapped:
+					pending = [(wrapped[0], None)]
 				elif proc is not None:
 					pending = [(proc.stdout, None), (proc.stderr, None)]
 			for i, (stream, _) in enumerate(pending):
