@@ -402,7 +402,9 @@ it too), `mcmd` stops them on
 SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
 commands still running when the interpreter exits are killed. A program that handles
 SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
-arrives), can call `multiCMD.kill_all()` from its handler.
+arrives), can call `multiCMD.kill_all()` from its handler. A command still running a second
+after SIGKILL (in uninterruptible sleep, or not yours to signal) is no longer tracked, so later
+calls and the exit do not wait for it again; multiCMD names its pid on stderr, unless quiet.
 
 A Ctrl-C (or a signal handler's exception, such as a SIGTERM handler's `sys.exit()`) that lands
 while a command starts stops it like any other, from the moment `Popen` knows the child's pid.

@@ -1552,7 +1552,8 @@ def _register(proc, pgid):
 
 def _unregister(proc):
 	'''
-	Stop tracking a command once it is reaped ( internal ); one still running ( a kill did not reach it ) stays tracked
+	Stop tracking a command once it is reaped ( internal ); one still running ( a kill cut short did not reach it ) stays
+	tracked, until a full kill sequence has been tried on it ( see _give_up_on )
 	'''
 	if _poll(proc) is None:
 		return
@@ -1609,7 +1610,35 @@ def _wait_all(commands, timeout):
 		time.sleep(delay)
 	return True
 
-def _kill_commands(commands, first_signal):
+def _exited(proc):
+	'''Whether a command has exited, reaped or not ( internal ): _poll(), or os.waitid() without reaping'''
+	if _poll(proc) is not None:
+		return True
+	if not _CAN_PEEK:
+		return False
+	try:
+		return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+	except OSError:
+		# reaped meanwhile
+		return True
+
+def _give_up_on(commands, quiet=False):
+	'''
+	Stop tracking the commands still running after a full kill sequence ( internal; see _kill_commands )
+	One no signal stops ( in uninterruptible sleep, or not ours to signal: EPERM ) would otherwise stay registered for
+	good, and cost every later kill_all() and the exit their full 2 s. It is dropped, with a message naming its pid
+	unless quiet, once.
+	'''
+	for proc, _ in commands:
+		if _exited(proc):
+			continue
+		_live_procs.pop(proc, None)
+		_draining.pop(proc, None)
+		if not quiet and proc.__dict__.setdefault('_multicmd_given_up', proc) is proc:
+			_write_error(f'multiCMD: pid {proc.pid} is still running after {"SIGKILL" if _IS_POSIX else "kill()"}: '
+				'no longer tracked')
+
+def _kill_commands(commands, first_signal, quiet=False):
 	'''
 	Stop commands and everything they started ( internal )
 
@@ -1618,10 +1647,12 @@ def _kill_commands(commands, first_signal):
 	members and up to 1s more. Every signal goes to the whole process group, and each step goes to
 	every command before waiting, so the total stays near 2s however many commands there are.
 	Windows: terminate(), up to 1s, kill(), up to 1s.
+	A command still running after all that is no longer tracked ( see _give_up_on ).
 
 	@params:
 		commands: ( Popen, process group id | None ) pairs
 		first_signal: The first signal to send ( POSIX only )
+		quiet: Whether to say nothing of a command that is still running after all that
 	'''
 	commands = list(commands)
 	if not commands:
@@ -1640,7 +1671,8 @@ def _kill_commands(commands, first_signal):
 						proc.kill()
 					except OSError:
 						pass
-			_wait_all(commands, 1)
+			if not _wait_all(commands, 1):
+				_give_up_on(commands, quiet)
 		return
 	for proc, pgid in commands:
 		_send(proc, pgid, first_signal)
@@ -1652,7 +1684,8 @@ def _kill_commands(commands, first_signal):
 	leftovers = [(proc, pgid) for proc, pgid in commands if _group_alive(proc, pgid)]
 	for proc, pgid in leftovers:
 		_send(proc, pgid, signal.SIGKILL)
-	_wait_all(leftovers, 1)
+	if not _wait_all(leftovers, 1):
+		_give_up_on(leftovers, quiet)
 
 def kill_all(sig=None):
 	'''
@@ -1952,14 +1985,14 @@ def _child_env(task, pager=False):
 		_apply_extra_env(env, extra)
 	return env
 
-def _stop_command(proc, pgid):
+def _stop_command(proc, pgid, quiet=False):
 	'''
-	Kill a command with everything it started ( _kill_commands ) ( internal )
+	Kill a command with everything it started ( _kill_commands; quiet as there ) ( internal )
 	An interrupt that ends the wait for it ( a second Ctrl-C, or whatever a signal handler raises ) leaves it sent
 	SIGTERM at least, and still registered: kill_all() and the exit hook do the rest.
 	'''
 	try:
-		_kill_commands([(proc, pgid)], signal.SIGINT)
+		_kill_commands([(proc, pgid)], signal.SIGINT, quiet)
 	except BaseException:
 		_send(proc, pgid, signal.SIGTERM)
 		_send(proc, pgid, signal.SIGCONT)
@@ -2080,7 +2113,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
 			first = cut
 		if not isinstance(first, KeyboardInterrupt):
-			_stop_command(proc, pgid)
+			_stop_command(proc, pgid, quiet)
 			_unregister(proc)
 			_join_all(readers, 1)
 			raise first
@@ -2088,7 +2121,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	if reason == 'timeout':
 		task.stderr.append('Timeout!')
 	if reason is not None:
-		_stop_command(proc, pgid)
+		_stop_command(proc, pgid, quiet)
 	_unregister(proc)
 	task.returncode = _poll(proc)
 	if reason is None:
@@ -2104,7 +2137,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		if reason == 'timeout':
 			task.stderr.append('Timeout!')
 		if reason is not None:
-			_stop_command(proc, pgid)
+			_stop_command(proc, pgid, quiet)
 	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124

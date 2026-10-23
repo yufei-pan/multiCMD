@@ -323,11 +323,11 @@ def test_a_ctrl_c_before_the_registration_still_registers_the_command_while_it_i
 	monkeypatch.setattr(multiCMD, '_register', register)
 	registered = []
 	real_kill = multiCMD._kill_commands
-	def kill(commands, first_signal):
+	def kill(commands, first_signal, *args):
 		commands = list(commands)
 		with multiCMD._live_procs_lock:
 			registered.extend(proc in multiCMD._live_procs for proc, _ in commands)
-		real_kill(commands, first_signal)
+		real_kill(commands, first_signal, *args)
 	monkeypatch.setattr(multiCMD, '_kill_commands', kill)
 	with pytest.raises(KeyboardInterrupt):
 		multiCMD.run_command(['sleep', '30'], quiet=True)

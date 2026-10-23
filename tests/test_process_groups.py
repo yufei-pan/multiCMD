@@ -274,3 +274,32 @@ def test_the_registry_takes_no_lock_a_ctrl_c_could_leave_held():
 		assert done == [0, 'killed']
 	finally:
 		multiCMD._live_procs_lock.release()
+
+
+@pytest.mark.parametrize('quiet', [False, True])
+def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, capfd, quiet):
+	# ( review of round 10, finding 7 ) one in uninterruptible sleep, or not ours to signal ( EPERM, which _send
+	# swallows ): here no signal is ever sent. It stayed registered for good, and every later kill_all() and the exit
+	# waited their full 2 s for it
+	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
+	multiCMD._register(proc, pgid)
+	try:
+		with monkeypatch.context() as m:
+			m.setattr(multiCMD, '_send', lambda *args: None)
+			if quiet:
+				multiCMD._stop_command(proc, pgid, quiet=True)
+			else:
+				multiCMD.kill_all()
+			assert proc.poll() is None
+			# before ( fdc45b9 ): still registered
+			assert proc not in multiCMD._live_procs
+			started = time.monotonic()
+			multiCMD.kill_all()
+			multiCMD._kill_running_at_exit()
+			assert time.monotonic() - started < 0.5
+		err = capfd.readouterr().err
+		assert err.count(f'pid {proc.pid} is still running') == (0 if quiet else 1), err
+	finally:
+		multiCMD._live_procs.pop(proc, None)
+		proc.kill()
+		proc.wait(5)

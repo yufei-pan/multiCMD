@@ -432,9 +432,9 @@ def _slow_kill(monkeypatch):
 	'''Make every kill of a stopped command wait until the returned event is set ( at most 10 s )'''
 	release = threading.Event()
 	real = multiCMD._kill_commands
-	def slow_kill(commands, first_signal):
+	def slow_kill(commands, first_signal, *args):
 		release.wait(10)
-		real(commands, first_signal)
+		real(commands, first_signal, *args)
 	monkeypatch.setattr(multiCMD, '_kill_commands', slow_kill)
 	return release
 
