@@ -1494,8 +1494,10 @@ def _inside(proc, call, *args):
 	call(*args): a call of proc's that may take its Popen lock ( poll(), send_signal() ), with this thread marked as
 	inside it meanwhile, so that _poll() on another thread knows the lock is held for real ( internal; see _poll )
 	The mark is one dict entry per call, set inside the try that removes it: an interrupt before it leaves none. Only
-	a second interrupt landing just as the call returns, before the finally removes it, can leave one behind: that
-	Popen is then never reaped behind a jammed lock by other threads, only by this one.
+	an interrupt that Python raises inside the finally, before its removal runs, can leave one behind: that Popen is
+	then never reaped behind a jammed lock by other threads, only by this one ( which ignores its own marks: while
+	it runs here, it is inside no such call of its own, unless a handler of its runs inside one, which
+	_in_subprocess() sees ).
 	'''
 	marks = proc.__dict__.setdefault('_multicmd_inside', {})
 	token = object()
