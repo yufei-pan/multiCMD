@@ -411,10 +411,11 @@ calls and the exit do not wait for it again; multiCMD names its pid on stderr, u
 A Ctrl-C (or a signal handler's exception, such as a SIGTERM handler's `sys.exit()`) that lands
 while a command starts stops it like any other, from the moment `Popen` knows the child's pid.
 One that lands while the command is being forked can leave it running unregistered, as in 1.54:
-Python raises it as the fork returns, before `Popen` has stored the pid, so neither the call nor
-`kill_all()` nor the exit hook knows the command, which runs on in its own process group. Python
-raises those on the main thread only, so this concerns serial runs (`max_threads=1`); and the
-window is the fork's own length, some 60-150 µs per command however long it then runs.
+if Python raises it as the fork returns, before `Popen` has stored the pid, neither the call nor
+`kill_all()` nor the exit hook knows the command, which runs on in its own process group. That is
+the only place a command can be lost. Python raises those on the main thread only, so this concerns
+serial runs (`max_threads=1`); and the window is the fork's own length, some 60-150 µs per command
+however long it then runs.
 On Python 3.6-3.9 and 3.14 a Ctrl-C that lands just as Python's `threading` takes one of its own
 locks with `with` (as `Thread.start()` does, for a serial run's output readers too) can leave that
 lock held, and the program then hangs as its threads end. That is CPython's own, and any threaded

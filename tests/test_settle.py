@@ -1391,3 +1391,34 @@ def test_a_settled_step_that_fails_on_its_own_is_not_run_for_ever():
 	with pytest.raises(KeyboardInterrupt):
 		multiCMD._settle(step2)
 	assert len(runs) == 3
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX fork')
+def test_a_popen_is_handed_over_before_it_forks(launcher, monkeypatch):
+	# ( review of round 11, finding 7 ) _Popen appended itself to started once Popen had returned or raised, after a
+	# check of its pid: on Python 3.6 - 3.9 a Ctrl-C can be raised between nearly any two instructions, so one landing
+	# between that check and the append dropped a command that runs. It is in started before the fork now, and the pid
+	# Popen stores on it is all the caller needs
+	started = []
+	at_fork = []
+	import _posixsubprocess
+	import subprocess
+	def hooked(real):
+		def fork(*args, **kwargs):
+			at_fork.append(list(started))
+			return real(*args, **kwargs)
+		return fork
+	if hasattr(subprocess, '_fork_exec'):
+		monkeypatch.setattr(subprocess, '_fork_exec', hooked(subprocess._fork_exec))
+	else:
+		monkeypatch.setattr(_posixsubprocess, 'fork_exec', hooked(_posixsubprocess.fork_exec))
+	if hasattr(os, 'posix_spawn'):
+		monkeypatch.setattr(os, 'posix_spawn', hooked(os.posix_spawn))
+	proc, pgid = multiCMD._spawn_process(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL, started=started)
+	try:
+		# before ( fc0c782 ): nothing in started yet as it forked
+		assert len(at_fork) == 1 and [entry[0] for entry in at_fork[0]] == [proc]
+		assert multiCMD._started_command(started) == (proc, pgid) and pgid == proc.pid
+	finally:
+		proc.kill()
+		proc.wait(5)

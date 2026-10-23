@@ -1305,30 +1305,34 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 
 class _Popen(subprocess.Popen):
 	'''
-	subprocess.Popen that hands itself over as soon as it has a child that may run ( internal )
+	subprocess.Popen that is handed over before it can have a child, so that no interrupt loses one ( internal )
 
 	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands after the fork, while Popen waits for
 	the exec or anywhere before the Popen object is back with its caller, would lose the only handle on a command
-	that runs on in a process group of its own, which the terminal's Ctrl-C does not reach. Once Popen has stored the
-	child's pid, the Popen, with its process group id, is appended to started however Popen ends, unless the child is
-	known to be gone ( an exec that failed, already reaped ): the caller then still registers and stops it ( see
-	_execute ). The pid is what counts, not _child_created: Windows stores it last, once the Popen has its process
-	handle. Nothing in between is a call, so no interrupt lands between the check and the append. One that lands inside
-	the fork itself, as _fork_exec / posix_spawn returns and before Popen has stored the pid, still loses the command:
-	nothing but that C call ever knew the pid.
+	that runs on in a process group of its own, which the terminal's Ctrl-C does not reach. So the Popen, with
+	whether its pid is its process group id, is appended to started before anything starts, and Popen then stores
+	the child's pid on it in one step ( self.pid = <the fork's result> ): from that moment on the caller finds the
+	command through started however Popen ends, and stops it ( see _started_command and _execute ). The pid is what
+	counts, not _child_created: Windows stores it last, once the Popen has its process handle. An interrupt that
+	lands between the fork's return and that store ( _fork_exec, _posixsubprocess.fork_exec or os.posix_spawn has
+	returned the pid, and Python raises the interrupt before the next instruction stores it ) loses the command:
+	nothing but that C call ever knew the pid. That is the only place.
 	'''
 	def __init__(self, args, started=None, grouped=False, **kwargs):
-		try:
-			super().__init__(args, **kwargs)
-		finally:
-			if started is not None:
-				try:
-					pid, returncode = self.pid, self.returncode
-				except AttributeError:
-					# ( it failed before it set them: nothing started )
-					pid = None
-				if pid is not None and returncode is None:
-					started.append((self, pid if grouped else None))
+		if started is not None:
+			started.append((self, grouped))
+		super().__init__(args, **kwargs)
+
+def _started_command(started):
+	'''
+	The command in started that may be running, as ( Popen, process group id | None ), or None ( internal; see _Popen )
+	The last one whose Popen has stored a pid and has no returncode: one whose exec failed, or that is reaped, has one.
+	'''
+	for proc, grouped in reversed(started):
+		pid = getattr(proc, 'pid', None)
+		if pid is not None and getattr(proc, 'returncode', None) is None:
+			return proc, (pid if grouped else None)
+	return None
 
 def _popen(argv, started=None, grouped=False, **kwargs):
 	'''
@@ -1339,7 +1343,7 @@ def _popen(argv, started=None, grouped=False, **kwargs):
 		return _Popen(argv, started=started, grouped=grouped, **kwargs)
 	proc = subprocess.Popen(argv, **kwargs)
 	if started is not None:
-		started.append((proc, proc.pid if grouped else None))
+		started.append((proc, grouped))
 	return proc
 
 def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None, started=None):
@@ -1370,7 +1374,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 			command up in env's PATH and hands env over whole ); otherwise env, if any, only adds to what
 			is inherited and the wrapper just runs with it, as it always has
 		executable: The file to run as the command, instead of looking argv[0] up ( Popen's executable; not with the wrapper )
-		started: A list the ( Popen, process group id ) is appended to as soon as the command may run ( see _Popen )
+		started: A list the ( Popen, whether its pid is its process group id ) is appended to before the command can start ( see _Popen )
 
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
@@ -2072,11 +2076,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is
 	re-raised once the command is dead; a second one ends that wait, the command sent SIGTERM and still registered.
 	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands while the command starts stops it like
-	any other, from the moment Popen has stored the child's pid ( see _Popen ). One that lands inside the fork itself
-	( as _fork_exec / posix_spawn returns, before Popen has the pid ) loses the command, which then runs on in a
-	process group of its own, unknown to kill_all() and the exit hook, as in multiCMD 1.54. Python raises it on the
-	main thread only, and the window is the fork's own length: some 60 - 150 us, until the child has exec'd ( a
-	quarter of a run of `true` on Python 3.13, 0.3 % of a 50 ms command ).
+	any other, from the moment Popen has stored the child's pid ( see _Popen ). One that Python raises as the fork's
+	C call ( _fork_exec / posix_spawn ) returns, before Popen has stored the pid it returned, loses the command, which
+	then runs on in a process group of its own, unknown to kill_all() and the exit hook, as in multiCMD 1.54; nowhere
+	else is a command lost. Python raises it on the main thread only, and the window is the fork's own length: some
+	60 - 150 us, until the child has exec'd ( a quarter of a run of `true` on Python 3.13, 0.3 % of a 50 ms command ).
 
 	@params:
 		task: The Task
@@ -2136,10 +2140,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		cuts = []
 		def settle():
 			nonlocal proc, pgid
-			if started:
-				# what cut it short may have come before _spawn returned ( see _Popen ): the last one is the command ( or
-				# an exec that failed, whose reaping was cut short: stopping it changes nothing )
-				proc, pgid = started[-1]
+			found = _started_command(started)
+			if found is not None:
+				# what cut it short may have come before _spawn returned ( see _Popen ): the last one with a pid is the
+				# command ( or an exec that failed, whose reaping was cut short: stopping it changes nothing )
+				proc, pgid = found
 			if proc is not None:
 				# registered here, so kill_all() and the exit hook reach it whatever cuts the kill short
 				proc._multicmd_quiet = quiet
@@ -2661,10 +2666,11 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	'''
 	Run a command
 
-	A Ctrl-C ( or a signal handler's exception ) that lands on the main thread while the command is being forked can
-	leave it running unregistered, unknown to kill_all() and the exit hook, as in 1.54: the window is the fork's own
-	length, some 60 - 150 us per command, and only a serial run ( max_threads=1 ) forks on the main thread. Anywhere
-	else the command is stopped before the interrupt is re-raised ( see _execute ).
+	A Ctrl-C ( or a signal handler's exception ) that Python raises as the fork returns, before Popen has stored the
+	child's pid, leaves the command running unregistered, unknown to kill_all() and the exit hook, as in 1.54: the
+	window is the fork's own length, some 60 - 150 us per command, and only a serial run ( max_threads=1 ) forks on
+	the main thread, where Python raises them. Anywhere else the command is stopped before the interrupt is re-raised
+	( see _execute ).
 
 	@params:
 		command: The command to run
