@@ -385,67 +385,35 @@ default, in the API and on the command line) disables it.
 
 ## Process groups and signals
 
-Every command runs in a process group of its own, so a timeout, `stop()` or Ctrl-C
-reaches the whole process tree, not just the first process. On Python 3.11+ this uses
-`Popen(process_group=0)`; older Pythons start the command through a tiny exec wrapper.
-Commands that try to read the terminal (a password prompt, for example) fail at once
-instead of hanging. The library does this by blocking SIGTTIN/SIGTTOU for the command,
-which covers commands started directly or through bash; `mcmd` also ignores them, which
-every command inherits through any shell.
+Every command runs in a process group of its own, so a timeout, `stop()` or Ctrl-C reaches the
+whole process tree, not just the first process. On Python 3.11+ this uses `Popen(process_group=0)`;
+older Pythons start the command through a tiny exec wrapper. A command that reads the terminal (a
+password prompt, for example) fails at once instead of hanging: multiCMD blocks SIGTTIN/SIGTTOU for
+it, and `mcmd` also ignores them, which every command inherits through any shell.
 
-Because the commands are not in your program's process group, signals sent to that
-group do not reach them. multiCMD handles this for you: a call waiting on the main
-thread that gets Ctrl-C, or the SystemExit of a SIGTERM handler's `sys.exit()`
-(`join_threads()` and `AsyncExecutor.wait()` included), stops its commands, the queued ones
-skipped, before re-raising, giving them up to 5 s to exit (a second Ctrl-C stops waiting
-for them at once, a serial run's command still sent SIGTERM; one that lands while multiCMD stops them or forgets the threads that never ran ends
-it too), `mcmd` stops them on
-SIGTERM / SIGHUP (unless it was started with them ignored, as under `nohup`), and any
-commands still running when the interpreter exits are killed. From then on a command queued
-before the exit on one of multiCMD's threads does not start: it fails (return code -1, "not started:
-the interpreter is exiting"), as the thread would be frozen with the interpreter and the command
-outlive it; a command run from an `atexit` handler, a `weakref.finalize` callback or a `__del__`
-after that (on the main thread) runs as usual. A program that handles
-SIGTERM itself, or that runs multiCMD from its own threads (where Ctrl-C never
-arrives), can call `multiCMD.kill_all()` from its handler. A command still running a second
-after SIGKILL (in uninterruptible sleep, or not yours to signal) is no longer tracked, so later
-calls and the exit do not wait for it again; multiCMD names its pid on stderr, unless quiet.
-
-A Ctrl-C (or a signal handler's exception, such as a SIGTERM handler's `sys.exit()`) that lands
-while a command starts stops it like any other, from the moment `Popen` knows the child's pid.
-One that lands while the command is being forked can leave it running unregistered, as in 1.54:
-if Python raises it as the fork returns, before `Popen` has stored the pid, neither the call nor
-`kill_all()` nor the exit hook knows the command, which runs on in its own process group. Python
-raises those on the main thread only, so this concerns serial runs (`max_threads=1`); and the window
-is the fork's own length, some 60-150 µs per command however long it then runs. That is the only place
-one Ctrl-C can lose a command. Before Python 3.11 a second one can too: on Python 3.6-3.10 a second
-Ctrl-C that lands while the first is still on its way out of the command's start, before multiCMD has
-begun to deal with it, is raised before multiCMD has registered the command (one that lands so while a
-call waits for a running command leaves it registered but not signalled: `kill_all()` and the exit hook
-still reach it), and on 3.6-3.9, where Python raises a Ctrl-C at nearly any instruction, a second one at a
-few other moments of that handling can do the same, and even a first one, at a few instructions between the
-steps of a run, can leave a command registered but not signalled. From Python 3.11 no other window is known where
-a Ctrl-C loses a command. On every Python, two Ctrl-Cs at nearly the same moment, the first cutting short the stop
-of a command that timed out or of what a finished command left running with its output open, can leave that
-not signalled: `kill_all()` still reaches it, and so does the exit hook, except on Python 3.6-3.10 for what a
-finished command left running, which can then outlive the program.
-On Python 3.6-3.9 and 3.14 a Ctrl-C that lands just as Python's `threading` takes one of its own
-locks with `with` (as `Thread.start()` does, for a serial run's output readers too) can leave that
-lock held, and the program then hangs as its threads end. That is CPython's own, and any threaded
-program can meet it; Python 3.10-3.13 do not leave the lock held.
+Signals sent to your program's group do not reach the commands, so multiCMD stops them itself. One
+Ctrl-C (or a SIGTERM handler's `sys.exit()`) in a call waiting on the main thread, `join_threads()`
+and `AsyncExecutor.wait()` included, stops and reports every command, skips the queued ones and
+re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
+commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`). At interpreter exit
+the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
+"not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
+handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
+multiCMD from its own threads (where Ctrl-C never arrives), can call `multiCMD.kill_all()` from its
+handler. A command still running a second after SIGKILL is no longer tracked; its pid is named on
+stderr, unless quiet.
 
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
-else). A Ctrl-C that lands while multiCMD does its bookkeeping on the rare paths (a thread that
-cannot start, stopping commands after a Ctrl-C or a failure, cancelling a batch, recording a command
-that cannot be run) makes that bookkeeping run again from the start, and the KeyboardInterrupt (or
-whatever your own handler raised) is raised once it is complete, so it neither cuts that short nor gets
-lost. Your handler, if you installed one, is called with every Ctrl-C as it lands, and C-level hooks on
-SIGINT (`faulthandler.register`, `signal.siginterrupt`) stay as they are. Whatever your handler raises
-while a call waits for its commands is handled as a Ctrl-C: the commands are stopped (a serial run's
-current one recorded as stopped, the ones after it skipped) and the exception is raised on. multiCMD
-tells it from a failure of its own by your handler's frame in its traceback, and takes anything raised
-while it only waits for a running command as yours; a handler that uninstalls itself before it
-raises is not seen elsewhere, and what it raises then while a command starts counts as a failure.
+else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
+
+A command is registered from the moment `Popen` returns it: a Ctrl-C that Python raises inside
+`Popen` as a serial run starts a command (some 50-70 µs each) can leave it running, unknown to
+`kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
+`kill_all()` or the exit stops it. On Python 3.6-3.9, which raise a Ctrl-C at nearly any instruction,
+even one at a few points between the steps of a run can leave its command registered but not signalled.
+On Python 3.6-3.9 and 3.14 a Ctrl-C just as `threading` takes one of its own locks can leave that lock
+held and hang the program as its threads end (CPython's own).
+These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
 
@@ -495,6 +463,23 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.56 from 1.55
+
+- Fix: a command that times out while it redraws a `\r` progress line on stderr keeps its `Timeout!`
+  line; 1.55 could replace it with the progress line, leaving return code 124 without the marker.
+- Simpler interrupt handling, some 700 lines lighter. One Ctrl-C still stops and reports every command.
+  What changes is a few rare corners, each in [docs/limitations.md](docs/limitations.md):
+  - two Ctrl-Cs microseconds apart can leave a command running, still registered, until `kill_all()`
+    or the exit stops it; 1.55 stopped it at once;
+  - a Ctrl-C can lose a serial run's starting command anywhere inside `Popen` (about 51 µs per start on
+    Python 3.14), not only inside the fork (about 41 µs);
+  - a Ctrl-C that leaves `Popen.poll()`'s lock held makes that command's stop about 2 s slower;
+  - an ordinary exception your own signal handler raises as a serial run starts a command is recorded as
+    a start failure (-1) and not raised, as in 1.54;
+  - `join_threads()` on another thread can return before a batch that is still starting.
+- `__running_threads_lock` and `_live_procs_lock`, unused since 1.55 and kept only for code that imported
+  them, are gone.
+
 ## Upgrading to 1.55 from 1.54
 
 - New: a per-call environment. `env=` (the whole environment, as `subprocess`'s) and `extra_env=`
@@ -520,18 +505,8 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   with -1 ("not started: the interpreter is exiting") instead of starting and outliving the program.
 - A command still running a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the
   exit do not wait for it again; its pid is named on stderr, unless quiet.
-- Known limits (see [Process groups and signals](#process-groups-and-signals)): a Ctrl-C raised just as
-  a command's fork returns, before `Popen` has stored the pid, still loses the command, as in 1.54
-  (serial runs only, some 60-150 µs per command). On Python 3.6-3.10 a second Ctrl-C right after a
-  first one can lose a command that is starting, or leave one that a call waits for registered but not
-  signalled; on 3.6-3.9 a second one at a few other moments can lose it too, and a first one at a few
-  instructions can leave it registered but not signalled. On every Python, two Ctrl-Cs at nearly the same
-  moment, the first cutting short the stop of a timed-out command or of a finished command's background
-  processes, can leave them not signalled: `kill_all()` still reaches them, and so does the exit hook, except
-  on Python 3.6-3.10 for a finished command's background processes, which can then outlive the program. On
-  Python 3.6-3.9 and 3.14 a Ctrl-C just as
-  `threading` takes one of its own locks can leave that lock held and hang the program as its threads end
-  (CPython's own).
+- Known limits: see [Process groups and signals](#process-groups-and-signals) and
+  [docs/limitations.md](docs/limitations.md).
 
 ## License
 

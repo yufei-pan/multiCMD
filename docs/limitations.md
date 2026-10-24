@@ -6,7 +6,10 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: two interrupts (Ctrl-Cs, or a Ctrl-C and a signal handler's exception) a few
   microseconds apart. The second ends multiCMD's wait at once, and a command not yet signalled keeps running,
-  still registered, until `kill_all()` or the program's exit stops it. 1.55 stopped it at once.
+  still registered, until `kill_all()` or the program's exit stops it. 1.55 stopped it at once. On Python
+  3.6 - 3.10, which raise an interrupt at more points, the second can also land before a starting command is
+  registered, which then runs on unknown to `kill_all()`, or leave what a finished command left running with
+  its output open to `kill_all()` alone ( the exit hook does not reach it ), as in 1.55.
 - Why: covering it took `_settle`, the settle loops in `_execute`'s handler and about 1,500 test lines, for a
   gap no person can double-tap into.
 - Revisit when: someone hits it, for example a program that sends signals in bursts.
@@ -26,9 +29,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A jammed Popen lock slows the stop and the exit by about 2 s
 - Kind: known limitation
 - What the operator sees: a Ctrl-C landing in the few bytecodes of CPython's `Popen.poll()` between its
-  lock's `acquire(False)` and its `try`, during a serial run, leaves that lock held. The stop and then the exit
-  each take about 2 s longer; the task is recorded as -1 and nothing is orphaned. 1.55 measured it at 1-3% of
-  Ctrl-Cs on free-threaded builds; it is rarer with the GIL.
+  lock's `acquire(False)` and its `try`, during a serial run, leaves that lock held. The stop takes about 2 s
+  longer and, unless the run was quiet, says the command's pid "is still running after SIGKILL: no longer
+  tracked", though it has exited ( its zombie stays until the program exits ). The task is recorded as -1 and
+  nothing keeps running; the exit is not slowed. 1.55 measured it at 1-3% of Ctrl-Cs on free-threaded builds; it
+  is rarer with the GIL.
 - Why: recovering took about 114 lines (`_peek`, `_inside*`, `_exit_code`) reaching into CPython's internals,
   to save 2 s.
 - Revisit when: someone hits it on a free-threaded build, or CPython fixes the poll lock.
