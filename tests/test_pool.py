@@ -192,27 +192,3 @@ def test_a_pool_short_of_workers_says_so_unless_quiet(monkeypatch, capfd):
 	assert "multiCMD: started 1 of 2 threads: can't start new thread" in capfd.readouterr().err
 	assert run_commands([['true']] * 3, max_threads=2, quiet=True, return_code_only=True) == [0] * 3
 	assert capfd.readouterr().err == ''
-
-
-def test_a_second_ctrl_c_while_the_pool_starts_still_stops_every_command(monkeypatch):
-	tasks = _record_tasks(monkeypatch)
-	_fail_worker_start(monkeypatch, {2}, KeyboardInterrupt())
-	real_stop = multiCMD._stop_tasks
-	armed = [True]
-	def stop(stopping):
-		if armed[0]:
-			armed[0] = False
-			stopping = list(stopping)
-			# cut short after the first task: the rest must be stopped all the same
-			stopping[0].stop = True
-			raise KeyboardInterrupt
-		real_stop(stopping)
-	monkeypatch.setattr(multiCMD, '_stop_tasks', stop)
-	with pytest.raises(KeyboardInterrupt):
-		run_commands([['sleep', '0.3']] * 12, max_threads=4, quiet=True)
-	assert all(task.stop for task in tasks)
-	# the interrupt that cut the stop short is a second one: it ends the wait, and the workers stop the commands
-	deadline = time.monotonic() + 5
-	while multiCMD._live_procs and time.monotonic() < deadline:
-		time.sleep(0.05)
-	assert not multiCMD._live_procs

@@ -9,7 +9,6 @@ import atexit
 import collections
 import collections.abc
 import errno
-import functools
 import io
 import itertools
 import math
@@ -284,17 +283,12 @@ class _Thread(threading.Thread):
 	  by timeout, and once done is set it joins the thread itself, which releases its stack ( from Python 3.13 a
 	  finished thread nobody joined keeps its stack mapped for as long as the Thread object lives ), within
 	  what is left of timeout: a thread whose target has finished is done, whether or not it has left yet;
-	- is_alive() is True until done is set, from the moment the thread is created: one registered before it
-	  starts counts as running, so a wait from another thread meanwhile waits for it.
-	A thread is therefore either started or abandoned, never left in between: start() abandons it when it
-	cannot start, or when a Ctrl-C lands while it waits for the thread to come up and the thread has not got
-	to its target yet; whoever meant to start it abandons it when it did not ( see _start_threads ). Whichever
-	comes first, run() or _abandon(), decides whether the target runs, so the answer never depends on timing
-	afterwards, and _abandon() gives the same answer however often it is asked, a Ctrl-C between two included.
+	- is_alive() is True from its start until done is set. A thread that never started is not alive, and join()
+	  returns at once for it.
 	done is a _Done, not a threading.Event, so no interrupt can leave it blocking anyone.
 	@attributes:
 		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
-		done: Set once the target has returned or raised, or the thread was abandoned ( a _Done )
+		done: Set once the target has returned or raised ( a _Done )
 	'''
 	def __init__(self, target, args=(), task=None):
 		super().__init__(target=target, args=args, daemon=True)
@@ -302,62 +296,41 @@ class _Thread(threading.Thread):
 		self.done = _Done()
 		# ( in a child forked meanwhile only the forking thread exists )
 		self._pid = os.getpid()
-		# who decided whether the target runs: 'run' or 'abandon'. setdefault() is one atomic step that also
-		# says who won, so no interrupt can leave the decision taken but unrecorded
-		self._claim = {}
 
 	def start(self):
-		# what the caller is handling already ( an except or finally block ): an error raised while handling it is not
-		# one raised during this start
+		# what the caller is handling already: a Ctrl-C it handles is not one that landed in this start
 		handling = sys.exc_info()[1]
 		try:
 			super().start()
-		except BaseException as e:
-			# it cannot start, or a Ctrl-C landed while start() waited for it to come up: it runs if it got that far
-			self._abandon()
-			interrupt = _interrupt_in(e, handling)
-			if interrupt is not None and interrupt is not e:
-				# a Ctrl-C that start()'s wait turned into another error: Condition.wait() releases its lock on the
-				# way out, and when the Ctrl-C cut short the _acquire_restore() that takes it back, that release
-				# raises RuntimeError ( seen on free-threaded 3.13t ). The Ctrl-C is what happened
-				raise interrupt
+		except RuntimeError as e:
+			# a Ctrl-C inside start()'s wait for the thread to come up can come out as RuntimeError('release unlocked
+			# lock') ( seen on 3.12 and free-threaded 3.13t ): the Ctrl-C is what happened
+			context = e.__context__
+			if context is not None and context is not handling and not isinstance(context, Exception):
+				raise context
 			raise
-
-	def _abandon(self):
-		'''
-		Make sure the thread never runs its target, unless it already does ( by the thread that starts it )
-		@returns:
-			bool: Whether it never runs its target ( done is then set )
-		'''
-		if self._claim.setdefault('by', 'abandon') != 'abandon':
-			return False
-		self.done.set()
-		return True
 
 	def run(self):
 		try:
-			if self._claim.setdefault('by', 'run') == 'run':
-				super().run()
+			super().run()
 		finally:
 			self.done.set()
 
 	def is_alive(self):
-		return not self.done.flag and self._pid == os.getpid()
+		return self._started.is_set() and not self.done.flag and self._pid == os.getpid()
 
 	def join(self, timeout=None):
 		# ( in a child forked meanwhile the thread does not exist: nothing ever sets done there )
-		if self._pid != os.getpid():
+		if self._pid != os.getpid() or not self._started.is_set():
 			return
 		deadline = None if timeout is None else time.monotonic() + timeout
 		if not self.done.wait(timeout):
 			return
-		# ( an abandoned thread may never have come up )
-		if self._started.is_set():
-			left = None if deadline is None else max(0, deadline - time.monotonic())
-			if _JOIN_MAY_HANG:
-				# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
-				left = 1 if left is None else min(left, 1)
-			super().join(left)
+		left = None if deadline is None else max(0, deadline - time.monotonic())
+		if _JOIN_MAY_HANG:
+			# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
+			left = 1 if left is None else min(left, 1)
+		super().join(left)
 
 def _any_alive(threads):
 	'''
@@ -371,263 +344,14 @@ def _any_alive(threads):
 			return True
 	return False
 
-def _interrupt_in(error, before=None):
+def _check_started(threads):
 	'''
-	The interrupt ( see _is_interrupt ) error is, or that it was raised while handling, if any ( internal )
-	The walk down error's __context__ chain stops at before: what the caller was handling already ( sys.exc_info()
-	before the call that raised error ), whose own context is older still. A Ctrl-C the caller is handling, from its
-	except block, is not one that landed during the call.
-	'''
-	seen = set()
-	while error is not None and error is not before and id(error) not in seen:
-		if _is_interrupt(error):
-			return error
-		seen.add(id(error))
-		error = error.__context__
-	return None
-
-# a KeyboardInterrupt ( a Ctrl-C ), or a SystemExit from a signal handler ( mcmd's own SIGTERM / SIGHUP one )
-_INTERRUPTS = (KeyboardInterrupt, SystemExit)
-# how many times a settled step may fail on its own before it is not run again ( see _settle )
-_STEP_FAILURES = 3
-
-def _handler_codes():
-	'''The code objects of the Python signal handlers installed now ( internal; see _is_interrupt )'''
-	codes = set()
-	signums = signal.valid_signals() if hasattr(signal, 'valid_signals') else range(1, getattr(signal, 'NSIG', 65))
-	for signum in signums:
-		try:
-			handler = signal.getsignal(signum)
-		except (ValueError, OSError):
-			continue
-		# ( a functools.partial or a bound method: the function it calls )
-		for _ in range(8):
-			if isinstance(handler, functools.partial):
-				handler = handler.func
-			elif hasattr(handler, '__func__'):
-				handler = handler.__func__
-			else:
-				break
-		code = getattr(handler, '__code__', None)
-		if code is None:
-			# an object with a __call__ method
-			code = getattr(getattr(type(handler), '__call__', None), '__code__', None)
-		if code is not None:
-			codes.add(code)
-	return codes
-
-def _is_interrupt(error):
-	'''
-	Whether error is an interrupt rather than a failure of multiCMD's own code ( internal ): a KeyboardInterrupt, a
-	SystemExit, or anything a Python signal handler raised
-	The last is told by the handler's frame in error's traceback: a frame running the code of a handler installed now
-	( signal.getsignal(), for every signal; only looked at once error is neither of the first two ). A handler that
-	is no longer installed when this looks ( one that restores the previous handler before it raises ) is not seen:
-	what it raised then counts as a failure. The traceback covers the frames from where error was caught down to
-	where it was raised, so a failure of multiCMD's own code called from a handler ( a kill_all() in it ) is not
-	taken for the handler's: the handler's frame is above the code that caught it.
-	'''
-	if isinstance(error, _INTERRUPTS):
-		return True
-	tb = getattr(error, '__traceback__', None)
-	if tb is None:
-		return False
-	codes = _handler_codes()
-	while tb is not None:
-		if tb.tb_frame.f_code in codes:
-			return True
-		tb = tb.tb_next
-	return False
-
-# per thread: the failure messages to show once the outermost _settle() running on that thread is done ( None: show
-# at once ). Only that _settle() sets it, and resets it as it ends, but whether one runs is told by the stack, not by
-# this: an interrupt that lands before the reset leaves a dict no running _settle() owns, which _show_error() then
-# never fills and the next outermost _settle() replaces ( see _settle_running )
-_settling = threading.local()
-# ( without it, not CPython: whether a _settle() runs is told by _settling alone, which such an interrupt leaves stale )
-_HAS_GETFRAME = hasattr(sys, '_getframe')
-
-def _settle_running(frame):
-	'''
-	Whether a _settle() runs on this thread at frame or further up its stack ( internal; see _settling )
-	A loop over the frames, so whatever an interrupt left in _settling never outlives the _settle() that set it.
-	'''
-	while frame is not None:
-		if frame.f_code is _SETTLE_CODE:
-			return True
-		frame = frame.f_back
-	return False
-
-def _settle(step, cuts=None, quiet=False):
-	'''
-	Run step() to its end, whatever interrupt lands meanwhile ( internal )
-
-	For multiCMD's rare paths only: a thread that cannot start, stopping commands, cancelling or abandoning a batch,
-	recording a task that failed. Nothing here touches signal state: whatever cuts step short makes it run again
-	from the start, so step must give the same result run again after being cut short anywhere ( idempotent ), and
-	must take no lock an interrupt could leave held ( none at all: see _Done ). A program's own SIGINT handler is
-	called as the Ctrl-C lands. What cuts it short is either an interrupt ( see _is_interrupt: a KeyboardInterrupt
-	from a Ctrl-C, on the main thread; a SystemExit from a handler such as mcmd's SIGTERM one; anything a program's own
-	signal handler raises ) or a failure of step's own, and the two are kept apart:
-	- the first interrupt is raised once step has completed. Anything step records ( a return code ) is recorded
-	  before it is raised, so it is raised from here and a wait the caller would start next is skipped, as a second
-	  Ctrl-C during it would end it;
-	- a failure of its own that a run again got past is not raised: it is shown once on stderr unless quiet. A step
-	  that fails on its own _STEP_FAILURES times is not run again, and the first failure is raised then ( an
-	  interrupt meanwhile is raised instead, and the failure shown unless quiet ).
-	The failure messages step shows ( see _show_error ) are shown after it, each once: a step run again shows
-	nothing twice. Only the outermost _settle() running on a thread shows them, told by the stack ( see _settling ): an
-	interrupt that cuts the end of one short leaves nothing that keeps a later one from showing its own. An interrupt
-	pending as _settle is called can still be raised before step starts ( from the call itself: no Python code can
-	take it earlier ); a caller that must have step run then calls it again with that interrupt in cuts ( see _execute ).
-	@params:
-		step: The step ( called with no arguments )
-		cuts: A list each interrupt that cuts step short is appended to before step runs again, so step can tell it
-			was ( None: one of its own ). One that lands once step has completed is put in it too, and step runs
-			again: when this raises the first one in it, step has completed knowing of each ( one it held already
-			included ). An interrupt this raises instead, one that lands as it returns, or a second one in its own
-			handling, may never have been seen by step: a caller that must have step see it calls this again with
-			it in cuts ( see _execute ). A failure of step's own is never put in it.
-		quiet: Whether to say nothing of a failure of step's own that is not raised
-	'''
-	if cuts is None:
-		cuts = []
-	# step's own failures, and whether it has completed
-	failures = []
-	done = False
-	# whether this is the outermost _settle() running on this thread, which shows the messages ( see _settling )
-	own = not _settle_running(sys._getframe(1)) if _HAS_GETFRAME else getattr(_settling, 'messages', None) is None
-	messages = {}
-	try:
-		if own:
-			_settling.messages = messages
-		# ( two loops: an interrupt that lands on the inner loop's way back is taken by the outer one, which is left from
-		# inside its try, as a loop's way back is where Python raises one. Neither has a condition: Python 3.13 copies a
-		# loop's condition to the end of its body, with a back-jump that no try covers ). An interrupt runs step
-		# again, one that lands once it has completed included ( on that way back, right after `done = True` ), so step
-		# knows of it
-		while True:
-			try:
-				while True:
-					try:
-						if done or len(failures) >= _STEP_FAILURES:
-							break
-						step()
-						done = True
-					except BaseException as e:
-						if _is_interrupt(e):
-							cuts.append(e)
-							done = False
-						else:
-							failures.append(e)
-				break
-			except BaseException as e:
-				if _is_interrupt(e):
-					cuts.append(e)
-					done = False
-				else:
-					failures.append(e)
-		if failures and (done or cuts) and not quiet:
-			error = failures[0]
-			_show_error(f'multiCMD: {type(error).__name__}: {error} cut a clean-up step short; it was run again'
-				+ ('' if done else f' {len(failures)} times, without completing'))
-	finally:
-		if own:
-			# ( reset before anything is called: an interrupt among the writes leaves nothing behind )
-			_settling.messages = None
-			for text in messages.values():
-				_write_error(text)
-	if cuts:
-		raise cuts[0]
-	if not done:
-		raise failures[0]
-
-_SETTLE_CODE = _settle.__code__
-
-def _abandon_all(threads, forget=None):
-	'''
-	Abandon every thread that has not got to its target, and forget each one abandoned ( forget(thread), see
-	_start_threads ) ( internal ); idempotent, for a settled step
+	Raise RuntimeError, as Thread.join() does, for a thread never started that is not a _Thread ( internal ): the
+	caller's error, told before a wait whose every exception is taken for an interrupt
 	'''
 	for thread in threads:
-		if thread._abandon() and forget is not None:
-			forget(thread)
-
-def _start_threads(threads, register=None, forget=None, fail=None, abort=None, wait=None, early=None):
-	'''
-	Start _Threads so that every one either runs or is abandoned, none left tracked that never runs ( internal )
-
-	Each thread in turn is registered ( register(thread) ) and started. One that cannot start ( an Exception ) is
-	abandoned, forgotten ( forget(thread) ) and failed ( fail(thread, error) ), and the next one starts, unless fail
-	returned True: that ends the starts there, and the threads not started yet are abandoned and forgotten. Without
-	fail, the error ends the starts early. When the starts end early ( that error, a Ctrl-C, register or fail
-	raising ), every thread that does not run, registered yet or not, is abandoned and forgotten, a fail cut
-	short is run again, abort() is called, then wait() and the exception is raised. fail and that bookkeeping run
-	to their end whatever interrupt lands meanwhile ( see _settle ), so forget, fail and abort must be idempotent.
-	An interrupt meanwhile is raised once they are done, with the exception as its __context__: after a Ctrl-C it
-	is a second one, which skips wait(), as it would end it.
-	@params:
-		threads: The _Threads to start ( list )
-		register: Called with each thread right before it starts ( None: nothing to do )
-		forget: Undoes register for a thread that never runs; called for every such thread, registered or not
-		fail: Called with a thread that cannot start and the error; True ends the starts ( None: the error ends them early )
-		abort: Called once the starts end early ( None: nothing to do )
-		wait: Called after abort, to wait for the threads that run ( None: nothing to do )
-		early: A list True is appended to as soon as the starts end early, before abort and wait: the caller's own
-			handling of the exception then knows the wait was done, or skipped by a second interrupt ( None: none )
-	@returns:
-		list: The threads that run ( or may yet get to their target )
-	'''
-	# a thread whose fail() has not completed yet -> its error ( None once it has )
-	failing = {}
-	# how many threads the starts got to, when a fail ended them
-	ended = [None]
-	def failed(thread, error, index):
-		failing[thread] = error
-		if fail(thread, error):
-			ended[0] = index + 1
-		failing[thread] = None
-	try:
-		for index, thread in enumerate(threads):
-			if register is not None:
-				register(thread)
-			try:
-				thread.start()
-			except Exception as e:
-				if not thread._abandon():
-					# it got to its target all the same
-					continue
-				if forget is not None:
-					forget(thread)
-				if fail is None:
-					raise
-				_settle(lambda: failed(thread, e, index))
-				if ended[0] is not None:
-					# the ones after it never start
-					_settle(lambda: _abandon_all(threads[ended[0]:], forget))
-					break
-	except BaseException as e:
-		if early is not None:
-			early.append(True)
-		def settle():
-			_abandon_all(threads, forget)
-			for thread, error in failing.items():
-				if error is not None:
-					fail(thread, error)
-					failing[thread] = None
-			if abort is not None:
-				abort()
-		try:
-			_settle(settle)
-		except BaseException:
-			# an interrupt meanwhile: the first one ( after a failure ) is waited for as any, a second one ends the wait
-			if wait is not None and not _is_interrupt(e):
-				wait()
-			raise
-		if wait is not None:
-			wait()
-		raise
-	return [thread for thread in threads[:ended[0]] if thread not in failing]
+		if not isinstance(thread, _Thread) and thread.ident is None:
+			raise RuntimeError('cannot join thread before it is started')
 
 class _Display:
 	'''
@@ -731,12 +455,12 @@ class AsyncExecutor:
 		self.env = None if env is None else env.copy()
 		# an empty one ( which _check_env reduces to None ) stays a dict to add to, like env
 		self.extra_env = None if extra_env is None else dict(extra or {})
-		# held while tasks, _queue and _dispatching change together; never by a settled step ( see _settle )
+		# held while tasks, _queue and _dispatching change together
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
 		self._queue = collections.deque()
 		self._dispatching = False
-		# started threads not yet joined, in start order ( dict used as an ordered set; no lock, see _track )
+		# started threads not yet joined, in start order ( dict used as an ordered set; one dict operation each, no lock )
 		self._threads = {}
 		# threads append themselves here when done, so _reap() joins them without scanning
 		self._finished = collections.deque()
@@ -789,11 +513,9 @@ class AsyncExecutor:
 
 	def _track(self, thread):
 		'''
-		Track a _Thread about to start until it reports itself finished ( internal; register for _start_threads )
+		Track a _Thread about to start until it reports itself finished ( internal )
 		Tracked before it starts, so it is tracked before it can report itself finished, and its task has it
-		before it runs, so _reap() never sees the task without its thread. _threads takes no lock ( one dict operation
-		each, and dict.copy() snapshots ), so no Ctrl-C can leave _track, _untrack or _reap blocking: _untrack is a
-		settled step's ( see _settle ).
+		before it runs, so _reap() never sees the task without its thread.
 		'''
 		self._threads[thread] = None
 		if thread.task is not None:
@@ -801,7 +523,7 @@ class AsyncExecutor:
 
 	def _untrack(self, thread):
 		'''
-		Stop tracking a thread that never runs its target, as it never reports itself finished ( internal; forget for _start_threads )
+		Stop tracking a thread that never started, as it never reports itself finished ( internal )
 		Its task drops it as a finished one does: an executor task has a thread only while it runs.
 		'''
 		self._threads.pop(thread, None)
@@ -835,14 +557,14 @@ class AsyncExecutor:
 				try:
 					self._reap()
 					thread = _Thread(_run_executor_task, (task, _HeldPermit(sem), timeout, quiet, dry_run, self._finished, decor, use_pty), task)
-					_start_threads([thread], self._track, self._untrack)
-				except BaseException as e:
-					if thread is None or thread._abandon():
-						sem.release()
-						# it is off the queue and will never run: it failed, as a command multiCMD cannot start does
-						_fail_task(task, f'cannot start its thread: {e}', e, quiet)
-					if not isinstance(e, Exception):
-						raise
+					self._track(thread)
+					thread.start()
+				except Exception as e:
+					if thread is not None:
+						self._untrack(thread)
+					sem.release()
+					# it is off the queue and will never run: it failed, as a command multiCMD cannot start does
+					_fail_task(task, f'cannot start its thread: {e}', e, quiet)
 		except BaseException:
 			# let the next run_commands() start a new dispatcher for what is still queued
 			with self._lock:
@@ -907,18 +629,6 @@ class AsyncExecutor:
 		self._reap()
 		start_dispatcher = False
 		dispatcher = None
-		def settle():
-			# a Ctrl-C or a failure from here on: this call's commands are skipped, whoever would start them ( so
-			# the outcome does not depend on how far the dispatcher got ); a dispatcher that runs stays the
-			# dispatcher, and without one the next run_commands() starts one for what is still queued
-			_stop_tasks(taskObjects)
-			if start_dispatcher and (dispatcher is None or dispatcher._abandon()):
-				if dispatcher is not None:
-					self._untrack(dispatcher)
-				# ( no dispatcher runs, so nothing else clears it; one store, without the lock, which a settled step
-				# never takes: a run_commands() from another thread that saw it still set leaves its commands queued
-				# for the next one, as it would have had it taken the lock first )
-				self._dispatching = False
 		try:
 			with self._lock:
 				first = len(self.tasks) + 1
@@ -928,13 +638,23 @@ class AsyncExecutor:
 				self._queue.extend(queued)
 				if not self._dispatching and self._queue:
 					start_dispatcher = True
-					# only the dispatcher clears this, under the lock, once it sees the queue empty ( or settle(), when there is none )
+					# only the dispatcher clears this, under the lock, once it sees the queue empty ( or the handler below,
+					# when none started )
 					self._dispatching = True
 			if start_dispatcher:
 				dispatcher = _Thread(self._dispatch)
-				_start_threads([dispatcher], self._track, self._untrack, abort=settle)
+				self._track(dispatcher)
+				dispatcher.start()
 		except BaseException:
-			_settle(settle)
+			# a Ctrl-C or a failure from here on: this call's commands are skipped, whoever would start them; a
+			# dispatcher that started stays the dispatcher, and without one the next run_commands() starts one for what
+			# is still queued ( one store, without the lock: a run_commands() from another thread that saw it still set
+			# leaves its commands queued for the next one, as it would have had it taken the lock first )
+			_stop_tasks(taskObjects)
+			if start_dispatcher and (dispatcher is None or not dispatcher._started.is_set()):
+				if dispatcher is not None:
+					self._untrack(dispatcher)
+				self._dispatching = False
 			raise
 		return taskObjects
 	
@@ -958,20 +678,20 @@ class AsyncExecutor:
 				including the ones the dispatcher starts while waiting
 		@returns:
 			list[threading.Thread]: The threads that are still running
-		A Ctrl-C ( or a SystemExit from a signal handler, as a SIGTERM handler's sys.exit() ) while it waits stops every
+		A Ctrl-C ( or whatever a signal handler raises, as a SIGTERM handler's sys.exit() ) while it waits stops every
 		command of the executor, queued ones skipped, waits up to 5 s for them ( a second Ctrl-C ends that wait at
-		once ) and re-raises.
+		once ) and re-raises. A thread never started is a RuntimeError, as for Thread.join().
 		'''
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+		if threads is not ...:
+			threads = list(threads)
+			_check_started(threads)
 		try:
 			self._wait_until(deadline, threads)
-		except BaseException as e:
-			# ( a thread never started is the caller's error, not an interrupt )
-			if not _is_interrupt(e):
-				raise
+		except BaseException:
 			# the commands run in process groups of their own, so the terminal's Ctrl-C did not reach them
 			# not wait(): a second Ctrl-C must end this wait, not nest another one ( it is raised with the first as its
-			# __context__ ); one that lands while the tasks are stopped is raised by _stop_tasks, before the wait
+			# __context__ )
 			_stop_tasks(self.tasks)
 			self._wait_until(time.monotonic() + 5)
 			raise
@@ -1837,7 +1557,7 @@ def _resolve_pty(pty):
 		print('multiCMD: pty mode needs a POSIX system, using pipes', file=sys.stderr)
 	return False
 
-def _open_pty(reserved=0, fds=None):
+def _open_pty(reserved=0):
 	'''
 	Open a pseudo-terminal for a command's output ( internal )
 	Output post-processing is off, so bytes arrive exactly as written ( no '\n' to '\r\n' ), and
@@ -1845,18 +1565,13 @@ def _open_pty(reserved=0, fds=None):
 	The pty is only the command's output, never its controlling terminal.
 	@params:
 		reserved: Columns to take off the terminal width
-		fds: A dict the descriptors are stored in, as 'master' and 'slave', the moment openpty() returns them, so the
-			caller can close them whatever interrupts the setup ( see _close_fds )
 	@returns:
 		( int, int ) | ( None, None ): The master and slave file descriptors, or None when no pty can be opened
 	'''
 	global _PTY_WARNED
-	if fds is None:
-		fds = {}
 	try:
 		import pty as _pty_module
-		fds['master'], fds['slave'] = _pty_module.openpty()
-		master, slave = fds['master'], fds['slave']
+		master, slave = _pty_module.openpty()
 	except (ImportError, OSError) as e:
 		if not _PTY_WARNED:
 			_PTY_WARNED = True
@@ -1874,20 +1589,6 @@ def _open_pty(reserved=0, fds=None):
 	except Exception:
 		pass
 	return master, slave
-
-def _close_fds(fds):
-	'''
-	Close the file descriptors in a dict, taking each out first ( internal ); idempotent, for a settled step
-	Taken out before it is closed, so an interrupt in between leaks it rather than have it closed twice ( by then
-	the number may be another file's ).
-	'''
-	for name in list(fds):
-		fd = fds.pop(name, None)
-		if fd is not None:
-			try:
-				os.close(fd)
-			except OSError:
-				pass
 
 def _watch(task, proc, timeout):
 	'''
@@ -2110,22 +1811,8 @@ def _child_env(task, pager=False):
 	return env
 
 def _stop_command(proc, pgid, quiet=False):
-	'''
-	Kill a command with everything it started ( _kill_commands; quiet as there ) ( internal )
-	An interrupt that ends the wait for it ( a second Ctrl-C, or whatever a signal handler raises ) leaves it sent
-	SIGTERM at least, and still registered: kill_all() and the exit hook do the rest. That is the caller's to do: it
-	calls this in a try whose handler calls _cut_stop(), as an interrupt can land as the call begins, before any try
-	in here could take it.
-	'''
+	'''Kill a command with everything it started ( _kill_commands; quiet as there ) ( internal )'''
 	_kill_commands([(proc, pgid)], signal.SIGINT, quiet)
-
-def _cut_stop(proc, pgid):
-	'''
-	The rest of a stop an interrupt cut short, or kept from beginning: SIGTERM, and SIGCONT for a stopped command
-	( internal; see _stop_command )
-	'''
-	_send(proc, pgid, signal.SIGTERM)
-	_send(proc, pgid, signal.SIGCONT)
 
 def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
@@ -2136,20 +1823,15 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	call. After a normal exit the output is read to its end, however long that takes. The command
 	leaves the live registry as soon as it is reaped, so kill_all() never touches what it left
 	running in the background on purpose.
-	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is
-	re-raised once the command is dead; a second one ends that wait, the command sent SIGTERM and still registered.
-	So is anything else a signal handler raises into the run ( a SIGTERM handler's SystemExit, a program's own
-	exception ), the task finalized as stopped: once the command runs, multiCMD only waits for it ( _watch, _drain:
-	polls, sleeps and joins, no I/O of their own ), so whatever is raised there is taken as such; before that, while
-	it starts, only an exception _is_interrupt() recognizes is ( a KeyboardInterrupt, a SystemExit, one with a
-	handler's frame in its traceback ), and anything else is a failure of multiCMD's, which the caller records ( -1 ).
-	A KeyboardInterrupt ( or a SystemExit from a signal handler ) that lands while the command starts stops it like
-	any other, from the moment Popen has returned it ( see _popen ). One that Python raises inside Popen, once it has
-	forked, loses the command, which then runs on in a process group of its own, unknown to kill_all() and the exit
-	hook. Python raises it on the main thread only, some 50 - 70 us per start. Nowhere else does one interrupt lose a
-	command. A second one can, before Python 3.11: one pending as the first reaches the handler that deals with
-	it is raised as that handler begins ( 3.6 - 3.10 ), and on 3.6 - 3.9, which raise one at nearly any instruction,
-	at a few other points of that handling.
+	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is re-raised once the
+	command is dead, the task finalized as stopped. So is anything else that is not an Exception ( a SIGTERM handler's
+	SystemExit ), and, once the command runs, whatever a signal handler raises: multiCMD then only waits for it
+	( _watch, _drain: polls, sleeps and joins, no I/O of their own ). An Exception raised while it starts is a failure
+	of multiCMD's: the command is stopped and the caller records it ( -1 ). A second interrupt ends the wait for the
+	stop: the command is sent SIGTERM and stays registered, for kill_all() and the exit hook.
+	The command is registered from the moment Popen has returned it ( see _popen ). An interrupt that Python raises
+	inside Popen, once it has forked, loses it: it runs on in a process group of its own, unknown to kill_all() and
+	the exit hook. Python raises one on the main thread only, some 50 - 70 us per start.
 
 	@params:
 		task: The Task
@@ -2160,42 +1842,33 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	'''
 	# whether the caller gave this command an environment ( rather than only the pty's pager defaults )
 	explicit = task._env is not None or task._extra_env is not None
-	# the pty's descriptors that no file object owns yet, from the moment they exist ( see _open_pty ): closed by
-	# _close_fds whatever cuts the start short ( each taken out of here before it is closed ), the master taken out
-	# once its file object has it
-	fds = {}
-	# the pty's file object, once there is one ( see below )
-	wrapped = []
+	# the pty's side until its file object has it
+	master = None
 	proc = pgid = None
-	# the command as soon as Popen has returned it, before _spawn returns ( see _popen )
+	# the command the moment Popen has returned it, before _spawn returns ( see _popen )
 	started = []
 	streams = []
 	readers = []
-	# the interrupt to raise once the command is dead ( see below )
-	interrupted = None
-	# whether multiCMD only waits for the command now ( see below )
+	# whether multiCMD only waits for the command now: whatever is raised then was raised into the run by a signal handler
 	waiting = False
-	# from the pty on, an interrupt or any failure closes it; from the spawn on, it still stops the command, which runs
-	# in a process group of its own
+	# the interrupt to raise once the command is dead
+	interrupted = None
 	try:
 		if use_pty:
-			_open_pty(len(decor[0]), fds)
-		if fds:
-			# the pty's side, wrapped in its file object before anything starts, and only ever closed through it. The
-			# file object is made and kept in one step ( list.extend() runs map's io.open() in C, where no interrupt
-			# lands ): whatever cuts this short, it is either in wrapped, owning the master, or was never made
-			wrapped.extend(map(io.open, (fds['master'],), ('rb',)))
-			fds.pop('master', None)
+			master, slave = _open_pty(len(decor[0]))
+		if master is not None:
 			try:
-				proc, pgid = _spawn(task.command, fds['slave'], fds['slave'], _child_env(task, pager=True), explicit, started)
+				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit, started)
 			finally:
 				# only the command keeps the terminal side open, so the master sees EIO once it is gone
-				_close_fds(fds)
+				os.close(slave)
 			task._pty = True
-			streams.append((wrapped[0], task.stdout))
+			# ( handed to its file object: a Ctrl-C in between leaks it rather than have it closed twice )
+			fd, master = master, None
+			streams = [(io.open(fd, 'rb'), task.stdout)]
 		else:
 			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
-			streams.extend(((proc.stdout, task.stdout), (proc.stderr, task.stderr)))
+			streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
 		# ( for kill_all() and the exit hook, which know no quiet of their own: see _give_up_on )
 		proc._multicmd_quiet = quiet
 		_register(proc, pgid)
@@ -2207,149 +1880,52 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._env = task._extra_env = None
 		task.start_time = time.time()
 		task._last_output = time.monotonic()
-		readers.extend(_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams)
-		_start_threads(readers)
-		# from here on multiCMD only waits for the command ( polls and sleeps, no I/O of its own ), so whatever is
-		# raised meanwhile was raised into the run by a signal handler
+		readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
+		for reader in readers:
+			reader.start()
 		waiting = True
 		reason = _watch(task, proc, timeout)
 	except BaseException as e:
-		# nothing here is a call or a conditional jump until the try below: an interrupt raised before it ( a second
-		# Ctrl-C, or a Ctrl-C a free-threaded build delivers twice, which lands at the next point Python raises one ) would
-		# leave _execute before settle has registered the command, which would run on unknown to kill_all() and the exit
-		# hook. From Python 3.11 Python raises one only as a call begins or returns, or on a loop's way back. 3.10 also
-		# raises one as a handler begins, and 3.6 - 3.9 at nearly any instruction: there a second Ctrl-C pending as the
-		# first reaches this handler is raised before it, and loses a command that was starting ( one that was waited
-		# for stays registered, unsignalled )
-		first = e
-		# whether what came is an interrupt, rather than a failure of multiCMD's ( see _is_interrupt; None until the
-		# loop below has looked )
-		interrupt = None
-		# the interrupts that cut settle short ( see _settle ), or that came around it: never a failure of settle's own
-		cuts = []
-		# what the _settle() calls below raised, and what landed around them, that the loop has not looked at yet ( in
-		# the order it came ), and whether settle is done with: it completed knowing of every interrupt in cuts, or
-		# failed on its own
-		raised = []
-		settled = False
-		def settle():
-			nonlocal proc, pgid
-			if proc is None and started:
-				# what cut it short came before _spawn returned ( see _popen )
-				proc, pgid = started[-1]
-			if proc is not None:
-				# registered here, so kill_all() and the exit hook reach it whatever cuts the kill short
-				proc._multicmd_quiet = quiet
-				_live_procs[proc] = pgid
-			_starting.pop(task, None)
-			# the pty's descriptors no file object owns yet, and a stream no reader reads, are closed here ( a reader
-			# closes its own; closing a file object again does nothing )
-			if wrapped:
-				fds.pop('master', None)
-			_close_fds(fds)
-			pending = streams
-			if not pending:
-				if wrapped:
-					pending = [(wrapped[0], None)]
-				elif proc is not None:
-					pending = [(proc.stdout, None), (proc.stderr, None)]
-			for i, (stream, _) in enumerate(pending):
-				if stream is not None and (i >= len(readers) or readers[i]._abandon()):
-					stream.close()
-			if cuts and interrupt and proc is not None:
-				# a second interrupt ( of any kind ) while the first is dealt with: it ends the wait for the command,
-				# which is sent SIGTERM now ( kill_all() and the exit hook do the rest )
-				_cut_stop(proc, pgid)
-		# what the loops below end on: the first interrupt that cut settle short, or came around it
-		cut = None
-		# from the loops to the end of the stop, an interrupt that lands outside their trys ( a second Ctrl-C: on Python
-		# 3.10 Python raises one at every conditional jump taken, as these decisions make, and on 3.6 - 3.9 at nearly any
-		# instruction ) has the command sent SIGTERM, and is raised on; one raised here on purpose needs no more
-		try:
-			# ( two loops, as in _settle: an interrupt that lands as the inner one keeps what was raised, or on its way back,
-			# is taken by the outer one, which is left from inside its try; neither has a condition ). The inner one does not
-			# end while something raised is not looked at: an interrupt landing once settle has completed ( on its way back,
-			# right after `settled = True` ) is the first Ctrl-C of a run that deals with a failure ( a command not found ),
-			# or a second one settle has not sent SIGTERM for
-			while True:
-				try:
-					while True:
-						try:
-							if raised:
-								# ( the oldest first: whatever came after _settle raised is looked at after it )
-								seen = raised.pop(0)
-								if cuts and seen is cuts[0]:
-									# raised by _settle, once settle has completed
-									settled = True
-								elif _is_interrupt(seen):
-									# pending as _settle was called, so settle never ran, or landing as it returned, once it
-									# had, or while this loop looked: it runs ( again ), knowing of it
-									cuts.append(seen)
-									settled = False
-								else:
-									# settle failed on its own, every time it ran ( see _settle ): what it did not do is left
-									# to the stop below, kill_all() and the exit hook
-									settled = True
-									if not quiet:
-										_show_error(f'multiCMD: cannot clean up after {type(first).__name__}: '
-											f'{type(seen).__name__}: {seen}')
-							elif settled:
-								break
-							elif interrupt is None:
-								interrupt = waiting or _is_interrupt(first)
-							else:
-								_settle(settle, cuts, quiet)
-								settled = True
-						except BaseException as c:
-							raised.append(c)
-					# ( not the loop's way back: an interrupt landing there would leave _execute, the command not stopped )
-					break
-				except BaseException as c:
-					raised.append(c)
-			cut = cuts[0] if cuts else None
-			if proc is None:
-				# it never started ( or _spawn raised ): nothing to undo, and the caller records why ( 127, 126, -1 )
-				if cut is not None:
-					raise cut
-				raise
-			if cut is not None:
-				if interrupt:
-					# a second interrupt: it ends the wait for the command ( sent SIGTERM by settle )
-					raise cut
-				# the first Ctrl-C, while a failure was dealt with: from here on it is handled as any Ctrl-C
-				first, interrupt = cut, True
-			if not interrupt:
-				# a failure of multiCMD's: the caller records it ( -1 )
-				_stop_command(proc, pgid, quiet)
-				_unregister(proc)
-				_join_all(readers, 1)
-				raise first
-			# an interrupt ( a Ctrl-C, a SIGTERM handler's SystemExit, whatever a program's signal handler raised ): the
-			# command is stopped and recorded as stopped, and the interrupt raised once it is dead. ( Stopped in the
-			# handler rather than after it, which changes nothing: on Python 3.12 the handler's way out is a jump back,
-			# which jumps before it checks for an interrupt, and CPython looks the handler of one raised there up at the
-			# instruction before the jump's target, the end of the try above: this handler runs again for it )
-			reason, interrupted = 'stop', first
-			_stop_command(proc, pgid, quiet)
-		except BaseException as c:
-			if proc is not None and c is not cut and c is not first:
-				# ( a stop cut short, or kept from beginning: see _stop_command )
-				_cut_stop(proc, pgid)
+		# registered first, with no call before the store ( from Python 3.11 Python raises a second Ctrl-C only as a call
+		# begins or returns, or on a loop's way back; 3.6 - 3.10 can raise one before it, see docs/limitations.md )
+		if proc is None and started:
+			proc, pgid = started[-1]
+		if proc is not None:
+			_live_procs[proc] = pgid
+			proc._multicmd_quiet = quiet
+		_starting.pop(task, None)
+		if master is not None:
+			os.close(master)
+		if proc is None:
+			# it never started: the caller records why ( 127, 126, -1 )
 			raise
+		# the streams no reader reads ( a reader closes its own ). Not that of a reader whose start an interrupt cut
+		# short: it may still come up, and a close while it reads would wait for the command's next output
+		for i, (stream, _) in enumerate(streams or [(proc.stdout, None), (proc.stderr, None)]):
+			if stream is not None and (i >= len(readers) or isinstance(e, Exception) and not readers[i]._started.is_set()):
+				stream.close()
+		if isinstance(e, Exception) and not waiting:
+			# a failure of multiCMD's as it started ( a reader that cannot start ): the caller records it ( -1 )
+			_stop_command(proc, pgid, quiet)
+			_unregister(proc)
+			_join_all(readers, 1)
+			raise
+		# an interrupt: the command is stopped below, recorded as stopped, and the interrupt raised once it is dead
+		reason, interrupted = 'stop', e
 	# whether the command exited of itself: what it started may still hold its output open, and is read to its end
 	draining = reason is None
-	# from here to the end of the stop, or of the output: an interrupt that lands has the command ( a stop or the
-	# timeout ) or its group ( once it exited ) sent SIGTERM, still tracked, and is raised on. A group is forgotten only
-	# once it is stopped, or once its output has ended; one whose stop is cut short stays tracked, as a command does:
-	# registered again, so the exit hook reaches it too. ( Its output may end just as one lands: what it left running
-	# is then sent SIGTERM all the same )
+	# from here to the end of the stop, or of the output: an interrupt that lands has the command ( stopped ) or its
+	# group ( once it exited ) sent SIGTERM, still tracked, and is raised on. A group is forgotten only once it is
+	# stopped, or once its output has ended; one whose stop is cut short stays tracked, as a command does: registered
+	# again, so the exit hook reaches it too. ( Its output may end just as one lands: what it left running is then sent
+	# SIGTERM all the same )
 	# where the timeout's 'Timeout!' goes ( see below )
 	marker_at = None
 	try:
 		if draining:
 			# tracked as draining before it leaves the live registry ( a Ctrl-C between the two would leave it in neither )
 			_draining[proc] = pgid
-		elif interrupted is None:
+		else:
 			if reason == 'timeout':
 				marker_at = len(task.stderr)
 			_stop_command(proc, pgid, quiet)
@@ -2373,7 +1949,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		if draining:
 			_live_procs[proc] = pgid
 			_draining.pop(proc, None)
-		_cut_stop(proc, pgid)
+		# ( SIGCONT: a stopped command acts on signals only once continued )
+		_send(proc, pgid, signal.SIGTERM)
+		_send(proc, pgid, signal.SIGCONT)
 		raise
 	_draining.pop(proc, None)
 	_join_all(readers, None if reason is None else 1)
@@ -2416,44 +1994,41 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		list[str]: The output of the command
 	'''
 	with sem:
+		if task.stop:
+			# stopped before it started: it stays unfinished, like a skipped queued command
+			task._env = task._extra_env = None
+			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
 			# a start from here until its command is registered ( see _execute ) is one the exit hook waits for
 			_starting[task] = None
-			if task.stop:
-				# stopped before it started: it stays unfinished, like a skipped queued command
-				task._env = task._extra_env = None
-				return task.stdout + task.stderr if with_stdErr else task.stdout
-			try:
-				if _cut_by_exit(task):
-					# never skipped silently: it fails, with that reason, as a command multiCMD cannot start does
-					raise RuntimeError('not started: the interpreter is exiting')
-				if dry_run:
-					if not quiet:
-						_display.message(_dry_run_line(task))
-					return task.stdout + task.stderr if with_stdErr else task.stdout
+			if _cut_by_exit(task):
+				# never skipped silently: it fails, with that reason, as a command multiCMD cannot start does
+				raise RuntimeError('not started: the interpreter is exiting')
+			if dry_run:
 				if not quiet:
-					_display.message('Running command: ' + _quote_command(task.command), decor)
-					_display.message('-' * 100, decor)
-				_execute(task, timeout, quiet, decor, use_pty)
-			# ( each failure is recorded whatever Ctrl-C lands meanwhile, and the Ctrl-C raised after it: see _settle )
-			except Exception as e:
-				if task._finalized:
-					# what a signal handler raised into the run: _execute recorded the command as stopped ( see there ),
-					# and it is raised on, as a KeyboardInterrupt is
-					raise
-				if isinstance(e, FileNotFoundError):
-					_settle(lambda: _cannot_run(task, 127, 'Command path not found', e, quiet), quiet=quiet)
-				elif isinstance(e, (PermissionError, _ExecRefused)):
-					# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
-					_settle(lambda: _cannot_run(task, 126, 'Command cannot be executed', e, quiet), quiet=quiet)
-				else:
-					_settle(lambda: _fail_task(task, str(e), e, quiet), quiet=quiet)
-			finally:
-				task._finalized = True
-				# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
-				task._env = task._extra_env = None
+					_display.message(_dry_run_line(task))
+				return task.stdout + task.stderr if with_stdErr else task.stdout
+			if not quiet:
+				_display.message('Running command: ' + _quote_command(task.command), decor)
+				_display.message('-' * 100, decor)
+			_execute(task, timeout, quiet, decor, use_pty)
+		except Exception as e:
+			if task._finalized:
+				# what a signal handler raised into the run: _execute recorded the command as stopped ( see there ),
+				# and it is raised on, as a KeyboardInterrupt is
+				raise
+			if isinstance(e, FileNotFoundError):
+				_cannot_run(task, 127, 'Command path not found', e, quiet)
+			elif isinstance(e, (PermissionError, _ExecRefused)):
+				# _ExecRefused: the system refused to execute it ( ENOEXEC, E2BIG, ... ): 126 whichever way it was started, as a shell reports it
+				_cannot_run(task, 126, 'Command cannot be executed', e, quiet)
+			else:
+				_fail_task(task, str(e), e, quiet)
 		finally:
 			_starting.pop(task, None)
+			task._finalized = True
+			# whatever happened, a long-lived executor keeps its tasks, not the environments they were given
+			task._env = task._extra_env = None
 		if not quiet:
 			_display.message('-' * 100, decor)
 			_display.message(f'Process exited with return code {task.returncode}', decor)
@@ -2472,37 +2047,21 @@ def _write_error(text):
 	except Exception:
 		pass
 
-def _show_error(text, key=None):
-	'''
-	Show a failure message on stderr ( internal ); see _write_error
-	Inside _settle() it is shown once the step is done, and a step run again shows it once: the last message
-	given for each key ( default: the text ). Outside one it is shown at once, whatever an interrupt left in _settling.
-	'''
-	messages = getattr(_settling, 'messages', None)
-	if messages is None or _HAS_GETFRAME and not _settle_running(sys._getframe(1)):
-		_write_error(text)
-	else:
-		messages[text if key is None else key] = text
-
 def _cannot_run(task, returncode, what, error, quiet=False):
 	'''
 	Record that a command could not be run ( internal ): not found ( 127 ) or not executable ( 126 ), with the
 	error in stderr; what it is about is shown on stderr unless quiet, as every failure multiCMD reports.
-	Run again for the same failure ( after a Ctrl-C cut it short ), it records the error once.
 	'''
-	line = str(error)
-	if task.stderr[-1:] != [line]:
-		task.stderr.append(line)
+	task.stderr.append(str(error))
 	task.returncode = returncode
 	if not quiet:
-		_show_error(f'{what}: {task.command[0]}', task)
+		_write_error(f'{what}: {task.command[0]}')
 
 def _fail_task(task, message, error, quiet=False):
 	'''
 	Finalize a task multiCMD itself could not run ( internal ): return code -1 and _error ( not a SIGHUP death ),
 	the message and error's traceback in stderr, end_time; then the message is shown on stderr unless quiet
-	The failure is recorded before it is shown, so a message that cannot be shown changes nothing. Run again for
-	the same failure ( after a Ctrl-C cut it short ), it records the lines once.
+	The failure is recorded before it is shown, so a message that cannot be shown changes nothing.
 	@params:
 		task: The Task
 		message: What went wrong ( str )
@@ -2510,16 +2069,14 @@ def _fail_task(task, message, error, quiet=False):
 		quiet: Whether to skip showing the message
 	'''
 	lines = message.split('\n')
-	record = lines + ''.join(traceback.format_exception(type(error), error, error.__traceback__)).split('\n')
-	if task.stderr[-len(record):] != record:
-		task.stderr.extend(record)
+	task.stderr.extend(lines + ''.join(traceback.format_exception(type(error), error, error.__traceback__)).split('\n'))
 	task.returncode = -1
 	task._error = True
 	task.end_time = time.time()
 	task._env = task._extra_env = None
 	task._finalized = True
 	if not quiet:
-		_show_error(f'Error running command: {task.command}\n' + '\n'.join(lines), task)
+		_write_error(f'Error running command: {task.command}\n' + '\n'.join(lines))
 
 def _run_executor_task(task, permit, timeout, quiet, dry_run, finished, decor=('', '', ''), use_pty=False):
 	'''
@@ -2760,37 +2317,18 @@ def ping(hosts,timeout=1,max_threads=0,quiet=True,dry_run=False,with_stdErr=Fals
 			return results
 
 def _stop_tasks(tasks):
-	'''
-	Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )
-	Every task is asked, whatever interrupt lands meanwhile ( see _settle: it is raised after it ).
-	'''
-	def stop():
-		for task in tasks:
-			task.stop = True
-	_settle(stop)
-
-def _stop_and_wait(tasks, threads, limit=5, forget=None):
-	'''
-	After a Ctrl-C ( or a failure ): stop the tasks' commands, then wait for their threads, up to limit seconds in all ( internal )
-	The threads that never got to their target are abandoned first, and forgotten ( forget(thread), see
-	_start_threads ), in the same settled step, so the wait never waits for one that does not run. The commands
-	run in process groups of their own, so the terminal's Ctrl-C did not reach them. A second Ctrl-C ends the wait
-	at once ( raised while the first is handled, it has the first as its __context__ ); one that lands while the
-	tasks are stopped is raised once they are, and skips it.
-	'''
-	def stop():
-		_abandon_all(threads, forget)
-		for task in tasks:
-			task.stop = True
-	_settle(stop)
-	_join_all(threads, limit)
+	'''Ask every task's command to stop: running ones are killed, ones not started yet are skipped ( internal )'''
+	for task in tasks:
+		task.stop = True
 
 def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=False):
 	'''
 	Run tasks on at most max_threads worker threads and wait for all of them ( internal )
 	Each worker takes the next task in order, so at most max_threads commands ( and their two
-	output readers each ) exist at any time, however many tasks there are.
-	On KeyboardInterrupt every task is stopped: running commands are killed, the rest never start.
+	output readers each ) exist at any time, however many tasks there are. A worker that cannot start leaves its
+	share to the others ( said on stderr unless quiet ); without any, every task fails.
+	On a Ctrl-C ( or anything raised meanwhile ) every task is stopped: running commands are killed, the rest never
+	start, and the workers get up to 5 s to finish ( a second Ctrl-C ends that wait ).
 	'''
 	if not tasks:
 		return
@@ -2810,39 +2348,35 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 				# the worker goes on to other tasks: this one is not alive with it, and keeps no Thread object
 				task.thread = None
 	wanted = min(max_threads, len(tasks))
-	workers = []
-	# a worker that could not start -> the error
-	failed = {}
-	def fail(thread, error):
-		# that worker leaves its share of the commands to the others ( only without any do they fail ). One failed
-		# start may be passing ( EAGAIN ): the next worker is tried; two in a row end the starts, as the next would
-		# most likely fail the same way
-		failed[thread] = error
-		index = workers.index(thread)
-		return index > 0 and workers[index - 1] in failed
-	# whether the starts ended early: _start_threads has then waited, or a second interrupt ended that
-	early = []
+	workers = [_Thread(worker) for _ in range(wanted)]
 	try:
-		workers.extend(_Thread(worker) for _ in range(wanted))
-		# a Ctrl-C while they start stops every task, so the workers already started do not run them unsupervised,
-		# and waits for those ( see _start_threads: a second Ctrl-C ends that wait )
-		running = _start_threads(workers, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(workers, 5), early=early)
-		error = next(iter(failed.values()), None)
+		running, error, failed_last = [], None, False
+		for thread in workers:
+			try:
+				thread.start()
+			except Exception as e:
+				# one failed start may be passing ( EAGAIN ): the next worker is tried; two in a row end the starts, as
+				# the next would most likely fail the same way
+				error = e
+				if failed_last:
+					break
+				failed_last = True
+			else:
+				running.append(thread)
+				failed_last = False
 		if not running:
-			_settle(lambda: [_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet) for task in tasks], quiet=quiet)
+			for task in tasks:
+				_fail_task(task, f'cannot start a thread to run it: {error}', error, quiet)
 			return
-		if len(running) < wanted and not quiet:
+		if error is not None and not quiet:
 			# commands that must run at the same time may then wait on each other for good: say so
-			_show_error(f'multiCMD: started {len(running)} of {wanted} threads: {error}')
+			_write_error(f'multiCMD: started {len(running)} of {wanted} threads: {error}')
 		for thread in running:
 			_join(thread)
 	except BaseException:
-		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will,
-		# nor do workers made but not started yet. When the starts ended early, _start_threads settled the ones it
-		# was given and waited for the ones that run, unless a second interrupt ended that: it is only done again
-		# here, without the wait, in case its own settling was cut short. Anywhere else ( right after the starts
-		# included ) this is the first interrupt, and the commands are waited for
-		_stop_and_wait(tasks, workers, 0 if early else 5)
+		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will
+		_stop_tasks(tasks)
+		_join_all(workers, 5)
 		raise
 
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
@@ -2955,32 +2489,28 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			task._env = task._extra_env = None
 	elif not wait_for_return:
 		__reap_finished_threads()
-		threads = []
-		early = []
-		def forget(thread):
-			# it never runs: untracked, as it never reports itself finished, and its task keeps it ( done, so
-			# task.thread.join() returns at once ) but not its environment
-			__running_threads.discard(thread)
-			thread.task.thread = thread
-			thread.task._env = thread.task._extra_env = None
-		def fail(thread, error):
-			# that command fails, the others run
-			_fail_task(thread.task, f'cannot start its thread: {error}', error, quiet)
+		threads = [_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors)]
 		try:
-			threads.extend(_Thread(__run_tracked_command, (task,sem,timeout,quiet,False,decor,use_pty), task) for task, decor in zip(tasks, decors))
 			for thread in threads:
 				thread.task.thread = thread
 			# the whole batch is tracked before any starts, so a thread is registered before it reports itself finished
-			# and a join_threads() from another thread meanwhile waits for all of it ( see _Thread )
 			__running_threads.update(threads)
-			# a Ctrl-C while they start: the commands not started yet never will ( skipped ), the others are stopped
-			# and waited for ( see _start_threads: a second Ctrl-C ends that wait )
-			_start_threads(threads, forget=forget, fail=fail, abort=lambda: _stop_tasks(tasks), wait=lambda: _join_all(threads, 5), early=early)
+			for thread in threads:
+				try:
+					thread.start()
+				except Exception as e:
+					# that command fails, the others run; its task keeps the thread ( task.thread.join() returns at once )
+					__running_threads.discard(thread)
+					_fail_task(thread.task, f'cannot start its thread: {e}', e, quiet)
 		except BaseException:
-			# ( also when the starts' own settling was cut short: no thread that never runs stays tracked. When the
-			# starts ended early the wait was _start_threads' own; one that lands as they return is the first, and
-			# the commands are waited for )
-			_stop_and_wait(tasks, threads, 0 if early else 5, forget)
+			# a Ctrl-C while they start: the commands not started yet never will ( skipped, and untracked: they never
+			# report themselves finished ), the others are stopped and get up to 5 s ( a second Ctrl-C ends that wait )
+			_stop_tasks(tasks)
+			for thread in threads:
+				if not thread._started.is_set():
+					__running_threads.discard(thread)
+					thread.task._env = thread.task._extra_env = None
+			_join_all(threads, 5)
 			raise
 	elif max_threads > 1:
 		_run_pool(tasks, decors, sem, timeout, quiet, False, max_threads, use_pty)
@@ -3011,10 +2541,11 @@ def join_threads(threads=...,timeout=None):
 	'''
 	Join threads
 
-	A Ctrl-C ( or a SystemExit from a signal handler, as a SIGTERM handler's sys.exit() ) while it waits stops the
+	A Ctrl-C ( or whatever a signal handler raises, as a SIGTERM handler's sys.exit() ) while it waits stops the
 	commands of the multiCMD threads it waits for ( they run in process groups of their own, so the terminal's
 	Ctrl-C did not reach them ), the ones still queued skipped, waits up to 5 s in all for them ( a second Ctrl-C
-	ends that wait at once ) and re-raises, as a waiting run_commands() does.
+	ends that wait at once ) and re-raises, as a waiting run_commands() does. A thread never started is a
+	RuntimeError, as for Thread.join(); one run_commands() could not start returns at once.
 
 	@params:
 		threads: The threads to join ( default: every fire-and-forget thread still running )
@@ -3027,19 +2558,13 @@ def join_threads(threads=...,timeout=None):
 		threads = list(__running_threads.copy())
 	else:
 		threads = list(threads)
+	_check_started(threads)
 	try:
 		for thread in threads:
 			_join(thread, timeout)
-	except BaseException as e:
-		# ( a thread never started is the caller's error, not an interrupt )
-		if not _is_interrupt(e):
-			raise
-		ours = []
-		def stop():
-			ours[:] = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
-			_stop_tasks([thread.task for thread in ours])
-		# ( an interrupt while they are stopped is raised by _settle: it ends the wait, as a second one would )
-		_settle(stop)
+	except BaseException:
+		ours = [thread for thread in threads if isinstance(thread, _Thread) and thread.task is not None]
+		_stop_tasks([thread.task for thread in ours])
 		_join_all(ours, 5)
 		raise
 	__reap_finished_threads()

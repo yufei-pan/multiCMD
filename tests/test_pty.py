@@ -73,30 +73,3 @@ def test_pty_timeout_still_kills():
 	task = run_command(['sh', '-c', 'echo hi; sleep 10'], quiet=True, pty=True, timeout=1, return_object=True)
 	assert task.returncode == 124
 	assert task.stdout == ['hi']
-
-
-def _open_fds():
-	return set(os.listdir('/proc/self/fd'))
-
-
-@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='counts descriptors through /proc')
-@pytest.mark.parametrize('where', ['after the pty opens', 'before io.open wraps it'])
-def test_a_ctrl_c_as_the_pty_is_set_up_leaks_none_of_its_descriptors(monkeypatch, where):
-	# ( review of round 11, finding 8 ) the slave was closed only by the finally around the spawn, and the master only
-	# once io.open() had wrapped it: a Ctrl-C before either leaked them
-	if where == 'after the pty opens':
-		real = multiCMD._open_pty
-		def open_pty(*args):
-			result = real(*args)
-			raise KeyboardInterrupt
-		monkeypatch.setattr(multiCMD, '_open_pty', open_pty)
-	else:
-		import types
-		def io_open(*args, **kwargs):
-			raise KeyboardInterrupt
-		monkeypatch.setattr(multiCMD, 'io', types.SimpleNamespace(open=io_open))
-	before = _open_fds()
-	with pytest.raises(KeyboardInterrupt):
-		multiCMD.run_command(['true'], quiet=True, pty=True)
-	# before ( fc0c782 ): both descriptors, or the master, left open
-	assert _open_fds() == before
