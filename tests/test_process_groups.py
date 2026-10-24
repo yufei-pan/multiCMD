@@ -244,3 +244,38 @@ def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, cap
 		proc.kill()
 		multiCMD.join_threads(timeout=5)
 	assert ran[0].returncode == -signal.SIGKILL
+
+
+def test_every_registry_entry_holds_a_real_process_group_id_or_none(launcher, monkeypatch):
+	# ( the incident of 2026-10-23: a prototype stored a "grouped" flag where the group id belongs, and killpg(True, sig)
+	# is kill(-1, sig), every process the user may signal ) whatever multiCMD registers, as a command starts, drains, or
+	# is stopped after a Ctrl-C, holds the command's pid as its group id, or None
+	seen = []
+	class Watched(dict):
+		def __setitem__(self, proc, pgid):
+			seen.append((proc, pgid))
+			super().__setitem__(proc, pgid)
+	monkeypatch.setattr(multiCMD, '_live_procs', Watched())
+	monkeypatch.setattr(multiCMD, '_draining', Watched())
+	multiCMD.run_commands([['true'], ['sh', '-c', 'sleep 0.3 & echo a']], quiet=True)
+	multiCMD.run_commands([['true']] * 3, max_threads=3, quiet=True)
+	multiCMD.run_command(['sleep', '5'], timeout=0.2, quiet=True, pty=os.name != 'nt')
+	multiCMD.run_commands([['true']] * 2, quiet=True, wait_for_return=False)
+	multiCMD.join_threads()
+	ex = multiCMD.AsyncExecutor(max_threads=2, quiet=True)
+	ex.run_commands([['true']] * 2)
+	ex.wait()
+	# a Ctrl-C before the registration ( the handler registers it ), and one that cuts the stop short ( re-registered )
+	real_register, real_stop = multiCMD._register, multiCMD._stop_command
+	for what in ('register', 'stop'):
+		def interrupt(*args, **kwargs):
+			raise KeyboardInterrupt
+		monkeypatch.setattr(multiCMD, '_register' if what == 'register' else '_stop_command', interrupt)
+		with pytest.raises(KeyboardInterrupt):
+			multiCMD.run_command(['sleep', '5'], timeout=0.2, quiet=True)
+		monkeypatch.setattr(multiCMD, '_register', real_register)
+		monkeypatch.setattr(multiCMD, '_stop_command', real_stop)
+		multiCMD.kill_all(signal.SIGKILL)
+	assert len(seen) >= 10
+	bad = [(proc.pid, pgid) for proc, pgid in seen if not (pgid is None or (type(pgid) is int and pgid > 1 and pgid == proc.pid))]
+	assert bad == []
