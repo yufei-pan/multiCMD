@@ -239,7 +239,7 @@ def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, cap
 			multiCMD.kill_all()
 			assert proc not in multiCMD._live_procs and proc.poll() is None
 		# before ( fc0c782 ): "multiCMD: pid N is still running after SIGKILL: no longer tracked"
-		assert 'not seen to exit' not in capfd.readouterr().err
+		assert f'pid {proc.pid}' not in capfd.readouterr().err
 	finally:
 		proc.kill()
 		multiCMD.join_threads(timeout=5)

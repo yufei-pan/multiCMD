@@ -79,15 +79,15 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A Ctrl-C as a lock is taken or released can leave it held
 - Kind: known limitation
-- What the operator sees: on Python 3.6 - 3.9 and 3.14, a Ctrl-C landing on one instruction of a `with lock:` (as
-  3.14 takes the lock, or as 3.6 - 3.9 leave the block) leaves that lock held. For `threading`'s own locks the
-  program can hang as its threads end (CPython's own). For multiCMD's: an `AsyncExecutor`'s queued commands never
-  start and a later `wait()`, `run_commands()` or `cleanup()` on it blocks; with the live-output lock, the next
-  call that is not quiet hangs at its first output line ("Running command: ..."), before it starts its command, and
-  commands still running are no longer read, so one that fills its pipe stalls. Only a program that catches the
-  Ctrl-C and keeps going (an interactive prompt, say) gets that far; nothing is orphaned, and the exit does not
-  hang. Measured by the 1.56 review with real signals aimed at the executor's locked region: about 60% of those
-  interrupts left the lock held on 3.14, 0.2 - 0.5% on 3.6 - 3.9, none on 3.10 and 3.12. The same in 1.55.
+- What the operator sees: on Python 3.6 - 3.9 and 3.14, a Ctrl-C landing on one instruction of a `with lock:` can
+  leave that lock held. For `threading`'s own locks the program can hang as its threads end (CPython's own). For
+  multiCMD's: an `AsyncExecutor`'s queued commands never start and a later `run_commands()` or `cleanup()` on it
+  blocks, and so does `wait()` if its dispatcher was running; with the live-output lock, the next call that is not
+  quiet hangs at its first output line ("Running command: ..."), before it starts its command, and commands still
+  running are no longer read, so one that fills its pipe stalls. Only a program that catches the Ctrl-C and keeps
+  going (an interactive prompt, say) gets that far; nothing is orphaned, and the exit does not hang. Measured by
+  the 1.56 review with real signals aimed at the executor's locked region: about 60% of those interrupts left the
+  lock held on 3.14, 0.2 - 0.5% on 3.6 - 3.9, none on 3.10 and 3.12. The same in 1.55.
 - Why: writing the acquire and `try` out by hand leaves the same gap on 3.14; only lock-free structures would
   close it, which is new machinery for a one-instruction window in a microsecond call.
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.

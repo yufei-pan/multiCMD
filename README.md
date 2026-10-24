@@ -411,7 +411,7 @@ A command is registered from the moment `Popen` returns it: a Ctrl-C that Python
 `kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
 `kill_all()` or the exit stops it. On Python 3.6-3.9, which raise a Ctrl-C at nearly any instruction,
 even one at a few points between the steps of a run can leave its command registered but not signalled.
-On Python 3.6-3.9 and 3.14 a Ctrl-C just as a `with` takes or releases a lock can leave it held: one of
+On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a lock can leave it held: one of
 `threading`'s can hang the program as its threads end (CPython's own), and one of multiCMD's (an
 `AsyncExecutor`'s queue, the live output) hangs that executor, or the next call that is not quiet, if the
 program keeps going.
@@ -469,7 +469,7 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 - Fix: a command that times out while it redraws a `\r` progress line on stderr keeps its `Timeout!`
   line; 1.55 could replace it with the progress line, leaving return code 124 without the marker.
-- Simpler interrupt handling, some 700 lines lighter. One Ctrl-C still stops and reports every command.
+- Simpler interrupt handling, some 700 lines lighter. One Ctrl-C still stops every command.
   What changes is a few rare corners, each in [docs/limitations.md](docs/limitations.md):
   - two Ctrl-Cs microseconds apart can leave a command running, still registered, until `kill_all()`
     or the exit stops it; 1.55 stopped it at once;
