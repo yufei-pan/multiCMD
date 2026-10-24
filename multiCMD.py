@@ -1168,11 +1168,10 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	Read one output stream of a command into target, showing complete lines live ( internal )
 
 	A '\n' ends a line. A '\r' ends a line that the next line replaces, like a terminal does, both
-	in target and on screen. The line it replaces is its own, so a line another writer appended to target
-	meanwhile ( the timeout's 'Timeout!' ) stays. Chunks without '\r' are split in one pass; chunks with '\r'
-	are handled separator by separator. Every chunk refreshes task._last_output, which drives the
+	in target and on screen. Chunks without '\r' are split in one pass; chunks with '\r' are
+	handled separator by separator. Every chunk refreshes task._last_output, which drives the
 	inactivity timeout. Once the task is finalized the reader keeps draining but records nothing.
-	The reader closes its stream when done.
+	The reader closes its stream when done. While it runs it is the only writer of target ( see _execute ).
 
 	@params:
 		stream: The binary stream to read ( a pipe, or a pty master )
@@ -1181,36 +1180,13 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 		decor: ( prefix, color start, color end ) for displayed lines
 		quiet: Whether to skip showing the lines
 	'''
-	# the '\r' line this reader last put in target, the one the next line replaces, and where it was put
-	redrawn = redrawn_at = None
 	def emit(lines, replace_first, ends_with_cr):
-		nonlocal redrawn, redrawn_at
 		if task._finalized:
 			return
 		texts = [line.decode('utf-8', errors='backslashreplace') for line in lines]
-		rest = texts
-		index = -1
-		if replace_first and redrawn is not None:
-			# ( replaces its own line, not target's last entry: the timeout's 'Timeout!' and the like are appended to the
-			# same list meanwhile. It is found where it was put, or else from the end by identity ( an empty or
-			# one-character line is the same str as any other such line: hence the place first ). Nothing inserts or
-			# removes entries, so the place found stays the place, and each list operation is atomic with the GIL and
-			# under the list's own lock without it )
-			index = redrawn_at
-			if index >= len(target) or target[index] is not redrawn:
-				index = len(target) - 1
-				while index >= 0 and target[index] is not redrawn:
-					index -= 1
-			if index >= 0:
-				target[index] = texts[0]
-				rest = texts[1:]
-		if index >= 0:
-			redrawn_at = index
-		else:
-			# ( where its line goes, unless another writer appends first: the search from the end then finds it )
-			redrawn_at = len(target)
-		target.extend(rest)
-		redrawn = texts[-1] if ends_with_cr else None
+		if replace_first:
+			target.pop()
+		target.extend(texts)
 		if not quiet:
 			_display.lines(texts, decor, replace_first, ends_with_cr)
 	def settle():
@@ -2520,14 +2496,15 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	# once it is stopped, or once its output has ended; one whose stop is cut short stays tracked, as a command does:
 	# registered again, so the exit hook reaches it too. ( Its output may end just as one lands: what it left running
 	# is then sent SIGTERM all the same )
+	# where the timeout's 'Timeout!' goes ( see below )
+	marker_at = None
 	try:
 		if draining:
 			# tracked as draining before it leaves the live registry ( a Ctrl-C between the two would leave it in neither )
 			_draining[proc] = pgid
 		elif interrupted is None:
-			# a stop or the timeout, the note in the try too ( a Ctrl-C as append() returns would leave it unsignalled )
 			if reason == 'timeout':
-				task.stderr.append('Timeout!')
+				marker_at = len(task.stderr)
 			_stop_command(proc, pgid, quiet)
 		_unregister(proc)
 		task.returncode = _poll(proc)
@@ -2542,7 +2519,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				# it is raised
 				reason, interrupted = 'stop', e
 			if reason == 'timeout':
-				task.stderr.append('Timeout!')
+				marker_at = len(task.stderr)
 			if reason is not None:
 				_stop_command(proc, pgid, quiet)
 	except BaseException:
@@ -2555,6 +2532,12 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	_join_all(readers, None if reason is None else 1)
 	if reason == 'timeout':
 		task.returncode = 124
+		# put in once the readers are done, so a reader replacing its '\r' line never takes it; where the timeout found
+		# the output, so what the command printed as it was stopped comes after it. A reader still alive ( something
+		# that escaped the kill holds its stream open ) keeps writing to the list it had, which the task no longer holds
+		if _any_alive(readers):
+			task.stderr = list(task.stderr)
+		task.stderr.insert(marker_at, 'Timeout!')
 	elif task.returncode is None:
 		# process been killed via sigkill or similar without a normal exit code
 		if task.stderr and task.stderr[-1].strip().startswith('Ctrl C detected, Emergency Stop!'):

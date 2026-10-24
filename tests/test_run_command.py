@@ -1,3 +1,4 @@
+import sys
 import time
 
 import pytest
@@ -95,6 +96,18 @@ def test_timeout_marker_kept_with_progress_line_on_stderr(progress, expected):
 	assert task.returncode == 124
 	assert "Timeout!" in task.stderr
 	assert task.stderr == expected
+
+
+@pytest.mark.slow
+def test_timeout_marker_kept_while_something_that_escaped_the_kill_still_redraws():
+	# a process in a group of its own keeps stderr open past the 1 s grace, redrawing a '\r' line after the timeout
+	writer = ("import os, sys, time\nos.setpgid(0, 0)\ntime.sleep(0.8)\n"
+		"for i in range(40):\n\tsys.stderr.write('\\r%d' % i)\n\tsys.stderr.flush()\n\ttime.sleep(0.05)\n")
+	task = run_command(["sh", "-c", '"$0" -c "$1" & exec sleep 10', sys.executable, writer], timeout=0.5, quiet=True,
+		return_object=True)
+	# ( what it redrew before the task was finalized comes after the marker )
+	assert task.returncode == 124
+	assert task.stderr[0] == "Timeout!" and task.stderr.count("Timeout!") == 1
 
 
 def test_progress_lines_on_stderr_recorded_as_before():

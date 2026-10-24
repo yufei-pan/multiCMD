@@ -380,10 +380,8 @@ seconds. Any byte counts, including a progress line redrawn with `\r` and a part
 line without a newline.
 
 On timeout, the command **and everything it started** are killed, the task's return
-code is set to `124`, and `Timeout!` is appended to its stderr, after the lines the
-command had written by then (a `\r` progress line it was still redrawing is replaced
-in place, ahead of `Timeout!`, and never replaces it). `timeout=0` (the default, in
-the API and on the command line) disables it.
+code is set to `124`, and `Timeout!` is appended to its stderr. `timeout=0` (the
+default, in the API and on the command line) disables it.
 
 ## Process groups and signals
 
