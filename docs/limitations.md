@@ -14,7 +14,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   gap no person can double-tap into.
 - Revisit when: someone hits it, for example a program that sends signals in bursts.
 - Approved: 2026-10-23, the user chose "Simple design (Recommended)" and "Drop _settle (Recommended)". The
-  3.6 - 3.10 part added after the 1.56 review: 2026-10-24, the user chose "Accept both (Recommended)".
+  3.6 - 3.10 part added after the 1.56 review: 2026-10-23, the user chose "Accept both (Recommended)".
 
 ### A Ctrl-C inside Popen during a serial start can orphan the command
 - Kind: known limitation
@@ -39,7 +39,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   to save 2 s.
 - Revisit when: someone hits it on a free-threaded build, or CPython fixes the poll lock.
 - Approved: 2026-10-23, the user chose "Known limitation (Recommended)". Re-worded after the 1.56 review
-  measured it: 2026-10-24, the user chose "Accept both (Recommended)".
+  measured it: 2026-10-23, the user chose "Accept both (Recommended)".
 
 ### A program's own handler exception during a serial start counts as a start failure
 - Kind: known limitation
@@ -75,7 +75,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: closing it would mean guarding every step against an interrupt at any instruction, which is what the
   machinery removed in 1.56 tried to do; the Pythons involved are past their end of life.
 - Revisit when: someone hits it on 3.6 - 3.9.
-- Approved: 2026-10-24, the user chose "Add the entry (Recommended)".
+- Approved: 2026-10-23, the user chose "Add the entry (Recommended)".
 
 ### A Ctrl-C as a lock is taken or released can leave it held
 - Kind: known limitation
@@ -83,11 +83,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   (as 3.14 takes the lock, or as 3.6 - 3.9 leave the block) leaves that lock held. For `threading`'s own locks
   the program can hang as its threads end (CPython's own). For multiCMD's: an `AsyncExecutor`'s queued commands
   never start and a later `wait()`, `run_commands()` or `cleanup()` on it blocks; with the live-output lock,
-  output from the commands stops. Only a program that catches the Ctrl-C and keeps going (an interactive
+  the next call that is not quiet hangs at its first output line ("Running command: ..."), before it starts its
+  command, and commands still running are no longer read, so one that fills its pipe stalls. Only a program that catches the Ctrl-C and keeps going (an interactive
   prompt, say) gets that far; nothing is orphaned, and the exit does not hang. Measured by the 1.56 review with
   real signals aimed at the executor's locked region: about 60% of those interrupts left the lock held on 3.14,
   0.2 - 0.5% on 3.6 - 3.9, none on 3.10 and 3.12. The same in 1.55.
 - Why: writing the acquire and `try` out by hand leaves the same gap on 3.14; only lock-free structures would
   close it, which is new machinery for a one-instruction window in a microsecond call.
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.
-- Approved: 2026-10-24, the user chose "Known limitation (Recommended)".
+- Approved: 2026-10-23, the user chose "Known limitation (Recommended)".

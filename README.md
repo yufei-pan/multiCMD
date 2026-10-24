@@ -413,7 +413,8 @@ A command is registered from the moment `Popen` returns it: a Ctrl-C that Python
 even one at a few points between the steps of a run can leave its command registered but not signalled.
 On Python 3.6-3.9 and 3.14 a Ctrl-C just as a `with` takes or releases a lock can leave it held: one of
 `threading`'s can hang the program as its threads end (CPython's own), and one of multiCMD's (an
-`AsyncExecutor`'s queue, the live output) hangs that executor or the output if the program keeps going.
+`AsyncExecutor`'s queue, the live output) hangs that executor, or the next call that is not quiet, if the
+program keeps going.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects

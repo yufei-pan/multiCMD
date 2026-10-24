@@ -116,7 +116,7 @@ _live_procs = {}
 _draining = {}
 # multiCMD takes no lock for these: each update is one dict operation and each snapshot one dict.copy(), atomic
 # with the GIL and under the dict's own lock without it. A `with lock:` on the main thread can be left holding the
-# lock by a Ctrl-C landing right after the acquire ( Python 3.6 - 3.9 and 3.14 ), which would hang kill_all() and
+# lock by a Ctrl-C landing as it is taken ( Python 3.14 ) or released ( 3.6 - 3.9 ), which would hang kill_all() and
 # the exit hook.
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
@@ -1390,7 +1390,7 @@ def _wait_all(commands, timeout):
 
 def _give_up_on(commands, quiet=False):
 	'''
-	Stop tracking the commands still running after a full kill sequence ( internal; see _kill_commands )
+	Stop tracking the commands not seen to exit after a full kill sequence ( internal; see _kill_commands )
 	One no signal stops ( in uninterruptible sleep, or not ours to signal: EPERM ) would otherwise stay registered for
 	good, and cost every later kill_all() and the exit their full 2 s. It is dropped, its pid named on stderr unless
 	quiet or the run that started it was quiet ( see _execute: kill_all() and the exit hook know no quiet of their own ).
@@ -1415,14 +1415,14 @@ def _kill_commands(commands, first_signal, quiet=False):
 	members and up to 1s more. Every signal goes to the whole process group, and each step goes to
 	every command before waiting, so the total stays near 2s however many commands there are.
 	Windows: terminate(), up to 1s, kill(), up to 1s.
-	A command still running after all that is no longer tracked ( see _give_up_on ), and one that is reaped leaves
+	A command not seen to exit after all that is no longer tracked ( see _give_up_on ), and one that is reaped leaves
 	the registry, as its own call has it do once it is reaped ( one whose call has gone would otherwise cost every
 	later kill_all() a look ).
 
 	@params:
 		commands: ( Popen, process group id | None ) pairs
 		first_signal: The first signal to send ( POSIX only )
-		quiet: Whether to say nothing of a command that is still running after all that
+		quiet: Whether to say nothing of a command not seen to exit after all that
 	'''
 	commands = list(commands)
 	if not commands:
