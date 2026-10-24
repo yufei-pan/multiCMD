@@ -26,13 +26,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Python code can raise.
 - Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)".
 
-### A jammed Popen lock slows the stop and the exit by about 2 s
+### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
 - What the operator sees: a Ctrl-C landing in the few bytecodes of CPython's `Popen.poll()` between its
   lock's `acquire(False)` and its `try`, during a serial run, leaves that lock held. The stop takes about 2 s
-  longer and, unless the run was quiet, says the command's pid "is still running after SIGKILL: no longer
-  tracked", though it has exited ( its zombie stays until the program exits ). The task is recorded as -1 and
-  nothing keeps running; the exit is not slowed. 1.55 measured it at 1-3% of Ctrl-Cs on free-threaded builds; it
+  longer and, unless the run was quiet, says the command's pid was "not seen to exit 1 s after SIGKILL: no
+  longer tracked", though it has exited ( its zombie stays until the program exits ). The task is recorded as -1
+  and nothing keeps running; the exit is not slowed, unless a second Ctrl-C left the command registered. 1.55 measured it at 1-3% of Ctrl-Cs on free-threaded builds; it
   is rarer with the GIL.
 - Why: recovering took about 114 lines (`_peek`, `_inside*`, `_exit_code`) reaching into CPython's internals,
   to save 2 s.

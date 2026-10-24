@@ -217,7 +217,7 @@ def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, cap
 			multiCMD._kill_running_at_exit()
 			assert time.monotonic() - started < 0.5
 		err = capfd.readouterr().err
-		assert err.count(f'pid {proc.pid} is still running') == (0 if quiet else 1), err
+		assert err.count(f'pid {proc.pid} not seen to exit') == (0 if quiet else 1), err
 	finally:
 		multiCMD._live_procs.pop(proc, None)
 		proc.kill()
@@ -239,7 +239,7 @@ def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, cap
 			multiCMD.kill_all()
 			assert proc not in multiCMD._live_procs and proc.poll() is None
 		# before ( fc0c782 ): "multiCMD: pid N is still running after SIGKILL: no longer tracked"
-		assert 'still running' not in capfd.readouterr().err
+		assert 'not seen to exit' not in capfd.readouterr().err
 	finally:
 		proc.kill()
 		multiCMD.join_threads(timeout=5)

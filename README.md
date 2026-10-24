@@ -393,14 +393,14 @@ it, and `mcmd` also ignores them, which every command inherits through any shell
 
 Signals sent to your program's group do not reach the commands, so multiCMD stops them itself. One
 Ctrl-C (or a SIGTERM handler's `sys.exit()`) in a call waiting on the main thread, `join_threads()`
-and `AsyncExecutor.wait()` included, stops and reports every command, skips the queued ones and
+and `AsyncExecutor.wait()` included, stops every command, skips the queued ones and
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
 commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`). At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
 multiCMD from its own threads (where Ctrl-C never arrives), can call `multiCMD.kill_all()` from its
-handler. A command still running a second after SIGKILL is no longer tracked; its pid is named on
+handler. A command not seen to exit a second after SIGKILL is no longer tracked; its pid is named on
 stderr, unless quiet.
 
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
@@ -503,7 +503,7 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   and the exit hook finish the kill. The limits below are the exceptions.
 - Once the interpreter exits, a command queued on one of multiCMD's threads that has not started fails
   with -1 ("not started: the interpreter is exiting") instead of starting and outliving the program.
-- A command still running a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the
+- A command not seen to exit a second after SIGKILL is no longer tracked, so later `kill_all()` calls and the
   exit do not wait for it again; its pid is named on stderr, unless quiet.
 - Known limits: see [Process groups and signals](#process-groups-and-signals) and
   [docs/limitations.md](docs/limitations.md).

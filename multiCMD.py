@@ -671,7 +671,8 @@ class AsyncExecutor:
 			list[threading.Thread]: The threads that are still running
 		A Ctrl-C ( or whatever a signal handler raises, as a SIGTERM handler's sys.exit() ) while it waits stops every
 		command of the executor, queued ones skipped, waits up to 5 s for them ( a second Ctrl-C ends that wait at
-		once ) and re-raises. A thread never started is a RuntimeError, as for Thread.join().
+		once ) and re-raises. A plain Thread never started is a RuntimeError, as for Thread.join(); one run_commands()
+		could not start returns at once.
 		'''
 		deadline = None if timeout is None or timeout < 0 else time.monotonic() + timeout
 		if threads is not ...:
@@ -1401,7 +1402,8 @@ def _give_up_on(commands, quiet=False):
 			continue
 		_live_procs.pop(proc, None)
 		if not quiet and not proc.__dict__.get('_multicmd_quiet'):
-			_write_error(f'multiCMD: pid {proc.pid} is still running after {"SIGKILL" if _IS_POSIX else "kill()"}: '
+			# ( not seen: a Popen lock a Ctrl-C left held hides an exit as well )
+			_write_error(f'multiCMD: pid {proc.pid} not seen to exit 1 s after {"SIGKILL" if _IS_POSIX else "kill()"}: '
 				'no longer tracked')
 
 def _kill_commands(commands, first_signal, quiet=False):
@@ -1940,7 +1942,8 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	if reason == 'timeout':
 		task.returncode = 124
 		# put in once the readers are done, so a reader replacing its '\r' line never takes it; where the timeout found
-		# the output, so what the command printed as it was stopped comes after it. A reader still alive ( something
+		# the output, so what the command printed as it was stopped comes after it ( whole lines: an unfinished last
+		# line, a prompt, is kept until its stream ends, and lands after it too ). A reader still alive ( something
 		# that escaped the kill holds its stream open ) keeps writing to the list it had, which the task no longer holds
 		if _any_alive(readers):
 			task.stderr = list(task.stderr)
@@ -2526,7 +2529,7 @@ def join_threads(threads=...,timeout=None):
 	A Ctrl-C ( or whatever a signal handler raises, as a SIGTERM handler's sys.exit() ) while it waits stops the
 	commands of the multiCMD threads it waits for ( they run in process groups of their own, so the terminal's
 	Ctrl-C did not reach them ), the ones still queued skipped, waits up to 5 s in all for them ( a second Ctrl-C
-	ends that wait at once ) and re-raises, as a waiting run_commands() does. A thread never started is a
+	ends that wait at once ) and re-raises, as a waiting run_commands() does. A plain Thread never started is a
 	RuntimeError, as for Thread.join(); one run_commands() could not start returns at once.
 
 	@params:
