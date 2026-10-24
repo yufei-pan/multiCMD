@@ -195,67 +195,6 @@ def test_a_command_still_running_stays_registered():
 		multiCMD._kill_commands([(proc, pgid)], signal.SIGKILL)
 
 
-def _jam(proc):
-	'''Leave proc's Popen lock held by nobody, as a KeyboardInterrupt right after poll()'s acquire(False) does'''
-	thread = threading.Thread(target=proc._waitpid_lock.acquire, daemon=True)
-	thread.start()
-	thread.join(5)
-	assert proc._waitpid_lock.locked()
-
-
-@pytest.mark.skipif(not multiCMD._CAN_PEEK, reason='needs os.waitid() with WNOWAIT')
-@pytest.mark.parametrize('how', ['exits', 'killed'])
-def test_a_command_whose_popen_lock_a_ctrl_c_left_held_is_still_reaped(launcher, how):
-	# ( seen on free-threaded 3.13t / 3.14t; review of round 10, finding 4 ) a Ctrl-C right after Popen.poll()'s
-	# acquire(False) of _waitpid_lock, before its try: the lock stays held, and every later poll() returns None
-	proc, pgid = multiCMD._spawn(['true'] if how == 'exits' else ['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
-	multiCMD._register(proc, pgid)
-	try:
-		_jam(proc)
-		started = time.monotonic()
-		if how == 'exits':
-			assert multiCMD._wait_all([(proc, pgid)], 5)
-			assert proc.returncode == 0
-		else:
-			multiCMD._kill_commands([(proc, pgid)], signal.SIGINT)
-			assert proc.returncode == -signal.SIGINT
-		# before ( fdc45b9's RLock: a lock left held by another thread ): None for good, every wait to its timeout
-		assert time.monotonic() - started < multiCMD._JAMMED_AFTER + 1
-		multiCMD._unregister(proc)
-		assert proc not in multiCMD._live_procs and proc.poll() == proc.returncode
-	finally:
-		multiCMD._live_procs.pop(proc, None)
-		if proc.returncode is None:
-			proc.kill()
-
-
-def test_a_signal_handler_that_stops_the_commands_inside_a_popen_wait_leaves_it_the_returncode(launcher):
-	# ( review of round 10, finding 4; probe r10probes/rlock_reenter.py ) a program's SIGTERM handler calls kill_all()
-	# ( as its docstring suggests ) and returns, landing in the main thread's Popen.wait() right after it took its
-	# lock: a reap from inside the handler leaves that wait ECHILD, and Popen records 0 for a killed command
-	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
-	multiCMD._register(proc, pgid)
-	try:
-		multiCMD._send(proc, pgid, signal.SIGTERM)
-		assert pid_gone(proc.pid)
-		real = proc._try_wait
-		seen = []
-		def try_wait(flags):
-			if not seen:
-				# what the handler does as it lands here, on the same thread
-				multiCMD.kill_all()
-				seen.append(proc.returncode)
-			return real(flags)
-		proc._try_wait = try_wait
-		proc.wait(timeout=5)
-		# before ( fdc45b9's RLock ): the handler reaped it, and the wait then recorded 0
-		assert seen == [None] and proc.returncode == -signal.SIGTERM
-	finally:
-		multiCMD._live_procs.pop(proc, None)
-		if proc.returncode is None:
-			proc.kill()
-
-
 @pytest.mark.parametrize('quiet', [False, True])
 def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, capfd, quiet):
 	# ( review of round 10, finding 7 ) one in uninterruptible sleep, or not ours to signal ( EPERM, which _send
@@ -285,26 +224,6 @@ def test_a_command_no_signal_stops_is_dropped_after_a_full_kill(monkeypatch, cap
 		proc.wait(5)
 
 
-def test_a_command_given_up_on_is_named_once_whoever_gives_up_on_it():
-	# ( review of round 11, finding 10 ) two kill_all() at once ( from two threads ) both took it from the registry's
-	# snapshot, and the "show once" guard stored proc itself, so it always said "first": the pid was named twice
-	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
-	try:
-		lines = []
-		real = multiCMD._write_error
-		multiCMD._write_error = lines.append
-		try:
-			multiCMD._give_up_on([(proc, pgid)])
-			multiCMD._give_up_on([(proc, pgid)])
-		finally:
-			multiCMD._write_error = real
-		# before ( fc0c782 ): twice
-		assert lines == [f'multiCMD: pid {proc.pid} is still running after SIGKILL: no longer tracked']
-	finally:
-		proc.kill()
-		proc.wait(5)
-
-
 @pytest.mark.skipif(not hasattr(signal, 'SIGKILL'), reason='POSIX signals')
 def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, capfd):
 	# ( review of round 11, finding 9 ) kill_all() and the exit hook passed no quiet down, so a command no signal stops
@@ -325,70 +244,3 @@ def test_kill_all_says_nothing_of_a_command_a_quiet_run_started(monkeypatch, cap
 		proc.kill()
 		multiCMD.join_threads(timeout=5)
 	assert ran[0].returncode == -signal.SIGKILL
-
-
-@pytest.mark.skipif(not multiCMD._CAN_PEEK, reason='needs os.waitid() with WNOWAIT')
-def test_a_command_reaped_outside_popen_while_its_lock_is_jammed_is_recorded_as_popen_does(launcher):
-	# ( review of round 11, finding 4; probe echild_probe.py ) SIGCHLD ignored has the kernel reap the command: with
-	# its Popen lock jammed, os.waitid() then raised ECHILD and _poll() returned None for ever, so every wait ran to
-	# its timeout and every kill_all() cost 2 s
-	previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-	try:
-		proc, pgid = multiCMD._spawn(['sleep', '0.2'], subprocess.DEVNULL, subprocess.DEVNULL)
-		multiCMD._register(proc, pgid)
-		try:
-			_jam(proc)
-			# ( the kernel has reaped it by then )
-			assert pid_gone(proc.pid)
-			time.sleep(0.3)
-			started = time.monotonic()
-			# before ( fc0c782 ): False after 2 s, returncode None
-			assert multiCMD._wait_all([(proc, pgid)], 2) and proc.returncode == 0
-			assert time.monotonic() - started < multiCMD._JAMMED_AFTER + 0.5
-			started = time.monotonic()
-			multiCMD.kill_all()
-			# before: still registered, and each kill_all() took 2 s or more
-			assert proc not in multiCMD._live_procs and time.monotonic() - started < 0.5
-		finally:
-			multiCMD._live_procs.pop(proc, None)
-	finally:
-		signal.signal(signal.SIGCHLD, previous)
-
-
-@pytest.mark.skipif(not multiCMD._CAN_PEEK, reason='needs os.waitid() with WNOWAIT')
-def test_a_poll_whose_signal_handler_runs_long_keeps_other_threads_from_reaping_its_command(launcher):
-	# ( review of round 11, finding 11 ) a signal handler ( kill_all(), some 2 s ) lands in the main thread's poll() as
-	# it holds the Popen lock: another thread's _poll() saw the lock held past _JAMMED_AFTER and reaped the command,
-	# and the interrupted poll() then got ECHILD, which Popen records as returncode 0
-	proc, pgid = multiCMD._spawn(['sleep', '30'], subprocess.DEVNULL, subprocess.DEVNULL)
-	multiCMD._register(proc, pgid)
-	try:
-		multiCMD._send(proc, pgid, signal.SIGTERM)
-		assert pid_gone(proc.pid)
-		other = []
-		real_lock = proc._waitpid_lock
-		class Lock:
-			'''The Popen lock, whose first acquire runs what a signal handler landing right after it would'''
-			def acquire(self, *args):
-				got = real_lock.acquire(*args)
-				if got and not other:
-					# the handler, inside Popen's own poll(), the lock held: meanwhile another thread waits for the command
-					thread = threading.Thread(target=lambda: other.append(multiCMD._wait_all([(proc, pgid)], multiCMD._JAMMED_AFTER + 0.5)))
-					thread.start()
-					thread.join(10)
-				return got
-			def release(self):
-				real_lock.release()
-			def locked(self):
-				return real_lock.locked()
-			__enter__ = acquire
-			def __exit__(self, *exc_info):
-				self.release()
-		proc._waitpid_lock = Lock()
-		# before ( fc0c782 ): the other thread reaped it ( [True] ), and the interrupted poll() recorded 0
-		assert multiCMD._poll(proc) == -signal.SIGTERM and other == [False]
-		assert not proc._multicmd_inside
-	finally:
-		multiCMD._live_procs.pop(proc, None)
-		if proc.returncode is None:
-			proc.kill()

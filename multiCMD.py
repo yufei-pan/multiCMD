@@ -1558,122 +1558,6 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	return proc, (proc.pid if grouped else None)
 
-# whether an exited command can be looked at without reaping it ( os.waitid() with WNOWAIT; see _poll )
-_CAN_PEEK = _IS_POSIX and hasattr(os, 'waitid') and hasattr(os, 'WNOWAIT')
-# how long poll() must have been kept from an exited command by its Popen's lock before multiCMD reaps it ( see _poll )
-_JAMMED_AFTER = 0.5
-
-def _exit_code(status):
-	'''A waitpid() status as Popen's returncode: the exit code, or -N after a death by signal N ( internal )'''
-	if os.WIFSIGNALED(status):
-		return -os.WTERMSIG(status)
-	return os.WEXITSTATUS(status)
-
-def _in_subprocess():
-	'''Whether this thread runs inside subprocess's own code, further up its stack ( internal; see _poll )'''
-	if not hasattr(sys, '_getframe'):
-		return True
-	frame = sys._getframe(1)
-	while frame is not None:
-		if frame.f_globals.get('__name__') == 'subprocess':
-			return True
-		frame = frame.f_back
-	return False
-
-def _inside(proc, call, *args):
-	'''
-	call(*args): a call of proc's that may take its Popen lock ( poll(), send_signal() ), with this thread marked as
-	inside it meanwhile, so that _poll() on another thread knows the lock is held for real ( internal; see _poll )
-	The mark is one dict entry per call, set inside the try that removes it: an interrupt before it leaves none. Only
-	an interrupt that Python raises inside the finally, before its removal runs, can leave one behind: that Popen is
-	then never reaped behind a jammed lock by other threads, only by this one ( which ignores its own marks: while
-	it runs here, it is inside no such call of its own, unless a handler of its runs inside one, which
-	_in_subprocess() sees ).
-	'''
-	marks = proc.__dict__.setdefault('_multicmd_inside', {})
-	token = object()
-	try:
-		marks[token] = threading.get_ident()
-		return call(*args)
-	finally:
-		marks.pop(token, None)
-
-def _inside_elsewhere(proc):
-	'''Whether a thread other than this one is inside a call of proc's that may take its Popen lock ( internal; see _inside )'''
-	me = threading.get_ident()
-	# ( a loop, not any() over a generator: see _any_alive )
-	for ident in proc.__dict__.get('_multicmd_inside', {}).copy().values():
-		if ident != me:
-			return True
-	return False
-
-def _peek(proc):
-	'''
-	Whether a command has exited, looked at without reaping it ( os.waitid() with WNOWAIT ) ( internal )
-	@returns:
-		None | str: None while it runs ( or where it cannot be looked at so ), 'exited' once it waits to be reaped,
-			'gone' when it is no longer a child this process can reap ( ECHILD: reaped already, by Popen or outside it )
-	'''
-	if not _CAN_PEEK:
-		return None
-	try:
-		return None if os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None else 'exited'
-	except OSError:
-		return 'gone'
-
-def _poll(proc):
-	'''
-	proc.poll(), and the command reaped all the same once a jammed Popen lock keeps poll() from it ( internal )
-
-	Popen.poll() and wait(timeout) take the Popen's _waitpid_lock with acquire(False), and only then enter the try
-	that releases it. A KeyboardInterrupt landing in between ( on the main thread, which polls a serial run's command
-	over and over ) leaves the lock held for good: poll() then returns None for ever, and the command would never be
-	reaped, stay registered, and cost every wait for it its full timeout ( seen on free-threaded 3.13t and 3.14t, in
-	1-3 % of the Ctrl-Cs of the start stress test; the window exists on every CPython ). So a command that has exited
-	( os.waitid() with WNOWAIT looks without reaping ) while poll() could not take that lock for _JAMMED_AFTER seconds
-	is reaped here, with os.waitpid(), and its returncode set; poll() and wait() look at returncode before the lock.
-	Never while this thread runs inside subprocess's own code further up its stack: a signal handler that calls
-	kill_all() as it lands in an interrupted Popen.wait() or poll(), which holds that lock and is about to reap, would
-	leave it ECHILD, which Popen records as returncode 0. Nor while another thread is inside a poll() or send_signal()
-	multiCMD made ( see _inside ): one whose signal handler runs as it holds the lock ( kill_all() takes 2 s ) is
-	about to reap the command as well. multiCMD calls nothing else of Popen's that takes the lock, and nothing else
-	has its commands' Popens, so a lock held that long by no such call is jammed; a thread that does hold it for real
-	finds the returncode set as it goes on. The lock itself is only looked at.
-	A command reaped outside Popen ( SIGCHLD ignored, which has the kernel reap it; a waitpid() of the program's
-	own ) is no longer a child to reap ( ECHILD ): poll() records returncode 0 then, as its status is lost, and so
-	does this, once the lock has kept poll() from it for _JAMMED_AFTER seconds.
-	'''
-	returncode = _inside(proc, proc.poll)
-	if returncode is not None or not _CAN_PEEK:
-		return returncode
-	lock = getattr(proc, '_waitpid_lock', None)
-	if lock is None or not lock.locked():
-		return None
-	state = _peek(proc)
-	if state is None:
-		# still running
-		return None
-	now = time.monotonic()
-	# ( since when poll() is kept from it: an exited command whose lock is free is reaped by poll() itself )
-	if now - proc.__dict__.setdefault('_multicmd_unreaped_since', now) < _JAMMED_AFTER or _in_subprocess() \
-		or _inside_elsewhere(proc):
-		# ( 'gone': reaped meanwhile by whoever holds the lock, which sets returncode as it goes on )
-		return proc.returncode
-	if state == 'exited':
-		try:
-			pid, status = os.waitpid(proc.pid, os.WNOHANG)
-		except ChildProcessError:
-			state = 'gone'
-		except OSError:
-			return proc.returncode
-		else:
-			if pid == proc.pid and proc.returncode is None:
-				proc.returncode = _exit_code(status)
-	if state == 'gone' and proc.returncode is None:
-		# reaped outside Popen: its status is lost, and Popen records 0 then ( Popen._internal_poll, on ECHILD )
-		proc.returncode = 0
-	return proc.returncode
-
 def _stdout_isatty():
 	'''
 	Whether sys.stdout is a terminal ( internal )
@@ -1768,7 +1652,7 @@ def _unregister(proc):
 	Stop tracking a command once it is reaped ( internal ); one still running ( a kill cut short did not reach it ) stays
 	tracked, until a full kill sequence has been tried on it ( see _give_up_on )
 	'''
-	if _poll(proc) is None:
+	if proc.poll() is None:
 		return
 	_live_procs.pop(proc, None)
 
@@ -1785,9 +1669,9 @@ def _send(proc, pgid, sig):
 				return
 			except ProcessLookupError:
 				pass
-		if _poll(proc) is None:
+		if proc.poll() is None:
 			# ( send_signal() polls first, from Python 3.9 )
-			_inside(proc, proc.send_signal, sig)
+			proc.send_signal(sig)
 	except OSError:
 		# already gone, or not ours to signal ( a root command under sudo: sudo relays the signal )
 		pass
@@ -1798,11 +1682,11 @@ def _group_alive(proc, pgid):
 	A group that does not exist ( yet: see _send ) is gone only once the command itself is.
 	'''
 	if pgid is None:
-		return _poll(proc) is None
+		return proc.poll() is None
 	try:
 		os.killpg(pgid, 0)
 	except ProcessLookupError:
-		return _poll(proc) is None
+		return proc.poll() is None
 	except OSError:
 		pass
 	return True
@@ -1814,12 +1698,12 @@ def _wait_all(commands, timeout):
 		bool: Whether all of them exited
 	'''
 	deadline = time.monotonic() + timeout
-	# ( Popen.wait()'s own loop, with _poll )
+	# ( Popen.wait()'s own loop )
 	delay = 0.0005
 	while True:
 		# ( a loop, not all() over a generator: see _any_alive )
 		for proc, _ in commands:
-			if _poll(proc) is None:
+			if proc.poll() is None:
 				break
 		else:
 			return True
@@ -1833,21 +1717,16 @@ def _give_up_on(commands, quiet=False):
 	'''
 	Stop tracking the commands still running after a full kill sequence ( internal; see _kill_commands )
 	One no signal stops ( in uninterruptible sleep, or not ours to signal: EPERM ) would otherwise stay registered for
-	good, and cost every later kill_all() and the exit their full 2 s. It is dropped, with a message naming its pid
-	once, unless quiet or the run that started it was quiet ( see _execute: kill_all() and the exit hook know no
-	quiet of their own ). One that has exited stays, reaped or not: whoever may reap it does ( see _poll ). Only
-	running commands are given up on: a draining one ( see _execute ) has exited, and kill_all() only reaches what it
-	left running.
+	good, and cost every later kill_all() and the exit their full 2 s. It is dropped, its pid named on stderr unless
+	quiet or the run that started it was quiet ( see _execute: kill_all() and the exit hook know no quiet of their own ).
+	Only running commands are given up on: a draining one ( see _execute ) has exited, and kill_all() only reaches
+	what it left running.
 	'''
 	for proc, _ in commands:
-		if _poll(proc) is not None or _peek(proc) is not None:
+		if proc.poll() is not None:
 			continue
 		_live_procs.pop(proc, None)
-		if quiet or proc.__dict__.get('_multicmd_quiet'):
-			continue
-		# ( once, whoever gives up on it at the same time: setdefault() says who stored first )
-		mine = object()
-		if proc.__dict__.setdefault('_multicmd_given_up', mine) is mine:
+		if not quiet and not proc.__dict__.get('_multicmd_quiet'):
 			_write_error(f'multiCMD: pid {proc.pid} is still running after {"SIGKILL" if _IS_POSIX else "kill()"}: '
 				'no longer tracked')
 
@@ -1861,8 +1740,8 @@ def _kill_commands(commands, first_signal, quiet=False):
 	every command before waiting, so the total stays near 2s however many commands there are.
 	Windows: terminate(), up to 1s, kill(), up to 1s.
 	A command still running after all that is no longer tracked ( see _give_up_on ), and one that is reaped leaves
-	the registry, as its own call has it do once it is reaped ( a command recorded as reaped outside Popen, see
-	_poll, or one whose call has gone, would otherwise cost every later kill_all() a look ).
+	the registry, as its own call has it do once it is reaped ( one whose call has gone would otherwise cost every
+	later kill_all() a look ).
 
 	@params:
 		commands: ( Popen, process group id | None ) pairs
@@ -1874,14 +1753,14 @@ def _kill_commands(commands, first_signal, quiet=False):
 		return
 	if not _IS_POSIX:
 		for proc, _ in commands:
-			if _poll(proc) is None:
+			if proc.poll() is None:
 				try:
 					proc.terminate()
 				except OSError:
 					pass
 		if not _wait_all(commands, 1):
 			for proc, _ in commands:
-				if _poll(proc) is None:
+				if proc.poll() is None:
 					try:
 						proc.kill()
 					except OSError:
@@ -2049,7 +1928,7 @@ def _watch(task, proc, timeout):
 		None | str: None when it exited, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
 	'''
 	sleep_time = 1.0e-7 # 100 nanoseconds
-	while _poll(proc) is None:  # while the process is still running
+	while proc.poll() is None:  # while the process is still running
 		if task.stop:
 			return 'stop'
 		if timeout > 0 and time.monotonic() - task._last_output > timeout:
@@ -2507,7 +2386,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 				marker_at = len(task.stderr)
 			_stop_command(proc, pgid, quiet)
 		_unregister(proc)
-		task.returncode = _poll(proc)
+		task.returncode = proc.poll()
 		if draining:
 			# the command exited, but something it started may still hold its output open: keep reading,
 			# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
