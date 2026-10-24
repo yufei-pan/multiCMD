@@ -33,8 +33,6 @@ COMMIT_DATE = '2026-10-23'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
-# unused: multiCMD 1.54 took it around __running_threads. Kept only for code that imported it; never take it
-__running_threads_lock = threading.Lock()
 # fire-and-forget threads append themselves here when done, so they get joined and dropped from __running_threads
 __finished_threads = collections.deque()
 # before 3.9.8, and on 3.10.0, a Thread.join() that a Ctrl-C interrupts right after it took the thread's tstate lock
@@ -102,12 +100,10 @@ _PGROUP_EXEC = (
 # blocked while a command starts and inherited by it: reading the terminal from a background
 # process group then fails with EIO instead of the kernel stopping the command
 _TTY_SIGNALS = {signal.SIGTTIN, signal.SIGTTOU} if _IS_POSIX else set()
-# the C function behind signal.pthread_sigmask(): it sets the calling thread's mask, then runs the Python signal
-# handlers ( PyErr_CheckSignals(), for a signal it may have unblocked ), so a Ctrl-C can come out of the call itself
-# with the new mask set and the old one never returned ( see _spawn_process, which reads the old one with a call that
-# changes nothing ). The Python wrapper adds another such point: it converts that result in a generator expression,
-# where a Ctrl-C lands with the mask set and the old one lost. None without one ( not POSIX, or a platform that has
-# no pthread_sigmask )
+# the C function behind signal.pthread_sigmask(): a Ctrl-C can come out of it with the new mask set and the old one
+# never returned ( it runs the Python signal handlers before it returns ), and the Python wrapper adds another such
+# point, where it turns the result into a set ( see _spawn_process ). None without one ( not POSIX, or a platform that
+# has no pthread_sigmask )
 try:
 	import _signal
 except ImportError:
@@ -122,8 +118,6 @@ _draining = {}
 # with the GIL and under the dict's own lock without it. A `with lock:` on the main thread can be left holding the
 # lock by a Ctrl-C landing right after the acquire ( Python 3.6 - 3.9 and 3.14 ), which would hang kill_all() and
 # the exit hook.
-# unused: multiCMD 1.54 took it around _live_procs and _draining. Kept only for code that imported it; never take it
-_live_procs_lock = threading.Lock()
 # set once the "cannot use a pty" warning has been printed
 _PTY_WARNED = False
 # set by the exit hook: from then on a thread other than the main one starts no command asked for before it, and one
@@ -335,9 +329,6 @@ class _Thread(threading.Thread):
 def _any_alive(threads):
 	'''
 	Whether any of the threads is alive ( internal )
-	A loop, not any() over a generator expression: a generator left suspended ( any() returns at the first True ) is
-	closed as it is dropped, by GeneratorExit thrown into its frame, and an interrupt Python raises there is dropped
-	by CPython as unraisable. The waits that use this run on the main thread, where a Ctrl-C would be lost so.
 	'''
 	for thread in threads:
 		if thread.is_alive():
@@ -1078,9 +1069,6 @@ def _search_dirs(env):
 def _file_named(command, dirs, start=0):
 	'''
 	The first regular file by that name in dirs[start:] ( internal ); '' is the current directory
-	A plain function, not a generator: a generator left suspended is closed as it is dropped ( when the spawn returns
-	from the loop over it ), and an interrupt Python raises inside that close is dropped by CPython as unraisable,
-	so a Ctrl-C landing there was lost ( seen with the start stress test on 3.13t ).
 	@returns:
 		( int, str ) | ( None, None ): Its index in dirs and its path, or None without one
 	'''
@@ -1233,18 +1221,13 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 		grouped = False
 	if _sigmask is None:
 		return _popen(argv, started, grouped, **kwargs)
-	# the mask as it is, read with a call that changes nothing ( an interrupt raised from inside it or as it returns
-	# leaves nothing to undo ): the block is in the try, as it can raise one with the mask already set ( see _sigmask ).
-	# From the block on, an interrupt landing anywhere leaves it set back, but for a second one landing as the finally
-	# begins, the first raised in the try, on Python 3.6 - 3.10: those raise one there, before the restoring call ( 3.10
-	# also at a conditional jump taken, 3.6 - 3.9 at nearly any instruction ). From 3.11 Python raises one only as a call
-	# begins or returns, or on a loop's way back. The restoring call raises one only once the mask is back
+	# the mask as it is, read with a call that changes nothing; the block is in the try, as a Ctrl-C can come out of it
+	# with the mask already set ( see _sigmask )
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
 	try:
 		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
 		command = _popen(argv, started, grouped, **kwargs)
-		# ( here too: on Python 3.6 - 3.9 an interrupt can be raised between the end of a try and its finally, which
-		# then never runs )
+		# ( here too: Python 3.6 - 3.9 can raise a Ctrl-C between the end of a try and its finally, which then never runs )
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
 		_sigmask(signal.SIG_SETMASK, old_mask)
@@ -1393,7 +1376,6 @@ def _wait_all(commands, timeout):
 	# ( Popen.wait()'s own loop )
 	delay = 0.0005
 	while True:
-		# ( a loop, not all() over a generator: see _any_alive )
 		for proc, _ in commands:
 			if proc.poll() is None:
 				break
