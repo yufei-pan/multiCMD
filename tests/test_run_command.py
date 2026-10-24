@@ -78,6 +78,38 @@ def test_timeout_returncode_preserved_after_sigint_handler_stderr():
 
 
 @pytest.mark.slow
+@pytest.mark.parametrize("progress, expected", [
+	# a progress line the command was redrawing when it stalled: the reader's last line replaces its own, not 'Timeout!'
+	("\\r12345 bytes copied", ["12345 bytes copied", "Timeout!"]),
+	("\\r1 bytes\\r12 bytes\\r123 bytes", ["123 bytes", "Timeout!"]),
+	("line\\r12345 bytes copied", ["12345 bytes copied", "Timeout!"]),
+	("\\r12345 bytes copied\\r", ["12345 bytes copied", "Timeout!"]),
+])
+def test_timeout_marker_kept_with_progress_line_on_stderr(progress, expected):
+	task = run_command(
+		["sh", "-c", "printf '%s' >&2; exec sleep 10" % progress],
+		timeout=0.5,
+		quiet=True,
+		return_object=True,
+	)
+	assert task.returncode == 124
+	assert "Timeout!" in task.stderr
+	assert task.stderr == expected
+
+
+def test_progress_lines_on_stderr_recorded_as_before():
+	task = run_command(
+		["python3", "-c", "import sys\n"
+			"sys.stderr.write('\\r1 bytes\\r12 bytes\\r123 bytes\\ndone\\n')\n"
+			"sys.stderr.flush()\n"],
+		quiet=True,
+		return_object=True,
+	)
+	assert task.returncode == 0
+	assert task.stderr == ["123 bytes", "done"]
+
+
+@pytest.mark.slow
 def test_wait_for_return_false():
 	task = run_command(
 		["sleep", "0.4"],

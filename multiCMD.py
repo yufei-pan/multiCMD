@@ -1168,8 +1168,9 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	Read one output stream of a command into target, showing complete lines live ( internal )
 
 	A '\n' ends a line. A '\r' ends a line that the next line replaces, like a terminal does, both
-	in target and on screen. Chunks without '\r' are split in one pass; chunks with '\r' are
-	handled separator by separator. Every chunk refreshes task._last_output, which drives the
+	in target and on screen. The line it replaces is its own, so a line another writer appended to target
+	meanwhile ( the timeout's 'Timeout!' ) stays. Chunks without '\r' are split in one pass; chunks with '\r'
+	are handled separator by separator. Every chunk refreshes task._last_output, which drives the
 	inactivity timeout. Once the task is finalized the reader keeps draining but records nothing.
 	The reader closes its stream when done.
 
@@ -1180,13 +1181,36 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 		decor: ( prefix, color start, color end ) for displayed lines
 		quiet: Whether to skip showing the lines
 	'''
+	# the '\r' line this reader last put in target, the one the next line replaces, and where it was put
+	redrawn = redrawn_at = None
 	def emit(lines, replace_first, ends_with_cr):
+		nonlocal redrawn, redrawn_at
 		if task._finalized:
 			return
 		texts = [line.decode('utf-8', errors='backslashreplace') for line in lines]
-		if replace_first:
-			target.pop()
-		target.extend(texts)
+		rest = texts
+		index = -1
+		if replace_first and redrawn is not None:
+			# ( replaces its own line, not target's last entry: the timeout's 'Timeout!' and the like are appended to the
+			# same list meanwhile. It is found where it was put, or else from the end by identity ( an empty or
+			# one-character line is the same str as any other such line: hence the place first ). Nothing inserts or
+			# removes entries, so the place found stays the place, and each list operation is atomic with the GIL and
+			# under the list's own lock without it )
+			index = redrawn_at
+			if index >= len(target) or target[index] is not redrawn:
+				index = len(target) - 1
+				while index >= 0 and target[index] is not redrawn:
+					index -= 1
+			if index >= 0:
+				target[index] = texts[0]
+				rest = texts[1:]
+		if index >= 0:
+			redrawn_at = index
+		else:
+			# ( where its line goes, unless another writer appends first: the search from the end then finds it )
+			redrawn_at = len(target)
+		target.extend(rest)
+		redrawn = texts[-1] if ends_with_cr else None
 		if not quiet:
 			_display.lines(texts, decor, replace_first, ends_with_cr)
 	def settle():
