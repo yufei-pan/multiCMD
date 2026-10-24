@@ -423,7 +423,7 @@ def _give_up_on(commands,quiet=False):
 	for(proc,_)in commands:
 		if proc.poll()is not None:continue
 		_live_procs.pop(proc,None)
-		if not quiet and not proc.__dict__.get('_multicmd_quiet'):_write_error(f"multiCMD: pid {proc.pid} is still running after {'SIGKILL'if _IS_POSIX else'kill()'}: no longer tracked")
+		if not quiet and not proc.__dict__.get('_multicmd_quiet'):_write_error(f"multiCMD: pid {proc.pid} not seen to exit 1 s after {'SIGKILL'if _IS_POSIX else'kill()'}: no longer tracked")
 def _kill_commands(commands,first_signal,quiet=False):
 	commands=list(commands)
 	if not commands:return
