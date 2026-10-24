@@ -352,11 +352,20 @@ def _expand_ranges_fast(inStr,variables=None):
 	segments.append([inStr[pos:]]);return[''.join(parts)for parts in itertools.product(*segments)]
 _expand_ranges=_expand_ranges_fast
 def _read_stream(stream,target,task,decor=('','',''),quiet=False):
+	redrawn=redrawn_at=None
 	def emit(lines,replace_first,ends_with_cr):
+		nonlocal redrawn,redrawn_at
 		if task._finalized:return
-		texts=[line.decode('utf-8',errors='backslashreplace')for line in lines]
-		if replace_first:target.pop()
-		target.extend(texts)
+		texts=[line.decode('utf-8',errors='backslashreplace')for line in lines];rest=texts;index=-1
+		if replace_first and redrawn is not None:
+			index=redrawn_at
+			if index>=len(target)or target[index]is not redrawn:
+				index=len(target)-1
+				while index>=0 and target[index]is not redrawn:index-=1
+			if index>=0:target[index]=texts[0];rest=texts[1:]
+		if index>=0:redrawn_at=index
+		else:redrawn_at=len(target)
+		target.extend(rest);redrawn=texts[-1]if ends_with_cr else None
 		if not quiet:_display.lines(texts,decor,replace_first,ends_with_cr)
 	def settle():
 		if not quiet and not task._finalized:_display.settle()
