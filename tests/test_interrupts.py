@@ -129,7 +129,7 @@ def _left_running(before, wait=6.0):
 		time.sleep(0.02)
 
 
-# on Python 3.6 - 3.9 and 3.14 a Ctrl-C right after a C lock's acquire in a `with lock:` leaves the lock held, and
+# on Python 3.6 - 3.9 and 3.14 a Ctrl-C at one instruction of a `with lock:` can leave the lock held, and
 # Thread.start() takes threading's own _active_limbo_lock so: every thread then hangs as it ends ( CPython's own, see
 # the README ). The stress test below keeps its Ctrl-Cs out of the output readers' Thread.start() there: one that would
 # land inside it is taken right after it
@@ -553,8 +553,8 @@ def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(command):
 	# ( matrix of round 12, finding 4 ) one KeyboardInterrupt at each call, return and C-call return of a serial run in
 	# turn, in every frame of the main thread ( subprocess's, os's ... ): run_command() raises it every time, for a
 	# command that runs and for one that is not found. It found a Ctrl-C that Thread.start() turns into RuntimeError on
-	# 3.12 ( see _Thread.start ). threading's own frames are left out where a Ctrl-C right after a `with lock:` acquire
-	# leaves the lock held ( 3.6 - 3.9, 3.14: CPython's own, see the README )
+	# 3.12 ( see _Thread.start ). threading's own frames are left out where a Ctrl-C at one instruction of a `with lock:`
+	# can leave the lock held ( 3.6 - 3.9, 3.14: CPython's own, see the README )
 	skipped = {threading.__file__} if _WITH_MAY_JAM else set()
 	def counted(frame, event):
 		return frame.f_code.co_filename not in skipped
