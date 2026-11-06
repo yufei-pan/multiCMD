@@ -66,12 +66,19 @@ def test_executor_stop_kills_grandchildren_promptly():
 	assert pid_gone(int(task.stdout[0]))
 
 
-def test_timing_fields():
+def test_timing_fields(tmp_path):
+	# no timing margin: the command runs until the test says so, and the test says so only once start_time is set
+	go = tmp_path / 'go'
 	t0 = time.time()
-	task = run_command(['sleep', '0.2'], quiet=True, return_object=True)
+	task = run_commands([['sh', '-c', 'until [ -e "$0" ]; do sleep 0.01; done', str(go)]], quiet=True, return_object=True, wait_for_return=False)[0]
+	deadline = time.monotonic() + 30
+	while task.start_time is None and time.monotonic() < deadline:
+		time.sleep(0.01)
+	during = time.time()
+	go.touch()
+	multiCMD.join_threads()
 	t1 = time.time()
-	# no timing margin: both stamps lie within the call, whatever the machine's load
-	assert t0 <= task.start_time <= task.end_time <= t1
+	assert t0 <= task.start_time <= during <= task.end_time <= t1
 	assert task.duration == task.end_time - task.start_time
 	assert multiCMD.Task(['x']).duration is None
 

@@ -823,7 +823,7 @@ def _sh_status(path, command):
 
 
 # multiCMD does as dash: a fifo in PATH, or a script whose interpreter is missing, is not found ( 127 ). bash as /bin/sh
-# finds the file and says it cannot be run ( 126 on bash before 5.2, 127 from 5.2 ): the tests only check that sh does
+# finds the file and says it cannot be run ( 126, and 127 for a missing interpreter from bash 5.2 ): the tests only check that sh does
 # not run it either, so the exact value of sh's own code is not pinned
 
 

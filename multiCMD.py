@@ -54,7 +54,7 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
 # Not preexec_fn, tried and measured ( it would save the wrapper's interpreter start ): on 3.6 the forked child frees
 # the other threads' top frames, so the destructors of their locals run in the child and flush the buffers it
-# duplicated, writing a caller's open file twice. On 3.7 - 3.9 preexec_fn runs the at-fork hooks, Python code in the
+# duplicated, writing a caller's open file twice. On 3.7 - 3.10 preexec_fn runs the at-fork hooks, Python code in the
 # parent: a Ctrl-C at the start of logging's _releaseLock can leave its lock held, and every later command started on
 # another thread hangs on it.
 # Not a new session ( setsid ) either: that would hide the terminal from sudo.
