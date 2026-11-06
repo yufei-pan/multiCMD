@@ -712,14 +712,26 @@ def test_the_wrapper_does_not_unset_each_variable_it_reads():
 	# unsetting one is a scan of the whole environment: N variables would cost N**2
 	assert 'SIGXFZ' not in multiCMD._PGROUP_EXEC and '.pop(' not in multiCMD._PGROUP_EXEC
 	# ( Python before 3.9 calls os.environb.unsetenv, 3.9+ the module's os.unsetenv )
-	code = ("import os, sys\nos.environb.unsetenv = os.unsetenv = lambda *a: sys.exit(99)\n"
+	code = ("import os, posix, sys\nos.environb.unsetenv = os.unsetenv = lambda *a: sys.exit(99)\n"
 		"def execve(f, a, e):\n\tprint(sorted(e.items()))\n\tsys.exit(0)\n"
-		"os.execve = execve\nexec(%r)" % multiCMD._PGROUP_EXEC)
+		"posix.execve = execve\nexec(%r)" % multiCMD._PGROUP_EXEC)
 	env = {'PATH': os.environ['PATH'], '_MULTICMD_ENV_0': 'A=1', '_MULTICMD_ENV_1': 'B=x=y'}
 	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, '2', 'true'], env=env,
 		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
 	assert proc.returncode == 0, proc.stderr
 	assert proc.stdout.strip() == "[(b'A', b'1'), (b'B', b'x=y')]"
+
+
+@pytest.mark.parametrize('count', ['-', '0'], ids=['plain', 'environment'])
+def test_the_wrapper_starts_nothing_but_built_in_modules(count):
+	# every command on Python < 3.11 pays for what the wrapper imports: os and signal ( with enum ) double its cost
+	code = ("import posix, sys\nbefore = set(sys.modules)\n"
+		"def run(*a):\n\tprint(sorted(set(sys.modules) - before))\n\tsys.exit(0)\n"
+		"posix.execv = posix.execve = run\nexec(%r)" % multiCMD._PGROUP_EXEC)
+	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, count, 'sh'], env={'PATH': '/usr/bin:/bin'},
+		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	assert proc.returncode == 0, proc.stderr
+	assert proc.stdout.strip() == '[]'
 
 
 def test_tasks_that_never_started_do_not_keep_their_environment():

@@ -52,7 +52,11 @@ _IS_POSIX = os.name == 'posix'
 # Popen(process_group=) exists from Python 3.11; older Pythons start commands through _PGROUP_EXEC
 _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
-# preexec_fn is not safe with threads, and a new session ( setsid ) would hide the terminal from sudo.
+# Not preexec_fn, tried and measured ( it would save the wrapper's interpreter start ): on 3.6 the forked child frees
+# the other threads' top frames, so the destructors of their locals run in the child and flush the buffers it
+# duplicated, writing a caller's open file twice. On 3.7 - 3.10 preexec_fn runs the at-fork hooks, Python code in the
+# parent: a Ctrl-C inside logging's _releaseLock can leave its lock held, and every later command hangs on it.
+# Not a new session ( setsid ) either: that would hide the terminal from sudo.
 # It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
 # like included ). Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
 # the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
@@ -62,36 +66,42 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # in the wrapper's environment: only a command started with '-' inherits that ( as it always has ).
 _ENV_VAR = '_MULTICMD_ENV_'
 _PGROUP_EXEC = (
-	"import os,signal,sys\n"
+	# only built-in modules: `import os, signal` is half of what the wrapper costs ( signal pulls in enum, os the path
+	# modules ), so the os helpers are spelled out for POSIX, the only place the wrapper runs
+	"import posix,_signal,sys\n"
 	# Python ignores SIGPIPE / SIGXFSZ at startup and an ignored signal survives exec; give the command the defaults
 	"for n in ('SIGPIPE','SIGXFSZ'):\n"
-	"\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\n"
-	"os.setpgid(0,0)\n"
+	"\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\n"
+	"posix.setpgid(0,0)\n"
 	"a=sys.argv\n"
 	"c=a[2]\n"
 	"v=None\n"
 	"if a[1]!='-':\n"
 	"\ttry:\n"
 	# read, not pop: the command is started with exactly the environment built here, and every removal is a scan of the whole environment
-	"\t\tv=dict(os.environb[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n"
+	"\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n"
 	"\texcept(KeyError,ValueError):\n"
 	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\n"
 	"def x(f):\n"
-	"\tif v is None:os.execv(f,a[2:])\n"
-	"\tos.execve(f,a[2:],v)\n"
+	"\tif v is None:posix.execv(f,a[2:])\n"
+	"\tposix.execve(f,a[2:],v)\n"
+	"def g(f):\n"
+	"\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n"
+	"\texcept(OSError,ValueError):return False\n"
 	"try:\n"
-	"\tif os.sep in c:x(c)\n"
+	"\tif '/' in c:x(c)\n"
 	# a bare name: try the regular files by that name in the PATH directories in turn ( see _spawn ); the first
 	# failure other than ENOENT / ENOTDIR says why it cannot run, and without one it is not found
-	"\tp=os.environ.get('PATH') if v is None else v.get(b'PATH')\n"
+	"\tp=(posix.environ if v is None else v).get(b'PATH')\n"
 	"\tr=None\n"
-	"\tfor d in os.fsdecode(os.defpath if p is None else p).split(os.pathsep):\n"
-	"\t\tf=os.path.join(d or os.curdir,c)\n"
-	"\t\tif os.path.isfile(f):\n"
+	"\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n"
+	"\t\td=d or '.'\n"
+	"\t\tf=d+c if d.endswith('/') else d+'/'+c\n"
+	"\t\tif g(f):\n"
 	"\t\t\ttry:x(f)\n"
 	"\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n"
 	"\t\t\texcept OSError as e:r=r or e\n"
-	"\traise r or FileNotFoundError(2,os.strerror(2),c)\n"
+	"\traise r or FileNotFoundError(2,posix.strerror(2),c)\n"
 	# a plain command reports as it always has; one with an environment as Popen does ( Python 3.11+: the error with the command as given )
 	"except OSError as e:\n"
 	"\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n"
