@@ -30,7 +30,7 @@ It works both as a command-line tool and as an importable wrapper around
 pip install multiCMD
 ```
 
-This installs the module and three equivalent console entry points:
+This installs the module and three equivalent commands:
 
 ```bash
 mcmd
@@ -464,6 +464,12 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
+
+## Upgrading to 1.58 from 1.57
+
+- The `multiCMD` command is now a script file, not an entry point, so `entry_points.txt` no longer has two names that differ only in case. All three commands still work the same way. From 1.58 on, stock pip 9 on EL7 and EL8 upgrades and uninstalls multiCMD like any other pip.
+- Upgrading from 1.57 or earlier with pip 9, the pip of EL7 and EL8 (`pip3 --version`), fails with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`, and so does `pip3 uninstall multiCMD` for those releases; the installed release keeps working. Run `pip3 install -U pip` once (`--user` for a user install), then upgrade.
+- An embedded copy made by the generator now falls back from any failure to import the installed multiCMD, not only the three errors it named.
 
 ## Upgrading to 1.57 from 1.56
 

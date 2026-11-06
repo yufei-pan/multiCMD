@@ -1,0 +1,6 @@
+#!/usr/bin/env python3
+# The mixed-case command, installed as a script and not as an entry point (see setup.py).
+import sys
+from multiCMD import main
+if __name__ == '__main__':
+    sys.exit(main())

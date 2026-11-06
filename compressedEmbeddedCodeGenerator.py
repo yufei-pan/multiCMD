@@ -38,7 +38,7 @@ EMBED_TEMPLATE = '''try:
 	import {module}  # type: ignore
 	if tuple(int(x) for x in {module}.version.split('.')) < ({version_tuple}):
 		raise ImportError('{module} too old')
-except (ImportError, AttributeError, ValueError):
+except Exception:
 	import sys,types,base64,lzma   # noqa: E401
 	{module} = types.ModuleType("{module}")
 	sys.modules["{module}"] = {module}

@@ -2,6 +2,13 @@
 
 Approved known limitations and deferrals. Reviewers: read this first, and don't raise these again.
 
+### pip 9 cannot upgrade from or uninstall 1.57 and earlier
+- Kind: known limitation
+- What the operator sees: on stock EL7 and EL8 pip 9.0.3, `pip3 install -U multiCMD` from 1.57 or earlier, and `pip3 uninstall multiCMD` of those releases, fail with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`. The installed release keeps working. `pip3 install -U pip` once clears it, measured on EL7 and EL8.
+- Why: pip 9 parses the installed release's `entry_points.txt` with a parser that folds case, and those releases list `multiCMD` and `multicmd`. Nothing in a new release can change the old metadata. 1.58 on have no such pair.
+- Revisit when: EL's stock pip stops being 9, or never.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
+
 ### A second Ctrl-C microseconds after the first
 - Kind: known limitation
 - What the operator sees: two interrupts (Ctrl-Cs, or a Ctrl-C and a signal handler's exception) a few

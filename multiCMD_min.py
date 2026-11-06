@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.57'
+version='1.58'
 __version__=version
 COMMIT_DATE='2026-11-06'
 __running_threads=set()
