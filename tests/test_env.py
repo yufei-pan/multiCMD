@@ -825,6 +825,12 @@ def _sh_status(path, command):
 	return subprocess.run(['/bin/sh', '-c', command], env={'PATH': path}, stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode
 
 
+# multiCMD does as dash: a fifo in PATH, or a script whose interpreter is missing, is not found ( 127 ). bash, /bin/sh
+# on EL7 and EL8, finds the file and says it cannot be run ( 126 )
+_SH_IS_BASH = subprocess.run(['/bin/sh', '-c', 'echo "$BASH_VERSION"'], stdout=subprocess.PIPE).stdout.strip() != b''
+_SH_STATUS_OF_A_FOUND_FILE = 126 if _SH_IS_BASH else 127
+
+
 @pytest.mark.parametrize('kind', ['directory', 'fifo', 'unsearchable'])
 @pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])
 def test_a_path_entry_without_a_regular_file_by_that_name_is_not_found(launcher, tmp_path, monkeypatch, kind, how):
@@ -845,7 +851,7 @@ def test_a_path_entry_without_a_regular_file_by_that_name_is_not_found(launcher,
 		task = _run_in_path(monkeypatch, how, path, command)
 		assert task.returncode == 127 and not task._error, task.stderr
 		assert "No such file or directory: '%s'" % command in ' '.join(task.stderr)
-		assert _sh_status(path, command) == 127
+		assert _sh_status(path, command) == (_SH_STATUS_OF_A_FOUND_FILE if kind == 'fifo' else 127)
 	finally:
 		where.chmod(0o755)
 
@@ -863,7 +869,7 @@ def test_a_script_whose_interpreter_is_missing_is_not_found_whatever_path_follow
 	task = _run_in_path(monkeypatch, how, path, 'badinterp')
 	assert task.returncode == 127 and not task._error, task.stderr
 	assert "No such file or directory: 'badinterp'" in ' '.join(task.stderr)
-	assert _sh_status(path, 'badinterp') == 127
+	assert _sh_status(path, 'badinterp') == _SH_STATUS_OF_A_FOUND_FILE
 
 
 @pytest.mark.parametrize('how', ['plain', 'extra_env', 'env'])

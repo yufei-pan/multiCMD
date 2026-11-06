@@ -49,7 +49,8 @@ TTY_PROBE = textwrap.dedent(r"""
 	sys.path.insert(0, {root!r})
 	import multiCMD
 	multiCMD._HAS_PROCESS_GROUP = {native!r}
-	proc, pgid = multiCMD._spawn(['sh', '-c', 'read x </dev/tty; echo rc=$?'], subprocess.PIPE, subprocess.STDOUT)
+	# ( 2> comes second: bash reports the failed read, which is the point here, but a failed open still shows )
+	proc, pgid = multiCMD._spawn(['sh', '-c', 'read x </dev/tty 2>/dev/null; echo rc=$?'], subprocess.PIPE, subprocess.STDOUT)
 	try:
 		print('RESULT', proc.communicate(timeout=5)[0].decode().strip())
 	except subprocess.TimeoutExpired:

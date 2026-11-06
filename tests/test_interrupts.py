@@ -575,7 +575,8 @@ def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(command):
 			break
 		state['k'] += 1
 	assert returned == []
-	assert state['k'] > 100 and not multiCMD._live_procs
+	# ( the matrix went through the run: 'missing' on 3.6 has the fewest points, some 70 and 10 per PATH entry looked in )
+	assert state['k'] > 50 and not multiCMD._live_procs
 
 
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
