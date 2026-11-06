@@ -54,8 +54,9 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # exec wrapper for Python < 3.11: joins a new process group, then becomes the command.
 # Not preexec_fn, tried and measured ( it would save the wrapper's interpreter start ): on 3.6 the forked child frees
 # the other threads' top frames, so the destructors of their locals run in the child and flush the buffers it
-# duplicated, writing a caller's open file twice. On 3.7 - 3.10 preexec_fn runs the at-fork hooks, Python code in the
-# parent: a Ctrl-C inside logging's _releaseLock can leave its lock held, and every later command hangs on it.
+# duplicated, writing a caller's open file twice. On 3.7 - 3.9 preexec_fn runs the at-fork hooks, Python code in the
+# parent: a Ctrl-C at the start of logging's _releaseLock can leave its lock held, and every later command started on
+# another thread hangs on it.
 # Not a new session ( setsid ) either: that would hide the terminal from sudo.
 # It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
 # like included ). Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
@@ -78,7 +79,7 @@ _PGROUP_EXEC = (
 	"v=None\n"
 	"if a[1]!='-':\n"
 	"\ttry:\n"
-	# read, not pop: the command is started with exactly the environment built here, and every removal is a scan of the whole environment
+	# read, not pop: the command is started with exactly the environment built here
 	"\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n"
 	"\texcept(KeyError,ValueError):\n"
 	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\n"

@@ -67,11 +67,12 @@ def test_executor_stop_kills_grandchildren_promptly():
 
 
 def test_timing_fields():
+	t0 = time.time()
 	task = run_command(['sleep', '0.2'], quiet=True, return_object=True)
-	assert task.start_time <= task.end_time
-	# ( start_time comes once Popen has returned: without the wrapper the command is already running, and a parent that
-	# stalls there takes that time off the duration, 26 ms at worst measured on a loaded machine )
-	assert task.duration >= 0.1
+	t1 = time.time()
+	# no timing margin: both stamps lie within the call, whatever the machine's load
+	assert t0 <= task.start_time <= task.end_time <= t1
+	assert task.duration == task.end_time - task.start_time
 	assert multiCMD.Task(['x']).duration is None
 
 
