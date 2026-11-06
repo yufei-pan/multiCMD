@@ -27,9 +27,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.56'
+version = '1.57'
 __version__ = version
-COMMIT_DATE = '2026-10-23'
+COMMIT_DATE = '2026-11-06'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -523,11 +523,8 @@ class AsyncExecutor:
 	def _untrack(self, thread):
 		'''
 		Stop tracking a thread that never started, as it never reports itself finished ( internal )
-		Its task drops it as a finished one does: an executor task has a thread only while it runs.
 		'''
 		self._threads.pop(thread, None)
-		if thread.task is not None and thread.task.thread is thread:
-			thread.task.thread = None
 
 	def _dispatch(self):
 		'''

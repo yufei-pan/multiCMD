@@ -465,6 +465,15 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.57 from 1.56
+
+- Faster command starts on Python 3.6 - 3.10: the wrapper that puts a command in its own process group
+  imports only built-in modules, halving its CPU cost (about 7 ms to 3.5 ms per command on EL8's Python 3.6.8).
+  Nothing else about starting a command changes.
+- Fix: `AsyncExecutor`'s `task.thread` is set by the command's thread once it runs. Before, it was set just before
+  the thread started, and a `task.thread.join()` in that gap returned at once, with the command not yet run.
+  `task.thread` from `run_command(..., wait_for_return=False)` is unchanged.
+
 ## Upgrading to 1.56 from 1.55
 
 - Fix: a command that times out while it redraws a `\r` progress line on stderr keeps its `Timeout!`

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.56'
+version='1.57'
 __version__=version
-COMMIT_DATE='2026-10-23'
+COMMIT_DATE='2026-11-06'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -16,7 +16,7 @@ USE_SUDO=False
 _IS_POSIX=os.name=='posix'
 _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
 _ENV_VAR='_MULTICMD_ENV_'
-_PGROUP_EXEC="import os,signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(signal,n):signal.signal(getattr(signal,n),signal.SIG_DFL)\nos.setpgid(0,0)\na=sys.argv\nc=a[2]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(os.environb[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:os.execv(f,a[2:])\n\tos.execve(f,a[2:],v)\ntry:\n\tif os.sep in c:x(c)\n\tp=os.environ.get('PATH') if v is None else v.get(b'PATH')\n\tr=None\n\tfor d in os.fsdecode(os.defpath if p is None else p).split(os.pathsep):\n\t\tf=os.path.join(d or os.curdir,c)\n\t\tif os.path.isfile(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,os.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
+_PGROUP_EXEC="import posix,_signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\nposix.setpgid(0,0)\na=sys.argv\nc=a[2]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:posix.execv(f,a[2:])\n\tposix.execve(f,a[2:],v)\ndef g(f):\n\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n\texcept(OSError,ValueError):return False\ntry:\n\tif '/' in c:x(c)\n\tp=(posix.environ if v is None else v).get(b'PATH')\n\tr=None\n\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n\t\td=d or '.'\n\t\tf=d+c if d.endswith('/') else d+'/'+c\n\t\tif g(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,posix.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
 try:import _signal
 except ImportError:_signal=None
@@ -129,12 +129,8 @@ class AsyncExecutor:
 			finally:
 				self._threads.pop(thread,None)
 				if task is not None and task.thread is thread:task.thread=None
-	def _track(self,thread):
-		self._threads[thread]=None
-		if thread.task is not None:thread.task.thread=thread
-	def _untrack(self,thread):
-		self._threads.pop(thread,None)
-		if thread.task is not None and thread.task.thread is thread:thread.task.thread=None
+	def _track(self,thread):self._threads[thread]=None
+	def _untrack(self,thread):self._threads.pop(thread,None)
 	def _dispatch(self):
 		try:
 			while True:
@@ -636,6 +632,7 @@ def _fail_task(task,message,error,quiet=False):
 	lines=message.split('\n');task.stderr.extend(lines+''.join(traceback.format_exception(type(error),error,error.__traceback__)).split('\n'));task.returncode=-1;task._error=True;task.end_time=time.time();task._env=task._extra_env=None;task._finalized=True
 	if not quiet:_write_error(f"Error running command: {task.command}\n"+'\n'.join(lines))
 def _run_executor_task(task,permit,timeout,quiet,dry_run,finished,decor=('','',''),use_pty=False):
+	task.thread=threading.current_thread()
 	try:__run_command(task,permit,timeout,quiet,dry_run,decor=decor,use_pty=use_pty)
 	finally:finished.append((threading.current_thread(),task))
 def __run_tracked_command(task,sem,timeout,quiet,dry_run,decor=('','',''),use_pty=False):
