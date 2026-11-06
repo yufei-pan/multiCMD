@@ -352,6 +352,30 @@ def _started_thread(task):
 	return task.thread
 
 
+def test_a_tasks_thread_shows_only_once_it_runs(monkeypatch):
+	# task.thread is None until the command's thread runs: a thread still starting joins at once, before the command ran
+	real = multiCMD._Thread.start
+	reached, go = threading.Event(), threading.Event()
+	def held(self):
+		if self.task is not None:
+			reached.set()
+			go.wait(5)
+		real(self)
+	monkeypatch.setattr(multiCMD._Thread, 'start', held)
+	ex = AsyncExecutor(max_threads=1, quiet=True)
+	try:
+		task = ex.run_command(['sleep', '0.3'])
+		assert reached.wait(5)
+		assert task.thread is None
+		go.set()
+		thread = _started_thread(task)
+		thread.join()
+		assert task.returncode == 0
+	finally:
+		go.set()
+		ex.cleanup()
+
+
 def test_sigint_helper_fails_a_call_that_returns_first_and_sends_nothing_later():
 	start = time.monotonic()
 	with pytest.raises(pytest.fail.Exception, match='returned before the SIGINT'):

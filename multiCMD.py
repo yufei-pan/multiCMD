@@ -515,12 +515,10 @@ class AsyncExecutor:
 	def _track(self, thread):
 		'''
 		Track a _Thread about to start until it reports itself finished ( internal )
-		Tracked before it starts, so it is tracked before it can report itself finished, and its task has it
-		before it runs, so _reap() never sees the task without its thread.
+		Tracked before it starts, so it is tracked before it can report itself finished. Its task gets it from
+		_run_executor_task: a task.thread still starting would look finished, as its join() returns at once.
 		'''
 		self._threads[thread] = None
-		if thread.task is not None:
-			thread.task.thread = thread
 
 	def _untrack(self, thread):
 		'''
@@ -2076,7 +2074,9 @@ def _fail_task(task, message, error, quiet=False):
 def _run_executor_task(task, permit, timeout, quiet, dry_run, finished, decor=('', '', ''), use_pty=False):
 	'''
 	Run an AsyncExecutor command, then report this thread finished so the executor joins it and drops it from the task ( internal )
+	An executor task has a thread only while it runs, so task.thread is set here, by the running thread.
 	'''
+	task.thread = threading.current_thread()
 	try:
 		__run_command(task, permit, timeout, quiet, dry_run, decor=decor, use_pty=use_pty)
 	finally:
