@@ -21,7 +21,6 @@ def test_no_two_commands_differ_only_in_case(tmp_path):
 	entry_points = (egg_info / "entry_points.txt").read_text(encoding="utf-8")
 	names = [line.split("=")[0].strip() for line in entry_points.splitlines() if "=" in line]
 	assert sorted(names) == ["mcmd", "multicmd"]
-	assert len({name.casefold() for name in names}) == len(names)
 	# the mixed-case command ships in the sdist as a script, so the three spellings stay three commands
 	assert "scripts/multiCMD" in (egg_info / "SOURCES.txt").read_text(encoding="utf-8").splitlines()
 	assert (PACKAGE_ROOT / "scripts" / "multiCMD").read_text(encoding="utf-8").startswith("#!")

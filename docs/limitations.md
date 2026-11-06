@@ -4,9 +4,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### pip 9 cannot upgrade from or uninstall 1.57 and earlier
 - Kind: known limitation
-- What the operator sees: on stock EL7 and EL8 pip 9.0.3, `pip3 install -U multiCMD` from 1.57 or earlier, and `pip3 uninstall multiCMD` of those releases, fail with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`. The installed release keeps working. `pip3 install -U pip` once clears it, measured on EL7 and EL8.
-- Why: pip 9 parses the installed release's `entry_points.txt` with a parser that folds case, and those releases list `multiCMD` and `multicmd`. Nothing in a new release can change the old metadata. 1.58 on have no such pair.
+- What the operator sees: With pip 9, the pip of EL7 and EL8 (`pip3 --version`), upgrading from 1.57 or earlier and `pip3 uninstall multiCMD` of those releases stop with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`, and nothing changes: the installed release keeps working. Run `pip3 install -U pip` once, then upgrade or uninstall. With `--user` the same happens, except that `pip3 install --user -U multiCMD` with no version does not stop: it installs the new release, which works, and leaves the old release's metadata behind. `pip3 list` then shows the old release after `pip3 uninstall multiCMD`, and the next uninstall stops with that error. To avoid this, run `pip3 install --user -U pip` once first. If it has already happened, run that, run `pip3 uninstall multiCMD` until it says multiCMD is not installed, and install again. As root, `pip3 install -U hpcp`, `statblk` or `statbtrfs` stops the same way once a multiCMD newer than the installed one is out, because pip 9 upgrades dependencies too. `pip3 install -U --no-deps hpcp` gets past it.
+- Why: pip 9 parses the installed release's `entry_points.txt` with a parser that folds case, and those releases list `multiCMD` and `multicmd`. Nothing in a new release can change the old metadata. 1.58 and later have no such pair.
 - Revisit when: EL's stock pip stops being 9, or never.
+- Approved: 2026-11-06, the user chose "Known limitation (Recommended)". The dependents' line: 2026-11-06, the user chose "Extend it (Recommended)".
+
+### The `multiCMD` spelling in a venv with a space in its path
+- Kind: known limitation
+- What the operator sees: In a venv whose path has a space, or is too long for the kernel's `#!` line, the `multiCMD` spelling fails with "bad interpreter", because pip gives a script file a plain `#!` line: use `multicmd`. uv and system or `--user` installs are not affected.
+- Why: pip writes a plain `#!<python>` line into a script file and a `/bin/sh` wrapper only for an entry point, and a launcher that delegates to the lowercase twin overwrites it on a case-insensitive disk under uv.
+- Revisit when: someone hits it.
 - Approved: 2026-11-06, the user chose "Known limitation (Recommended)".
 
 ### A second Ctrl-C microseconds after the first

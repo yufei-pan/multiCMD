@@ -467,8 +467,11 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 ## Upgrading to 1.58 from 1.57
 
-- The `multiCMD` command is now a script file, not an entry point, so `entry_points.txt` no longer has two names that differ only in case. All three commands still work the same way. From 1.58 on, stock pip 9 on EL7 and EL8 upgrades and uninstalls multiCMD like any other pip.
-- Upgrading from 1.57 or earlier with pip 9, the pip of EL7 and EL8 (`pip3 --version`), fails with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`, and so does `pip3 uninstall multiCMD` for those releases; the installed release keeps working. Run `pip3 install -U pip` once (`--user` for a user install), then upgrade.
+- The `multiCMD` command is now a script file, not an entry point, so `entry_points.txt` no longer has two names that differ only in case. All three commands still work the same way. From 1.58 on, stock pip 9 on EL7 and EL8 upgrades and uninstalls multiCMD without `configparser.DuplicateOptionError`.
+- With pip 9, the pip of EL7 and EL8 (`pip3 --version`), upgrading from 1.57 or earlier and `pip3 uninstall multiCMD` of those releases stop with `configparser.DuplicateOptionError: ... option 'multicmd' in section 'console_scripts' already exists`, and nothing changes: the installed release keeps working. Run `pip3 install -U pip` once, then upgrade or uninstall.
+- With `--user` the same happens, except that `pip3 install --user -U multiCMD` with no version does not stop: it installs the new release, which works, and leaves the old release's metadata behind. `pip3 list` then shows the old release after `pip3 uninstall multiCMD`, and the next uninstall stops with that error. To avoid this, run `pip3 install --user -U pip` once first. If it has already happened, run that, run `pip3 uninstall multiCMD` until it says multiCMD is not installed, and install again. From 1.58 on the same upgrade leaves the metadata too, but with no error: `pip3 uninstall multiCMD` takes one run per release left.
+- As root, `pip3 install -U hpcp`, `statblk` or `statbtrfs` stops the same way once a multiCMD newer than the installed one is out, because pip 9 upgrades dependencies too. `pip3 install -U --no-deps hpcp` gets past it.
+- In a venv whose path has a space, or is too long for the kernel's `#!` line, the `multiCMD` spelling fails with "bad interpreter", because pip gives a script file a plain `#!` line: use `multicmd`. uv and system or `--user` installs are not affected.
 - An embedded copy made by the generator now falls back from any failure to import the installed multiCMD, not only the three errors it named.
 
 ## Upgrading to 1.57 from 1.56
