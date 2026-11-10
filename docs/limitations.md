@@ -32,7 +32,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### On Python 3.11+ a Ctrl-C inside Popen during a serial start can orphan the command
 - Kind: known limitation
-- What the operator sees: on Python 3.11+ and on Windows, a single Ctrl-C (or a signal handler's exception) landing
+- What the operator sees: on Python 3.11+, on Windows, and in a frozen app (whose `sys.executable` is the app
+  itself, so it has no wrapper to run, on any Python), a single Ctrl-C (or a signal handler's exception) landing
   while Popen starts a command in a serial run can leave that command running, never registered, after the
   program exits. About 51 µs per start on Python 3.14 (1.56's measurement); in hpcp's early-stop test (Docker,
   3.14, 8 copy workers, 400 small files) 3 commands in 200 stops ran so, with hpcp 9.86 and 9.87 alike, and each
