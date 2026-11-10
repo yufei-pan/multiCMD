@@ -426,9 +426,10 @@ stderr, unless quiet.
 multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
 
-A command is registered from the moment `Popen` returns it: a Ctrl-C that Python raises inside
-`Popen` as a serial run starts a command (some 50-70 µs each) can leave it running, unknown to
-`kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
+A command is registered from the moment `Popen` returns it. Before Python 3.11 the exec wrapper runs
+the command only once it is registered, so a Ctrl-C that Python raises inside `Popen` as a serial run
+starts a command keeps that command from running at all; on 3.11+ such a Ctrl-C (a window of some
+50-70 µs per start) can leave it running, unknown to `kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
 `kill_all()` or the exit stops it. On Python 3.6-3.9, which raise a Ctrl-C at nearly any instruction,
 even one at a few points between the steps of a run can leave its command registered but not signalled.
 On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a lock can leave it held: one of
@@ -489,6 +490,13 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ## Upgrading to 1.59 from 1.58
 
 - Nothing needs doing to upgrade.
+- Fix, Python 3.6 to 3.10: a Ctrl-C, or what your own signal handler raises (a SIGTERM handler's `sys.exit()`),
+  inside `Popen` as a serial run starts a command no longer leaves that command running, unknown to `kill_all()`
+  and the exit hook. The exec wrapper now waits for one byte that multiCMD writes on a pipe once the command is
+  registered; an interrupted start closes the pipe instead, and the wrapper exits 125 without running anything.
+  The window was the whole fork and wait for the exec, about 2.5 ms per start of a large program on 3.6: hpcp's copy
+  workers ran 66 such commands in 200 early stops on 3.6 and 33 in 200 on 3.10, and none with 1.59. On 3.11+ the
+  window stays (about 50 µs per start; 3 in 200 in the same test), see [docs/limitations.md](docs/limitations.md).
 - New: `pass_fds=` on `run_command`, `run_commands` and `AsyncExecutor` (a constructor default, overridden per call):
   descriptors a command inherits, at the same numbers, as `subprocess`'s `pass_fds` (POSIX only). The default passes
   nothing, as before. See "Descriptors a command inherits" above.

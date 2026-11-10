@@ -59,7 +59,10 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # another thread hangs on it.
 # Not a new session ( setsid ) either: that would hide the terminal from sudo.
 # It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
-# like included ). Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
+# like included ). It runs the command only once the caller has it registered: its second argument is the read end of a
+# pipe ( passed to it alone ) on which the caller writes one byte then ( see _popen ). A caller interrupted inside Popen
+# once it has forked never has the command, and closes the pipe: the wrapper reads its end and exits 125 without running
+# anything. Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
 # the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
 # _MULTICMD_ENV_0 .. _MULTICMD_ENV_<N-1>, handed over by exec itself ( nothing can be cut short ), and it
 # runs with exactly those, found in their PATH like Python 3.11+'s Popen does. A missing or malformed entry
@@ -75,7 +78,11 @@ _PGROUP_EXEC = (
 	"\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\n"
 	"posix.setpgid(0,0)\n"
 	"a=sys.argv\n"
-	"c=a[2]\n"
+	# handed over or not: the byte, or the end of the pipe ( 125, as env and timeout fail on their own )
+	"h=int(a[2])\n"
+	"if not posix.read(h,1):posix._exit(125)\n"
+	"posix.close(h)\n"
+	"c=a[3]\n"
 	"v=None\n"
 	"if a[1]!='-':\n"
 	"\ttry:\n"
@@ -84,8 +91,8 @@ _PGROUP_EXEC = (
 	"\texcept(KeyError,ValueError):\n"
 	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\n"
 	"def x(f):\n"
-	"\tif v is None:posix.execv(f,a[2:])\n"
-	"\tposix.execve(f,a[2:],v)\n"
+	"\tif v is None:posix.execv(f,a[3:])\n"
+	"\tposix.execve(f,a[3:],v)\n"
 	"def g(f):\n"
 	"\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n"
 	"\texcept(OSError,ValueError):return False\n"
@@ -1164,21 +1171,52 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None, pass_fd
 		raise PermissionError(failure.errno, failure.strerror, command)
 	raise _ExecRefused(failure.errno, failure.strerror, command)
 
-def _popen(argv, started=None, grouped=False, **kwargs):
+def _handover_pipe():
+	'''
+	The exec wrapper's hand-over pipe ( internal; see _popen ): ( read end, write end ). The read end is never 0, 1 or 2:
+	in one the caller has closed, Popen would put the command's stdin, stdout or stderr over it in the child
+	'''
+	r, w = os.pipe()
+	low = []
+	while r <= 2:
+		low.append(r)
+		r = os.dup(r)
+	for fd in low:
+		os.close(fd)
+	return r, w
+
+def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 	'''
 	Start a process with subprocess.Popen ( internal )
 	@params:
 		started: A list the command is appended to, as the registry holds it, the moment Popen returns, so a Ctrl-C from
 			there on finds it ( see _execute ). One that Python raises inside Popen, once it has forked, loses the
-			command, which runs on in a process group of its own
+			command: through the exec wrapper ( handover ) it then never runs; with Popen(process_group=) it runs on in
+			a process group of its own ( docs/limitations.md )
 		grouped: Whether the process's pid is its process group id
+		handover: For the exec wrapper, the index in argv of its pipe's read end, filled in here; None otherwise. One
+			byte on the pipe, once the command is in started, lets the wrapper run it; both ends are closed here however
+			Popen ends, and a wrapper that got no byte exits 125 ( see _PGROUP_EXEC )
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
-	proc = subprocess.Popen(argv, **kwargs)
-	command = (proc, proc.pid if grouped else None)
-	if started is not None:
-		started.append(command)
+	pipe = None
+	try:
+		if handover is not None:
+			pipe = _handover_pipe()
+			argv[handover] = str(pipe[0])
+			kwargs['pass_fds'] = tuple(kwargs.get('pass_fds', ())) + (pipe[0],)
+		proc = subprocess.Popen(argv, **kwargs)
+		command = (proc, proc.pid if grouped else None)
+		if started is not None:
+			started.append(command)
+		if pipe is not None:
+			# last in the try: a Ctrl-C that Python 3.6 - 3.9 raise between a try and its finally comes after it
+			os.write(pipe[1], b'1')
+	finally:
+		if pipe is not None:
+			os.close(pipe[0])
+			os.close(pipe[1])
 	return command
 
 def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None, started=None, pass_fds=()):
@@ -1225,6 +1263,7 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	if not _IS_POSIX:
 		return _popen(argv, started, **kwargs)
 	grouped = True
+	handover = None
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
 	elif _uses_wrapper():
@@ -1235,17 +1274,19 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 			kwargs['env'] = dict(_snapshot(os.environb, drop_empty=True))
 			kwargs['env'].update((os.fsencode(_ENV_VAR + str(i)), entry) for i, entry in enumerate(entries))
 			count = str(len(entries))
-		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count] + list(argv)
+		# the hand-over pipe's read end goes in at index 6 ( see _popen )
+		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count, None] + list(argv)
+		handover = 6
 	else:
 		grouped = False
 	if _sigmask is None:
-		return _popen(argv, started, grouped, **kwargs)
+		return _popen(argv, started, grouped, handover, **kwargs)
 	# the mask as it is, read with a call that changes nothing; the block is in the try, as a Ctrl-C can come out of it
 	# with the mask already set ( see _sigmask )
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
 	try:
 		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
-		command = _popen(argv, started, grouped, **kwargs)
+		command = _popen(argv, started, grouped, handover, **kwargs)
 		# ( here too: Python 3.6 - 3.9 can raise a Ctrl-C between the end of a try and its finally, which then never runs )
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
@@ -1874,8 +1915,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	of multiCMD's: the command is stopped and the caller records it ( -1 ). A second interrupt ends the wait for the
 	stop: the command is sent SIGTERM and stays registered, for kill_all() and the exit hook.
 	The command is registered from the moment Popen has returned it ( see _popen ). An interrupt that Python raises
-	inside Popen, once it has forked, loses it: it runs on in a process group of its own, unknown to kill_all() and
-	the exit hook. Python raises one on the main thread only, some 50 - 70 us per start.
+	inside Popen, once it has forked, loses it. Through the exec wrapper ( Python < 3.11 ) it then never runs: the
+	wrapper waits until the command is registered. With Popen(process_group=) ( 3.11+ ) it runs on in a process group of
+	its own, unknown to kill_all() and the exit hook ( docs/limitations.md ). Python raises one on the main thread only.
 
 	@params:
 		task: The Task
@@ -2435,8 +2477,9 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	'''
 	Run a command
 
-	A Ctrl-C ( or a signal handler's exception ) that Python raises inside Popen, once it has forked, leaves the command
-	running unregistered, unknown to kill_all() and the exit hook: some 50 - 70 us per command, and only a serial run
+	A Ctrl-C ( or a signal handler's exception ) that Python raises inside Popen, once it has forked, keeps the command
+	from running on Python < 3.11 ( the exec wrapper waits until it is registered ); on 3.11+ it leaves the command running
+	unregistered, unknown to kill_all() and the exit hook ( some 50 - 70 us per command ). Only a serial run
 	( max_threads=1 ) starts its commands on the main thread, where Python raises them. Anywhere else the command is
 	stopped before the interrupt is re-raised ( see docs/limitations.md for a second one microseconds after it ).
 
@@ -2489,8 +2532,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	'''
 	Run multiple commands in parallel
 
-	A Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running unregistered
-	( see run_command ).
+	On Python 3.11+ a Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running
+	unregistered ( see run_command ).
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )

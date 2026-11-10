@@ -16,7 +16,7 @@ USE_SUDO=False
 _IS_POSIX=os.name=='posix'
 _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
 _ENV_VAR='_MULTICMD_ENV_'
-_PGROUP_EXEC="import posix,_signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\nposix.setpgid(0,0)\na=sys.argv\nc=a[2]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:posix.execv(f,a[2:])\n\tposix.execve(f,a[2:],v)\ndef g(f):\n\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n\texcept(OSError,ValueError):return False\ntry:\n\tif '/' in c:x(c)\n\tp=(posix.environ if v is None else v).get(b'PATH')\n\tr=None\n\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n\t\td=d or '.'\n\t\tf=d+c if d.endswith('/') else d+'/'+c\n\t\tif g(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,posix.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
+_PGROUP_EXEC="import posix,_signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\nposix.setpgid(0,0)\na=sys.argv\nh=int(a[2])\nif not posix.read(h,1):posix._exit(125)\nposix.close(h)\nc=a[3]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:posix.execv(f,a[3:])\n\tposix.execve(f,a[3:],v)\ndef g(f):\n\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n\texcept(OSError,ValueError):return False\ntry:\n\tif '/' in c:x(c)\n\tp=(posix.environ if v is None else v).get(b'PATH')\n\tr=None\n\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n\t\td=d or '.'\n\t\tf=d+c if d.endswith('/') else d+'/'+c\n\t\tif g(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,posix.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
 try:import _signal
 except ImportError:_signal=None
@@ -346,25 +346,36 @@ def _spawn(argv,stdout,stderr,env=None,explicit=False,started=None,pass_fds=()):
 	if failure is None:raise FileNotFoundError(errno.ENOENT,os.strerror(errno.ENOENT),command)
 	if isinstance(failure,PermissionError):raise PermissionError(failure.errno,failure.strerror,command)
 	raise _ExecRefused(failure.errno,failure.strerror,command)
-def _popen(argv,started=None,grouped=False,**kwargs):
-	proc=subprocess.Popen(argv,**kwargs);command=proc,proc.pid if grouped else None
-	if started is not None:started.append(command)
+def _handover_pipe():
+	r,w=os.pipe();low=[]
+	while r<=2:low.append(r);r=os.dup(r)
+	for fd in low:os.close(fd)
+	return r,w
+def _popen(argv,started=None,grouped=False,handover=None,**kwargs):
+	pipe=None
+	try:
+		if handover is not None:pipe=_handover_pipe();argv[handover]=str(pipe[0]);kwargs['pass_fds']=tuple(kwargs.get('pass_fds',()))+(pipe[0],)
+		proc=subprocess.Popen(argv,**kwargs);command=proc,proc.pid if grouped else None
+		if started is not None:started.append(command)
+		if pipe is not None:os.write(pipe[1],b'1')
+	finally:
+		if pipe is not None:os.close(pipe[0]);os.close(pipe[1])
 	return command
 def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None,started=None,pass_fds=()):
 	kwargs={'stdin':subprocess.DEVNULL,'stdout':stdout,'stderr':stderr,'env':env}
 	if pass_fds:kwargs['pass_fds']=pass_fds
 	if executable is not None:kwargs['executable']=executable
 	if not _IS_POSIX:return _popen(argv,started,**kwargs)
-	grouped=True
+	grouped=True;handover=None
 	if _HAS_PROCESS_GROUP:kwargs['process_group']=0
 	elif _uses_wrapper():
 		count='-'
 		if explicit:entries=[os.fsencode(k)+b'='+os.fsencode(v)for(k,v)in env.items()];kwargs['env']=dict(_snapshot(os.environb,drop_empty=True));kwargs['env'].update((os.fsencode(_ENV_VAR+str(i)),entry)for(i,entry)in enumerate(entries));count=str(len(entries))
-		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count]+list(argv)
+		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count,None]+list(argv);handover=6
 	else:grouped=False
-	if _sigmask is None:return _popen(argv,started,grouped,**kwargs)
+	if _sigmask is None:return _popen(argv,started,grouped,handover,**kwargs)
 	old_mask=_sigmask(signal.SIG_BLOCK,())
-	try:_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS);command=_popen(argv,started,grouped,**kwargs);_sigmask(signal.SIG_SETMASK,old_mask)
+	try:_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS);command=_popen(argv,started,grouped,handover,**kwargs);_sigmask(signal.SIG_SETMASK,old_mask)
 	finally:_sigmask(signal.SIG_SETMASK,old_mask)
 	return command
 def _stdout_isatty():

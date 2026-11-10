@@ -30,16 +30,23 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-23, the user chose "Simple design (Recommended)" and "Drop _settle (Recommended)". The
   3.6 - 3.10 part added after the 1.56 review: 2026-10-23, the user chose "Accept both (Recommended)".
 
-### A Ctrl-C inside Popen during a serial start can orphan the command
+### On Python 3.11+ a Ctrl-C inside Popen during a serial start can orphan the command
 - Kind: known limitation
-- What the operator sees: a single Ctrl-C landing while Popen starts a command in a serial run (about 51 µs
-  per start on Python 3.14) can leave that command running, never registered, after the program exits. 1.55
-  narrowed this to the fork's own C call (about 41 µs).
-- Why: the part after the fork took a 30-line hand-over class (`_Popen`) for about 10 µs per start, and the
-  fork's own window cannot be closed from Python either way.
+- What the operator sees: on Python 3.11+ and on Windows, a single Ctrl-C (or a signal handler's exception) landing
+  while Popen starts a command in a serial run can leave that command running, never registered, after the
+  program exits. About 51 µs per start on Python 3.14 (1.56's measurement); in hpcp's early-stop test (Docker,
+  3.14, 8 copy workers, 400 small files) 3 commands in 200 stops ran so, with hpcp 9.86 and 9.87 alike, and each
+  ended before hpcp did. 1.59 closed it before 3.11: the exec wrapper runs the command only once it is
+  registered (66 and 33 such commands in 200 stops on 3.6 and 3.10 with 1.58, none with 1.59).
+- Why: from 3.11 Popen runs the command itself, with no wrapper to wait in, and the fork's own window cannot be
+  closed from Python: blocking the stops in the calling thread does not hold them while another thread exists
+  (Python runs the handler on the main thread whichever thread the kernel picks), and holding the handlers
+  (1.56's `_HoldCtrlC`) drops a C-level handler, keeps a Ctrl-C waiting on an exec that cannot finish, and
+  turns a missing command's 127 into a stop.
 - Revisit when: someone hits it, or CPython offers a way to start a process with its pid known before any
   Python code can raise.
-- Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)".
+- Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+
+  and Windows.
 
 ### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
