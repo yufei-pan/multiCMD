@@ -300,6 +300,26 @@ overrides. `sudo` resets the environment by default, so with `use_sudo` they may
 command. On the command line: `mcmd -e LC_ALL=C -e UNSET_ME "cmd"`; `-n` shows them as
 `env LC_ALL=C cmd` ( `env -i ...` for a whole environment ).
 
+### Descriptors a command inherits
+
+```python
+fd = os.open("out/file", os.O_WRONLY)                                       # a file this process holds
+multiCMD.run_command(["cp", "src/file", "/dev/fd/%d" % fd], pass_fds=(fd,))  # cp writes it through its own copy
+```
+
+`pass_fds` names descriptors the command inherits, at the same numbers, as `subprocess`'s `pass_fds`
+( POSIX only ). It takes an int, an object with `fileno()`, or an iterable of either; the default
+passes nothing, and every descriptor past 2 is closed in the command, as before. It is checked
+before anything runs: a negative, `bool` or closed descriptor is a `ValueError`, and so is any
+off POSIX. multiCMD neither closes nor duplicates them, so keep them open until the command has
+started ( with `wait_for_return=False` or `AsyncExecutor`, until its task's `start_time` is set ).
+The command opens its own copy by name: `/dev/fd/N` ( on Linux `/proc/self/fd/N`, a new open of the
+file; on macOS a `dup` that shares the offset and ignores the open's flags ). With `use_sudo`, sudo
+closes descriptors past 2 unless its policy lets the caller keep them ( `sudo -C`,
+`closefrom_override` ); with `shell=True` the shell inherits them too. `AsyncExecutor` takes it as a
+default a call overrides. There is no command-line form: nothing on a command line holds a
+descriptor.
+
 `raise_error=True` raises `multiCMD.CommandError`; its `.tasks` holds the failed `Task`
 objects and its message lists each one with its return code and last error line.
 `Task` also records `start_time`, `end_time` and `duration`. With `dry_run=True` nothing
@@ -423,13 +443,14 @@ These and the other known limits are in [docs/limitations.md](docs/limitations.m
 run_command(command, timeout=0, max_threads=1, quiet=False, dry_run=False,
             with_stdErr=False, return_code_only=False, return_object=False,
             wait_for_return=True, sem=None, use_sudo=..., raise_error=False,
-            prefix=False, color=None, pty=False, shell=False, env=None, extra_env=None)
+            prefix=False, color=None, pty=False, shell=False, env=None, extra_env=None,
+            pass_fds=())
 
 run_commands(commands, timeout=0, max_threads=1, quiet=False, dry_run=False,
              with_stdErr=False, return_code_only=False, return_object=False,
              parse=False, wait_for_return=True, sem=None, use_sudo=...,
              raise_error=False, prefix=False, color=None, pty=False, shell=False,
-             env=None, extra_env=None)
+             env=None, extra_env=None, pass_fds=())
 
 ping(hosts, timeout=1, max_threads=0, ...)   # returns True/False reachability
 join_threads(threads=..., timeout=None)      # join fire-and-forget threads
@@ -439,7 +460,7 @@ set_sudo(use_sudo)                           # enable/disable sudo globally
 class Task:          # command, returncode, stdout, stderr, start_time, end_time, duration
 class CommandError:  # raised by raise_error=True; .tasks = the failed Tasks
 class AsyncExecutor: # run_command(s), wait, join, stop, cleanup, get_results, get_return_codes;
-                     # takes the options above, env / extra_env as defaults a call overrides
+                     # takes the options above, env / extra_env / pass_fds as defaults a call overrides
 ```
 
 The module also bundles a few terminal/formatting helpers used internally and
@@ -464,6 +485,13 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
+
+## Upgrading to 1.59 from 1.58
+
+- Nothing needs doing to upgrade.
+- New: `pass_fds=` on `run_command`, `run_commands` and `AsyncExecutor` (a constructor default, overridden per call):
+  descriptors a command inherits, at the same numbers, as `subprocess`'s `pass_fds` (POSIX only). The default passes
+  nothing, as before. See "Descriptors a command inherits" above.
 
 ## Upgrading to 1.58 from 1.57
 
