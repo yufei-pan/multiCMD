@@ -496,6 +496,22 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.61 from 1.60
+
+- Nothing needs doing to upgrade.
+- Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
+  longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
+  initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")
+  and exits 1 with that message on 3.8 to 3.10; a little later in its start it prints a `KeyboardInterrupt` traceback.
+  Each landed in that command's stderr, and each core dump in the host's crash handler (systemd-coredump, apport, abrt).
+  Aimed at random into 400 starts each with 1.60: 80 aborted on 3.6 (1.59 the same) and 63 on 3.7; 54, 41 and 42 exited
+  with "Fatal Python error" on 3.8, 3.9 and 3.10; with 1.61 every one ended by SIGINT or ran to its end, without a
+  word. It is not new: every version with the exec wrapper (1.52 on) had it. The wrapper now starts with SIGINT
+  blocked and unblocks it once it has the command, so such a stop ends it by SIGINT, as it ends the command; a command
+  still inherits SIGINT blocked from a calling thread that has it blocked. On GitHub's runners the core dumps of
+  1.60's new stop test (5,000 stops in one process) each started an apport process, which drove the load to 250 and
+  timed the 3.6 job out.
+
 ## Upgrading to 1.60 from 1.59
 
 - Nothing needs doing to upgrade.

@@ -36,12 +36,26 @@ def test_spawn_blocks_tty_signals_in_the_command(launcher):
 	blocked = int(out.split()[1], 16)
 	assert blocked & (1 << (signal.SIGTTIN - 1))
 	assert blocked & (1 << (signal.SIGTTOU - 1))
+	# ( 1.61 ) the exec wrapper starts with SIGINT blocked too, and unblocks it before the command runs
+	assert not blocked & (1 << (signal.SIGINT - 1))
+
+
+def test_a_command_inherits_sigint_blocked_from_a_caller_that_blocks_it(launcher):
+	before = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+	try:
+		proc, _ = multiCMD._spawn(['grep', 'SigBlk', '/proc/self/status'], subprocess.PIPE, subprocess.DEVNULL)
+		out, _ = proc.communicate(timeout=10)
+		assert signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+	finally:
+		signal.pthread_sigmask(signal.SIG_SETMASK, before)
+	assert int(out.split()[1], 16) & (1 << (signal.SIGINT - 1))
 
 
 def test_spawn_restores_the_callers_signal_mask(launcher):
 	proc, _ = multiCMD._spawn(['true'], subprocess.DEVNULL, subprocess.DEVNULL)
 	proc.wait(timeout=10)
-	assert signal.SIGTTIN not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+	mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+	assert signal.SIGTTIN not in mask and signal.SIGINT not in mask
 
 
 TTY_PROBE = textwrap.dedent(r"""

@@ -2,6 +2,7 @@
 waits for one byte on a pipe that _popen writes once the command is in started, and a caller interrupted inside Popen once
 it has forked closes the pipe instead, so the wrapper exits 125 without running anything.'''
 import os
+import random
 import signal
 import subprocess
 import sys
@@ -97,6 +98,43 @@ def test_the_wrapper_runs_the_command_once_handed_over(tmp_path):
 	os.write(w, b'1')
 	os.close(w)
 	assert proc.wait(timeout=30) == 0 and marker.exists()
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
+def test_a_stop_as_the_command_starts_ends_it_by_sigint_alone(launcher):
+	# ( 1.61; seen as 1.60's 3.6 CI job slowing to a timeout ) a stop sends SIGINT first. One that reached the exec
+	# wrapper's Python as it initialized aborted it with a core dump on 3.6 and 3.7 ( 80 and 63 of 400 stops aimed into
+	# a start, Docker ), and ended it with 'Fatal Python error' and 1 on 3.8 - 3.10 ( 41 to 54 of 400 ); later in its
+	# start it printed a KeyboardInterrupt traceback. On a 2-vCPU GitHub runner each core dump started an apport, and
+	# test_stops_in_serial_commands_never_jam_thread_starts drove the load to 250. The wrapper now starts with SIGINT
+	# blocked and unblocks it once handed over, so a stop ends it by SIGINT, as it ends the command, without a word.
+	# 200 stops: at 1 in 10 ( the rarest above ) a regression goes unseen with odds of 7e-10
+	times = []
+	for _ in range(10):
+		start = time.perf_counter()
+		proc, _ = multiCMD._spawn(['true'], subprocess.PIPE, subprocess.PIPE)
+		proc.communicate(timeout=30)
+		times.append(time.perf_counter() - start)
+	start_time = sorted(times)[len(times) // 2]
+	# ( a regression's core dumps go nowhere )
+	import resource
+	core = resource.getrlimit(resource.RLIMIT_CORE)
+	resource.setrlimit(resource.RLIMIT_CORE, (0, core[1]))
+	ends = []
+	try:
+		for _ in range(200):
+			proc, _ = multiCMD._spawn(['true'], subprocess.PIPE, subprocess.PIPE)
+			time.sleep(random.uniform(0, start_time))
+			try:
+				os.kill(proc.pid, signal.SIGINT)
+			except ProcessLookupError:
+				pass
+			_, err = proc.communicate(timeout=30)
+			ends.append((proc.returncode, err.decode(errors='replace')[:200]))
+	finally:
+		resource.setrlimit(resource.RLIMIT_CORE, core)
+	assert [(code, err) for code, err in ends if code not in (0, -signal.SIGINT) or err] == []
 
 
 @pytest.mark.skipif(not os.path.isdir('/proc/self/fd'), reason='needs /proc/self/fd')

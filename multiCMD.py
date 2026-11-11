@@ -28,7 +28,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.60'
+version = '1.61'
 __version__ = version
 COMMIT_DATE = '2026-11-11'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -63,7 +63,10 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # like included ). It runs the command only once the caller has it registered: its second argument is the read end of a
 # pipe ( passed to it alone ) on which the caller writes one byte then ( see _popen ). A caller interrupted inside Popen
 # once it has forked never has the command, and closes the pipe: the wrapper reads its end and exits 125 without running
-# anything. Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
+# anything. It starts with SIGINT blocked, as a Python that a SIGINT reaches while it initializes aborts with a core dump
+# ( 3.6, 3.7 ) or exits 1 with 'Fatal Python error' ( 3.8 - 3.10 ), and a stop sends SIGINT first: the byte b'2' has it
+# unblock SIGINT ( b'1': the caller had it blocked, and so does the command ).
+# Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
 # the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
 # _MULTICMD_ENV_0 .. _MULTICMD_ENV_<N-1>, handed over by exec itself ( nothing can be cut short ), and it
 # runs with exactly those, found in their PATH like Python 3.11+'s Popen does. A missing or malformed entry
@@ -81,8 +84,14 @@ _PGROUP_EXEC = (
 	"a=sys.argv\n"
 	# handed over or not: the byte, or the end of the pipe ( 125, as env and timeout fail on their own )
 	"h=int(a[2])\n"
-	"if not posix.read(h,1):posix._exit(125)\n"
+	"b=posix.read(h,1)\n"
+	"if not b:posix._exit(125)\n"
 	"posix.close(h)\n"
+	# b'2': SIGINT was blocked for the start only ( see _spawn_process ). A stop's SIGINT that came meanwhile ends the
+	# wrapper now, as it would end the command; an ignored SIGINT stays ignored
+	"if b==b'2':\n"
+	"\tif _signal.getsignal(_signal.SIGINT)!=_signal.SIG_IGN:_signal.signal(_signal.SIGINT,_signal.SIG_DFL)\n"
+	"\t_signal.pthread_sigmask(_signal.SIG_UNBLOCK,(_signal.SIGINT,))\n"
 	"c=a[3]\n"
 	"v=None\n"
 	"if a[1]!='-':\n"
@@ -1249,7 +1258,7 @@ def _handover_pipe():
 		os.close(fd)
 	return r, w
 
-def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
+def _popen(argv, started=None, grouped=False, handover=None, go=b'1', **kwargs):
 	'''
 	Start a process with subprocess.Popen ( internal )
 	@params:
@@ -1261,6 +1270,7 @@ def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 		handover: For the exec wrapper, the index in argv of its pipe's read end, filled in here; None otherwise. One
 			byte on the pipe, once the command is in started, lets the wrapper run it; both ends are closed here however
 			Popen ends, and a wrapper that got no byte exits 125 ( see _PGROUP_EXEC )
+		go: That byte: b'2' has the wrapper unblock SIGINT first, b'1' leaves the mask as it is
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
@@ -1276,7 +1286,7 @@ def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 			started.append(command)
 		if pipe is not None:
 			# last in the try: a Ctrl-C that Python 3.6 - 3.9 raise between a try and its finally comes after it
-			os.write(pipe[1], b'1')
+			os.write(pipe[1], go)
 	finally:
 		if pipe is not None:
 			os.close(pipe[0])
@@ -1292,7 +1302,8 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	terminal from its background group the read fails with EIO instead of the kernel stopping it.
 	The calling thread's mask is set back as it was however the start ends, a Ctrl-C anywhere included.
 	Python 3.11+ uses Popen(process_group=0); older Pythons run the command through the exec
-	wrapper _PGROUP_EXEC. Windows gets a plain Popen.
+	wrapper _PGROUP_EXEC, which also starts with SIGINT blocked, until it has the command: a stop's
+	SIGINT could otherwise reach its Python as it initializes. Windows gets a plain Popen.
 
 	The wrapper itself always starts in this process's environment. A command given an environment of
 	its own ( explicit ) gets it as reserved variables of the wrapper's, which the wrapper unpacks and
@@ -1348,9 +1359,13 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	# the mask as it is, read with a call that changes nothing; the block is in the try, as a Ctrl-C can come out of it
 	# with the mask already set ( see _sigmask )
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
+	block, go = _TTY_SIGNALS, b'1'
+	if handover is not None and signal.SIGINT not in old_mask:
+		# the wrapper's Python starts with SIGINT blocked and unblocks it once handed over ( see _PGROUP_EXEC )
+		block, go = _TTY_SIGNALS | {signal.SIGINT}, b'2'
 	try:
-		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
-		command = _popen(argv, started, grouped, handover, **kwargs)
+		_sigmask(signal.SIG_BLOCK, block)
+		command = _popen(argv, started, grouped, handover, go, **kwargs)
 		# ( here too: Python 3.6 - 3.9 can raise a Ctrl-C between the end of a try and its finally, which then never runs )
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
