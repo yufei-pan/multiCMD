@@ -666,7 +666,7 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	if interrupted is not None:raise interrupted
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,decor=('','',''),use_pty=False):
 	with sem:
-		if task.stop:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
+		if task.stop or _display.closed:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
 		try:
 			_starting[task]=None
 			if _cut_by_exit(task):raise RuntimeError('not started: the interpreter is exiting')
@@ -784,7 +784,6 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 	try:
 		running,error,failed_last=[],None,False
 		for thread in workers:
-			_raise_if_stdout_closed()
 			try:thread.start()
 			except Exception as e:
 				if thread._started.is_set():raise

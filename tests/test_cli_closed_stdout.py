@@ -346,6 +346,40 @@ def test_the_stop_that_a_closed_stdout_starts_is_not_cut_short(tmp_path):
 		kill_leftovers(pids_in(tmp_path))
 
 
+# a command not started yet is not started once a reader has found stdout closed ( 1.60 never started it: its "Running command"
+# write failed ). Found after the main thread's last look, or while the workers go on taking commands: each of these ends one
+# command, and then has the display closed, as such a reader does
+
+
+def count_executions_closing_after_each(monkeypatch):
+	'''The list of the commands whose run begins; every run that ends leaves the display closed'''
+	begun = []
+	real = multiCMD._execute
+	def execute(task, *args, **kwargs):
+		begun.append(task.command)
+		try:
+			return real(task, *args, **kwargs)
+		finally:
+			multiCMD._display.closed = True
+	monkeypatch.setattr(multiCMD, '_execute', execute)
+	return begun
+
+
+@pytest.mark.parametrize('kwargs, running', [
+	pytest.param({}, 1, id='serial'),
+	pytest.param({'max_threads': 2}, 2, id='pool'),
+])
+def test_no_command_is_started_after_stdout_was_found_closed(monkeypatch, kwargs, running):
+	# ( the commands in flight when it was found go on to their stop; the others never begin )
+	begun = count_executions_closing_after_each(monkeypatch)
+	commands = ['sleep 0.3'] * 6
+	try:
+		multiCMD.run_commands(commands, quiet=True, **kwargs)
+	except multiCMD._StdoutClosed:
+		pass
+	assert len(begun) == running
+
+
 # main() in this process: _end_by_closed_stdout is replaced first, it would end the test run itself
 
 
