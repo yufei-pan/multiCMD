@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
+import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
 version='1.59'
 __version__=version
@@ -66,15 +66,21 @@ class _Done:
 			if step<=0:return False
 			if self._wake.acquire(True,step):self._wake.release()
 		return True
+_START_WAIT=1
+def _start_in_helper(thread,done,failed):
+	try:threading.Thread.start(thread)
+	except BaseException as e:failed.append(e)
+	finally:done.set()
 class _Thread(threading.Thread):
 	def __init__(self,target,args=(),task=None):super().__init__(target=target,args=args,daemon=True);self.task=task;self.done=_Done();self._pid=os.getpid()
 	def start(self):
-		handling=sys.exc_info()[1]
-		try:super().start()
-		except RuntimeError as e:
-			context=e.__context__
-			if context is not None and context is not handling and not isinstance(context,Exception):raise context
+		if _thread.get_ident()!=threading.main_thread().ident:return super().start()
+		done,failed,helper=_Done(),[],[]
+		try:helper.extend(map(_thread.start_new_thread,(_start_in_helper,),((self,done,failed),)));done.wait()
+		except BaseException:
+			if helper:done.wait(_START_WAIT)
 			raise
+		if failed:raise failed[0]
 	def run(self):
 		try:super().run()
 		finally:self.done.set()
@@ -86,6 +92,17 @@ class _Thread(threading.Thread):
 		left=None if deadline is None else max(0,deadline-time.monotonic())
 		if _JOIN_MAY_HANG:left=1 if left is None else min(left,1)
 		super().join(left)
+class _Reader:
+	__slots__='_target','_args','done','_started','_pid'
+	def __init__(self,target,args=()):self._target,self._args=target,args;self.done=_Done();self._started=_Done();self._pid=os.getpid()
+	def start(self):_thread.start_new_thread(self._run,());self._started.set()
+	def _run(self):
+		self._started.set()
+		try:self._target(*self._args)
+		finally:self.done.set()
+	def is_alive(self):return self._started.flag and not self.done.flag and self._pid==os.getpid()
+	def join(self,timeout=None):
+		if self._pid==os.getpid()and self._started.flag:self.done.wait(timeout)
 def _any_alive(threads):
 	for thread in threads:
 		if thread.is_alive():return True
@@ -597,7 +614,7 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 		else:proc,pgid=_spawn(task.command,subprocess.PIPE,subprocess.PIPE,_child_env(task),explicit,started,task._pass_fds);streams=[(proc.stdout,task.stdout),(proc.stderr,task.stderr)]
 		proc._multicmd_quiet=quiet;_register(proc,pgid);_starting.pop(task,None)
 		if _cut_by_exit(task):task.stop=True
-		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers=[_Thread(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams]
+		task._env=task._extra_env=None;task.start_time=time.time();task._last_output=time.monotonic();readers=[_Reader(_read_stream,(stream,target,task,decor,quiet))for(stream,target)in streams]
 		for reader in readers:reader.start()
 		waiting=True;reason=_watch(task,proc,timeout)
 	except BaseException as e:
