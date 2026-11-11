@@ -4,6 +4,7 @@
 # dependencies = []
 # ///
 #%% imports
+import _thread
 import argparse
 import atexit
 import collections
@@ -27,9 +28,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.59'
+version = '1.60'
 __version__ = version
-COMMIT_DATE = '2026-11-10'
+COMMIT_DATE = '2026-11-11'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -285,9 +286,25 @@ class _Done:
 				self._wake.release()
 		return True
 
+# How long an interrupted _Thread.start waits for its helper to finish the start, so _started is right when the interrupt
+# reaches the caller: a main-thread start through the helper took 40 us (median) and 74 us (p90) on Python 3.14, and 2 ms
+# at 3.6's p90 on a host loaded past its 32 cores ( measured for 1.60 ); 1 s is the bound in which hpcp acts on a stop
+# (_check_stop), so the wait never holds an interrupt longer than that.
+_START_WAIT = 1
+
+def _start_in_helper(thread, done, failed):
+	'''threading.Thread.start( thread ) in a thread no signal handler runs in ( internal, see _Thread.start )'''
+	try:
+		threading.Thread.start(thread)
+	except BaseException as e:
+		failed.append(e)
+	finally:
+		done.set()
+
 class _Thread(threading.Thread):
 	'''
-	A daemon thread that reports itself done, for every thread multiCMD starts and waits for ( internal )
+	A daemon thread that reports itself done, for every thread multiCMD starts and waits for but a command's output
+	readers ( _Reader ) ( internal )
 
 	On Python 3.9.8 through 3.12 a Thread.join() that a KeyboardInterrupt interrupts leaves the thread flagged
 	as stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and Thread.join()
@@ -301,7 +318,7 @@ class _Thread(threading.Thread):
 	  returns at once for it.
 	done is a _Done, not a threading.Event, so no interrupt can leave it blocking anyone.
 	@attributes:
-		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
+		task: The Task the thread runs ( None for a dispatcher or pool worker )
 		done: Set once the target has returned or raised ( a _Done )
 	'''
 	def __init__(self, target, args=(), task=None):
@@ -312,17 +329,26 @@ class _Thread(threading.Thread):
 		self._pid = os.getpid()
 
 	def start(self):
-		# what the caller is handling already: a Ctrl-C it handles is not one that landed in this start
-		handling = sys.exc_info()[1]
+		'''
+		threading.Thread.start(), from a helper thread when called on the main thread: Python runs a signal's handler only
+		on the main thread, and one that raised inside start() there could leave threading's own locks held ( see
+		_Reader ). The helper is started by one C call, its ident stored by C ( list.extend over map ) before Python can
+		raise, and the caller waits on a _Done. An interrupt there waits for the helper ( _START_WAIT at most ), then is
+		raised: _started then says whether the thread runs. Off the main thread no handler runs, and start() is called
+		directly.
+		'''
+		if _thread.get_ident() != threading.main_thread().ident:
+			return super().start()
+		done, failed, helper = _Done(), [], []
 		try:
-			super().start()
-		except RuntimeError as e:
-			# a Ctrl-C inside start()'s wait for the thread to come up can come out as RuntimeError('release unlocked
-			# lock') ( seen on 3.12 and free-threaded 3.13t ): the Ctrl-C is what happened
-			context = e.__context__
-			if context is not None and context is not handling and not isinstance(context, Exception):
-				raise context
+			helper.extend(map(_thread.start_new_thread, (_start_in_helper,), ((self, done, failed),)))
+			done.wait()
+		except BaseException:
+			if helper:
+				done.wait(_START_WAIT)
 			raise
+		if failed:
+			raise failed[0]
 
 	def run(self):
 		try:
@@ -345,6 +371,44 @@ class _Thread(threading.Thread):
 			# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
 			left = 1 if left is None else min(left, 1)
 		super().join(left)
+
+class _Reader:
+	'''
+	A command's output reader ( internal ): a thread started by one C call, _thread.start_new_thread, so its start takes no
+	threading lock in the calling thread and waits on nothing there. threading.Thread.start() takes _active_limbo_lock and
+	waits on the new thread's _started Event: a Ctrl-C that Python raised inside it on the main thread left either held, and
+	every later thread start blocked. A serial run starts two readers per command on the main thread. done and _started are
+	_Done ( no interrupt jams them ); is_alive() and join() go by them, as _Thread's do. Not in threading.enumerate(), and
+	threading's trace, profile and excepthook do not reach it: an exception _read_stream raises is reported by Python's
+	hook for a thread it started ( sys.unraisablehook from 3.8 ). Detached: its stack goes when it ends.
+	'''
+	__slots__ = ('_target', '_args', 'done', '_started', '_pid')
+
+	def __init__(self, target, args=()):
+		self._target, self._args = target, args
+		self.done = _Done()
+		self._started = _Done()
+		# ( in a child forked meanwhile only the forking thread exists )
+		self._pid = os.getpid()
+
+	def start(self):
+		_thread.start_new_thread(self._run, ())
+		# ( the thread sets it too, first thing: a stop that lands right here leaves it to the thread )
+		self._started.set()
+
+	def _run(self):
+		self._started.set()
+		try:
+			self._target(*self._args)
+		finally:
+			self.done.set()
+
+	def is_alive(self):
+		return self._started.flag and not self.done.flag and self._pid == os.getpid()
+
+	def join(self, timeout=None):
+		if self._pid == os.getpid() and self._started.flag:
+			self.done.wait(timeout)
 
 def _any_alive(threads):
 	'''
@@ -1659,8 +1723,8 @@ def _join(thread, timeout=None):
 	'''
 	Wait for a thread to finish, in short steps ( internal )
 	A plain join() blocks in C, where a KeyboardInterrupt only arrives if the signal happens to
-	land on this very thread; short steps let the waiting thread see it within 0.1s. A _Thread
-	waits in such steps by itself ( see _Thread ). Like Thread.join(), this raises RuntimeError for
+	land on this very thread; short steps let the waiting thread see it within 0.1s. A _Thread or
+	_Reader waits in such steps by itself ( see _Thread ). Like Thread.join(), this raises RuntimeError for
 	a threading.Thread that was never started.
 	@params:
 		thread: The thread to wait for
@@ -1966,7 +2030,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._env = task._extra_env = None
 		task.start_time = time.time()
 		task._last_output = time.monotonic()
-		readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
+		readers = [_Reader(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
 		for reader in readers:
 			reader.start()
 		waiting = True
@@ -2446,6 +2510,10 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			try:
 				thread.start()
 			except Exception as e:
+				if thread._started.is_set():
+					# it runs: what a signal handler raised while the main thread waited for its start ( see _Thread.start )
+					# is an interrupt, not a thread that cannot start
+					raise
 				# one failed start may be passing ( EAGAIN ): the next worker is tried; two in a row end the starts, as
 				# the next would most likely fail the same way
 				error = e
@@ -2606,6 +2674,9 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 				try:
 					thread.start()
 				except Exception as e:
+					if thread._started.is_set():
+						# it runs: an interrupt, not a thread that cannot start ( see _run_pool )
+						raise
 					# that command fails, the others run; its task keeps the thread ( task.thread.join() returns at once )
 					__running_threads.discard(thread)
 					_fail_task(thread.task, f'cannot start its thread: {e}', e, quiet)

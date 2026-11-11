@@ -6,18 +6,18 @@ import time
 import pytest
 
 import multiCMD
-from conftest import pid_gone, sigint_main_after
+from conftest import os_threads, pid_gone, sigint_main_after
 from multiCMD import run_commands
 
 
 @pytest.mark.slow
 def test_pool_keeps_threads_bounded():
-	baseline = threading.active_count()
+	baseline = os_threads()
 	peak = [0]
 	done = threading.Event()
 	def watch():
 		while not done.is_set():
-			peak[0] = max(peak[0], threading.active_count())
+			peak[0] = max(peak[0], os_threads())
 			time.sleep(0.001)
 	watcher = threading.Thread(target=watch, daemon=True)
 	watcher.start()
@@ -27,8 +27,10 @@ def test_pool_keeps_threads_bounded():
 		done.set()
 		watcher.join()
 	assert codes == [0] * 1000
-	# 4 workers, 2 output readers per running command, and the watcher itself
-	assert peak[0] <= baseline + 4 + 2 * 4 + 1
+	# 4 workers, 2 output readers per running command, the watcher itself, and the 2 readers of each worker's previous
+	# command, which may still be leaving: a reader is done before its thread has left ( its last step needs the CPU, and
+	# the GIL ), and the worker starts its next command meanwhile
+	assert peak[0] <= baseline + 4 + 2 * 4 + 1 + 2 * 4
 
 
 def test_empty_command_list():

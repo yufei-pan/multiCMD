@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 import signal
@@ -45,13 +46,20 @@ def test_max_threads_and_timeout_smoke():
 	assert proc.returncode == 0
 
 
-def test_sudo_flag_without_sudo_binary_does_not_crash(monkeypatch):
-	# Force child env: PATH without sudo by invoking python -c wrapper is heavy;
-	# instead assert current host behavior: --sudo with missing sudo should not
-	# abort with traceback. If sudo exists, command still succeeds for echo.
-	proc = run_cli(["-q", "--sudo", "echo ok"], timeout=20)
+def test_sudo_flag_without_sudo_binary_does_not_crash(tmp_path):
+	# a PATH that holds echo and no sudo: --sudo is ignored, with a note, and the command runs. The host's own sudo is
+	# never run: it may refuse this user ( exit 1, and it reports the try ), as on a Mac's standard account
+	env = None
+	echo = shutil.which('echo')
+	if os.name == 'posix' and echo:
+		(tmp_path / 'echo').symlink_to(echo)
+		env = dict(os.environ, PATH=str(tmp_path))
+	proc = run_cli(["-q", "--sudo", "echo ok"], timeout=20, env=env)
 	assert proc.returncode == 0
 	assert "Traceback" not in (proc.stdout + proc.stderr)
+	if env is not None and os.geteuid() != 0:
+		# ( root needs no sudo, and is not told )
+		assert 'sudo not found' in proc.stderr
 
 
 def test_exit_status_single_command_passes_its_code_through():

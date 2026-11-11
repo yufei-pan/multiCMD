@@ -118,6 +118,16 @@ def sigint_main_after(*delays):
 			pytest.fail(f'the call ended after {sent_by_then} of the {len(delays)} SIGINTs ( at {delays}s )')
 
 
+def os_threads():
+	'''
+	How many threads this process has: every OS thread on Linux ( /proc/self/task ), so a command's output readers, which
+	threading does not list since 1.60, count; threading.active_count() elsewhere, which leaves them out
+	'''
+	if sys.platform.startswith('linux'):
+		return len(os.listdir('/proc/self/task'))
+	return threading.active_count()
+
+
 def pid_gone(pid, wait=3.0):
 	'''Whether a process has exited within wait seconds ( a zombie counts as exited )'''
 	deadline = time.monotonic() + wait

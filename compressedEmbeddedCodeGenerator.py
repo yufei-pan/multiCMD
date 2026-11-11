@@ -2,11 +2,15 @@
 """Build the minified and embeddable copies of a single-file module.
 
 	multiCMD.py -> multiCMD_min.py            (python-minifier)
-	            -> multiCMD_min_lzma_a85.py   (lzma + ascii85 blob in a drop-in import guard)
+	            -> multiCMD_min_zlib_a85.py   (zlib + ascii85 blob in a drop-in import guard)
 
 The import guard uses an installed module only if its version is not older
 than the embedded copy; otherwise it exec()s the embedded copy into a fresh
-module. Paste multiCMD_min_lzma_a85.py verbatim into the consuming scripts.
+module. Paste multiCMD_min_zlib_a85.py verbatim into the consuming scripts.
+It decodes with zlib, not lzma: lzma is an optional module that a Python built
+without the xz headers lacks, and zlib is one pip itself needs. The blob sits
+in a raw string that ascii85 decoding reads with whitespace ignored, so the
+block may also be pasted indented, inside a try of the consumer's.
 
 python-minifier writes f-strings in the syntax of the Python it runs on, so
 run this under Python <= 3.11 to keep the output loadable on Python 3.6+:
@@ -16,9 +20,9 @@ run this under Python <= 3.11 to keep the output loadable on Python 3.6+:
 import argparse
 import ast
 import base64
-import lzma
 import re
 import sys
+import zlib
 from pathlib import Path
 
 # Keep names readable (no renaming) and drop docstrings.
@@ -39,12 +43,12 @@ EMBED_TEMPLATE = '''try:
 	if tuple(int(x) for x in {module}.version.split('.')) < ({version_tuple}):
 		raise ImportError('{module} too old')
 except Exception:
-	import sys,types,base64,lzma   # noqa: E401
+	import sys,types,base64,zlib   # noqa: E401
 	{module} = types.ModuleType("{module}")
 	sys.modules["{module}"] = {module}
 	_SRC_B85=r\'\'\'
 {b85}\'\'\'
-	exec(lzma.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), {module}.__dict__)
+	exec(zlib.decompress(base64.a85decode(_SRC_B85)).decode("utf-8"), {module}.__dict__)
 '''
 
 def minify(source):
@@ -68,22 +72,25 @@ def b85_is_raw_string_safe(b85):
 	return "'''" not in b85 and not b85.endswith("\\")
 
 def compress(data):
-	"""Return (b85_text, preset, is_extreme, compressed_size) for the best preset.
+	"""Return (b85_text, level, mem_level, compressed_size) for the best zlib settings.
 
-	Tries all standard and PRESET_EXTREME presets. Prefers the smallest output,
-	then the lowest preset level, then non-extreme, skipping any whose ascii85
-	text can't be embedded in a raw string.
+	Tries every compression level and memory level. Prefers the smallest output,
+	then the lowest level, then the lowest memory level, skipping any whose
+	ascii85 text can't be embedded in a raw string. The output depends on the
+	zlib library too: the documented command's Python 3.11 has the same one on
+	every run, so the files regenerate byte for byte.
 	"""
 	candidates = []
-	for preset in range(10):
-		for is_extreme in (False, True):
-			blob = lzma.compress(data, preset=preset | (lzma.PRESET_EXTREME if is_extreme else 0))
-			candidates.append((len(blob), preset, is_extreme, blob))
-	for size, preset, is_extreme, blob in sorted(candidates, key=lambda c: c[:3]):
+	for level in range(1, 10):
+		for mem_level in range(1, 10):
+			packer = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS, mem_level)
+			blob = packer.compress(data) + packer.flush()
+			candidates.append((len(blob), level, mem_level, blob))
+	for size, level, mem_level, blob in sorted(candidates, key=lambda c: c[:3]):
 		b85 = base64.a85encode(blob).decode('ascii')
 		if b85_is_raw_string_safe(b85):
-			return b85, preset, is_extreme, size
-	sys.exit("No LZMA preset produced an ascii85 blob that fits in a raw string.")
+			return b85, level, mem_level, size
+	sys.exit("No zlib setting produced an ascii85 blob that fits in a raw string.")
 
 def build_embed(module, version, b85):
 	wrapped = "\n".join(b85[i:i + B85_LINE_WIDTH] for i in range(0, len(b85), B85_LINE_WIDTH))
@@ -98,11 +105,11 @@ def verify_embed(embed, expected_source):
 	if len(literals) != 1:
 		sys.exit("Embed snippet must assign _SRC_B85 exactly once.")
 	text = ast.literal_eval(literals[0])
-	if lzma.decompress(base64.a85decode(text)).decode("utf-8") != expected_source:
+	if zlib.decompress(base64.a85decode(text)).decode("utf-8") != expected_source:
 		sys.exit("Embed snippet does not decode back to the minified source.")
 
 def main():
-	parser = argparse.ArgumentParser(description="Minify a single-file module and build its embeddable lzma/ascii85 import guard.")
+	parser = argparse.ArgumentParser(description="Minify a single-file module and build its embeddable zlib/ascii85 import guard.")
 	parser.add_argument('source', nargs='?', help="Module to process (e.g. multiCMD.py). Prompted for if omitted.")
 	args = parser.parse_args()
 	source_path = Path(args.source or input("Enter the path to the file you want to compress: "))
@@ -117,15 +124,15 @@ def main():
 	min_path = source_path.with_name(f"{module}_min.py")
 	min_path.write_text(minified, encoding="utf-8")
 
-	b85, preset, is_extreme, compressed_size = compress(minified.encode("utf-8"))
+	b85, level, mem_level, compressed_size = compress(minified.encode("utf-8"))
 	embed = build_embed(module, version, b85)
 	verify_embed(embed, minified)
-	embed_path = source_path.with_name(f"{module}_min_lzma_a85.py")
+	embed_path = source_path.with_name(f"{module}_min_zlib_a85.py")
 	embed_path.write_text(embed, encoding="utf-8")
 
 	print(f"{module} {version}")
 	print(f"Wrote {min_path} ({len(minified.encode('utf-8'))} bytes, from {len(source.encode('utf-8'))})")
-	print(f"Wrote {embed_path} (LZMA preset {preset}{' | PRESET_EXTREME' if is_extreme else ''}, {compressed_size} bytes compressed)")
+	print(f"Wrote {embed_path} (zlib {zlib.ZLIB_RUNTIME_VERSION} level {level}, memLevel {mem_level}, {compressed_size} bytes compressed)")
 
 if __name__ == "__main__":
 	main()

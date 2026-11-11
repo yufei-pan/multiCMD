@@ -432,10 +432,19 @@ starts a command keeps that command from running at all; on 3.11+ such a Ctrl-C 
 50-70 µs per start) can leave it running, unknown to `kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
 `kill_all()` or the exit stops it. On Python 3.6-3.9, which raise a Ctrl-C at nearly any instruction,
 even one at a few points between the steps of a run can leave its command registered but not signalled.
-On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a lock can leave it held: one of
-`threading`'s can hang the program as its threads end (CPython's own), and one of multiCMD's (an
-`AsyncExecutor`'s queue, the live output) hangs that executor, or the next call that is not quiet, if the
-program keeps going.
+On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a C-level lock can leave it held: one of
+`threading`'s, in your program's own code, can hang the program as its threads end (CPython's own; multiCMD starts
+its threads where no handler runs), and one of multiCMD's (an `AsyncExecutor`'s queue, the live output) hangs that
+executor, or the next call that is not quiet, if the program keeps going.
+A Python-level primitive such as `threading.Semaphore` or `Condition` is reached on every Python, 3.10 to 3.13
+included: if your program passes its own `Semaphore` as `sem=` to a serial `run_command()` or `run_commands()` on the
+main thread, and keeps going after it catches a Ctrl-C, the Ctrl-C can lose a permit (with `Semaphore(1)` the next
+call waits for ever) or leave the semaphore's internal lock held (every later `acquire()` or `release()` of it blocks,
+on any thread). Measured at 0.02 to 0.42 % of the Ctrl-Cs that land during a 0.2 to 5 ms command, and the same in
+1.59. In the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C can also be
+dropped, about 1 in 700 of those that land there on 3.12 and 3.14 (1.59: 1 in 1,400, and it hung on 3.14): Python
+ignores an exception raised in a weakref callback and prints "Exception ignored", the program goes on, and the next
+Ctrl-C works.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
@@ -486,6 +495,41 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
+
+## Upgrading to 1.60 from 1.59
+
+- Nothing needs doing to upgrade.
+- Fix: a Ctrl-C, or what your own signal handler raises, can no longer hang the program in Python's thread-start lock.
+  Python runs signal handlers on the main thread, and one that raised inside `threading.Thread.start()` there could
+  leave `threading`'s `_active_limbo_lock`, or the new thread's `_started` Event, held: every later thread start then
+  blocked, and on Python 3.6 the exit too. A serial run starts two output readers per command on the main thread, so a
+  program stopped often met it: a probe that stops a serial `run_command(['true'])` at random, 20,000 times in one
+  process, hung 6 of 6 runs with 1.59 on Python 3.14 (after 30 to 9,000 calls) and finished 3 of 3 with 1.60.
+- Fix: what your own signal handler raises (an ordinary exception, a `TimeoutError` from SIGALRM) while a pool or a
+  fire-and-forget batch starts its threads is raised as an interrupt, every command stopped. Before, it was taken for a
+  thread that could not start, and lost. A few microseconds of each start remain (about 4 µs, before the helper that
+  starts the thread exists), see [docs/limitations.md](docs/limitations.md).
+- A command's output readers are now threads started with `_thread.start_new_thread`: they are not in
+  `threading.enumerate()` or `threading.active_count()`, `threading.settrace()`, `setprofile()` and `excepthook` do not
+  reach them, and an error in one is reported through `sys.unraisablehook` (from Python 3.8). A serial run is no slower:
+  its median was 0 to 4 % below 1.59's, timed side by side on 3.6, 3.12 and 3.14.
+- The threads multiCMD starts on the main thread (a pool's workers, fire-and-forget commands, an `AsyncExecutor`'s
+  dispatcher) start through a helper thread, so no signal handler runs inside `threading`'s start: about 20 µs more per
+  start on 3.12 and 3.14 and 10 µs on 3.6 with nothing else running (medians: 40 µs against 22 µs on 3.14; 61 µs
+  against 34 µs on a host loaded past its cores). In a batch whose first commands already run, each hand-off to the
+  helper waits for the GIL, and the main thread spends 0.1 to 0.35 ms more per start on 3.12 and 3.14 (0.35 to 1.1 ms
+  on 3.6): 2.1 ms against 1.3 ms to start 8 workers on 3.14. The batch as a whole still ends sooner, and a pool is no
+  slower for it: 200 `true`s on 16 workers took 35 ms against 47 ms with 1.59 on 3.14, as its readers no longer wait
+  for `threading`'s start. A Ctrl-C that lands while such a thread starts is raised once the start is done (1 s at
+  most), so multiCMD knows whether the thread runs.
+- Known: in the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C is dropped about
+  twice as often as with 1.59 (about 1 in 700 of those that land there, against 1 in 1,400; 1.59 also hung on 3.14
+  there): Python prints "Exception ignored" and the program goes on, and the next Ctrl-C works. See
+  [docs/limitations.md](docs/limitations.md).
+- The embeddable copy for programs that paste multiCMD is now `multiCMD_min_zlib_a85.py`, in place of
+  `multiCMD_min_lzma_a85.py`. It decodes with zlib, so it runs on a Python built without lzma, where the lzma one made
+  the program fail to import unless its installed multiCMD was new enough. It is about 7 % larger. Its block may be
+  pasted indented inside a `try`: ascii85 decoding ignores the added tabs.
 
 ## Upgrading to 1.59 from 1.58
 

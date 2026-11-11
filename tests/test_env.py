@@ -496,6 +496,8 @@ print(task.returncode)
 
 
 def test_an_inherited_variable_with_an_empty_name_is_left_out_of_an_explicit_environment(launcher):
+	if subprocess.run(['env', '=weird', 'true'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+		pytest.skip("this system's env cannot set a variable with an empty name ( macOS: setenv refuses it )")
 	proc = _in_fresh_python("""
 task = multiCMD.run_command(['/usr/bin/env'], quiet=True, extra_env={'A': 'x'}, return_object=True)
 print(task.returncode, sorted(task.stdout))
@@ -700,8 +702,10 @@ def test_enoexec_is_126_with_the_reason(launcher, tmp_path, kwargs):
 
 @pytest.mark.parametrize('kwargs', [{}, {'extra_env': {'A': '1'}}], ids=['plain', 'extra_env'])
 def test_e2big_is_126(launcher, kwargs):
-	# one argument longer than the system takes in a string
-	task = run_command(['true', 'x' * (256 * 1024)], quiet=True, return_object=True, **kwargs)
+	# one argument longer than the system takes: in one string on Linux ( MAX_ARG_STRLEN, 128 KiB ), elsewhere in all of
+	# them together ( ARG_MAX: 1 MiB on macOS, which takes 256 KiB in one )
+	size = 256 * 1024 if sys.platform == 'linux' else os.sysconf('SC_ARG_MAX')
+	task = run_command(['true', 'x' * size], quiet=True, return_object=True, **kwargs)
 	assert task.returncode == 126 and not task._error
 	assert 'Argument list too long' in ' '.join(task.stderr)
 
