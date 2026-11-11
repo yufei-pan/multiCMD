@@ -128,6 +128,20 @@ def os_threads():
 	return threading.active_count()
 
 
+def process_state(pid):
+	'''The state letter of a process ( 'Z': a zombie ), '' when it is gone: from /proc, or from ps where there is none ( macOS )'''
+	try:
+		with open(f'/proc/{pid}/stat') as f:
+			return f.read().rsplit(')', 1)[1].split()[0]
+	except OSError:
+		if os.path.isdir('/proc/self'):
+			# there is a /proc, and no such process in it
+			return ''
+	out = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+		universal_newlines=True).stdout.strip()
+	return out[:1]
+
+
 def pid_gone(pid, wait=3.0):
 	'''Whether a process has exited within wait seconds ( a zombie counts as exited )'''
 	deadline = time.monotonic() + wait
@@ -136,11 +150,7 @@ def pid_gone(pid, wait=3.0):
 			os.kill(pid, 0)
 		except ProcessLookupError:
 			return True
-		try:
-			with open(f'/proc/{pid}/stat') as f:
-				if f.read().rsplit(')', 1)[1].split()[0] == 'Z':
-					return True
-		except OSError:
+		if process_state(pid) in ('', 'Z'):
 			return True
 		if time.monotonic() > deadline:
 			return False
