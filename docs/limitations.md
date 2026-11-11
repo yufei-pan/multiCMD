@@ -157,7 +157,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.
 - Approved: 2026-10-23, the user chose "Known limitation (Recommended)". Amended 2026-11-11 (a caller's `sem=` in a serial run; every Python for `Semaphore` and `Condition`): the user chose "Amend the KL (Recommended)".
 
-### A first Ctrl-C in the start of a fire-and-forget batch can be dropped
+### A first Ctrl-C can be dropped: in a fire-and-forget batch's start, or in a finished command's Popen cleanup
 - Kind: known limitation
 - What the operator sees: in the first milliseconds of a fire-and-forget batch (`run_commands(...,
   wait_for_return=False)`), a first Ctrl-C can do nothing: Python prints "Exception ignored" with the
@@ -172,13 +172,39 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
     against 52.
   - Serial runs drop fewer stops with 1.60 than with 1.59, since a command's readers are no longer `Thread`s in that
     `WeakSet`; pools dropped none with either.
-- Why: 1.60's helper that starts a thread allocates a few objects on the main thread at each start, so the cyclic
-  garbage collection that frees finished fire-and-forget threads (each points at its `Task` and the `Task` at it)
+  - Also in a serial run (widened by the 1.61 review): a Ctrl-C that lands in `Popen`'s cleanup (`Popen.__del__`) of a
+    command that has finished, on the main thread, is dropped the same way. Python prints "Exception ignored in: ...
+    Popen.__del__" with the `KeyboardInterrupt`'s traceback on stderr, the run goes on, and the next Ctrl-C works: press
+    it again. Measured with SIGINTs aimed at random into back-to-back serial `run_command(['true'])` and
+    `['sleep', '0.005']`: 12 of about 6,000 dropped with 1.60 and 3 with 1.61.
+- Why: CPython ignores an exception raised in a `__del__` as it does in a weakref callback, and a serial run frees each
+  finished command's `Popen` on the main thread. For the batch: 1.60's helper that starts a thread allocates a few
+  objects on the main thread at each start, so the cyclic garbage collection that frees finished fire-and-forget threads (each points at its `Task` and the `Task` at it)
   often runs on the main thread now, with the `WeakSet` callbacks it sets off. Keeping that garbage off the main
   thread means breaking the documented `task.thread` link or allocating nothing there per start; neither is worth a
   loss of about 1 in 700 of the first Ctrl-Cs that land in those few ms, with the next one working.
-- Revisit when: someone hits it, or CPython stops ignoring an exception in a weakref callback.
-- Approved: 2026-11-11, the user chose "Release; note it (Recommended)".
+- Revisit when: someone hits it, or CPython stops ignoring an exception in a weakref callback or a `__del__`.
+- Approved: 2026-11-11, the user chose "Release; note it (Recommended)". Widened to serial runs and `Popen.__del__`
+  2026-11-11 (the 1.61 review's P1): the user chose "Widen the entry (Recommended)".
+
+### On Python 3.6 - 3.10 a Ctrl-C as a command starts waits for the exec wrapper's Popen
+- Kind: known limitation
+- What the operator sees: on Python 3.6 - 3.10 (macOS 3.9 included), in a serial run, a Ctrl-C that arrives while
+  multiCMD starts a command waits for the exec wrapper's `Popen` to return (the fork, the exec of the Python binary
+  itself, and the read of Popen's error pipe), then stops the command as usual. Normally that is about 1 ms, and 2 - 5 ms
+  at p99: the 1.61 review aimed 1,000 SIGINTs at random into back-to-back serial `true` and `sleep 0.005` commands, and
+  the time from a SIGINT until the `KeyboardInterrupt` reached the caller was p50 / p90 / p99 11.6 / 14.4 / 20.8 ms on 3.6
+  and 11.5 / 14.4 / 19.6 ms on 3.10, against 10.4 / 12.3 / 17.3 and 10.5 / 11.8 / 14.5 ms with 1.60 (about 10 ms of it is
+  the stop's own wait between SIGINT and SIGTERM). If the exec of the Python binary itself hangs (a venv on an NFS mount
+  that stopped answering), Ctrl-C does nothing until the mount answers, where 1.60 exited 130 (read from the code, not
+  reproduced). On Python 3.11+ there is no wrapper, and nothing changes.
+- Why: before 3.11 the child's signal mask can only be set through the calling thread's, which the child inherits. 1.61
+  blocks SIGINT there for the whole `Popen`, so that a stop reaching the wrapper's Python while it initializes cannot
+  crash it (core dumps on 3.6 and 3.7, "Fatal Python error" on 3.8 - 3.10), and a Ctrl-C that arrives meanwhile stays
+  pending until the mask is restored. `preexec_fn` was rejected, and `os.posix_spawn(setsigmask=)` exists from Python 3.8
+  only.
+- Revisit when: `Popen` gains a way to set the child's signal mask.
+- Approved: 2026-11-11, the user chose "Approve as KL (Recommended)".
 
 ### Check a closed stdout on Windows (EINVAL)
 - Kind: deferred

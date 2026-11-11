@@ -448,7 +448,11 @@ on any thread). Measured at 0.02 to 0.42 % of the Ctrl-Cs that land during a 0.2
 1.59. In the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C can also be
 dropped, about 1 in 700 of those that land there on 3.12 and 3.14 (1.59: 1 in 1,400, and it hung on 3.14): Python
 ignores an exception raised in a weakref callback and prints "Exception ignored", the program goes on, and the next
-Ctrl-C works.
+Ctrl-C works. A serial run can drop one too, in `Popen`'s cleanup (`Popen.__del__`) of a command that has finished (12 of
+about 6,000 aimed Ctrl-Cs with 1.60, 3 with 1.61): the same message, and the next Ctrl-C works. On Python 3.6-3.10 a
+Ctrl-C that arrives as a command starts waits for the exec wrapper's `Popen`, normally about 1 ms (2-5 ms at p99); if the
+exec of the Python binary itself hangs (a venv on an NFS mount that stopped answering), it does nothing until the mount
+answers.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
@@ -524,6 +528,14 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   still inherits SIGINT blocked from a calling thread that has it blocked. On GitHub's runners the core dumps of
   1.60's new stop test (5,000 stops in one process) each started an apport process, which drove the load to 250 and
   timed the 3.6 job out.
+- Known: on Python 3.6 to 3.10 a Ctrl-C that arrives as a command starts waits for the exec wrapper's `Popen` (the fork,
+  the exec of the Python binary, the read of its error pipe), normally about 1 ms (2 to 5 ms at p99), where 1.60 stopped
+  at once. If the exec of the Python binary itself hangs (a venv on an NFS mount that stopped answering), Ctrl-C does
+  nothing until the mount answers; 1.60 exited 130. See [docs/limitations.md](docs/limitations.md).
+- Known: a Ctrl-C that lands in `Popen`'s cleanup (`Popen.__del__`) of a command that has finished, in a serial run, is
+  dropped (12 of about 6,000 aimed Ctrl-Cs with 1.60, 3 with 1.61): Python prints "Exception ignored" and the run goes
+  on; press it again. It is the dropped Ctrl-C of 1.60's note below, in serial runs too. See
+  [docs/limitations.md](docs/limitations.md).
 
 ## Upgrading to 1.60 from 1.59
 
