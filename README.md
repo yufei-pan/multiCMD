@@ -427,7 +427,7 @@ multiCMD from its own threads (where Ctrl-C never arrives), can call `multiCMD.k
 handler. A command not seen to exit a second after SIGKILL is no longer tracked; its pid is named on
 stderr, unless quiet.
 
-multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP / SIGPIPE handlers, nothing
+multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
 else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
 
 A command is registered from the moment `Popen` returns it. Before Python 3.11 the exec wrapper runs
@@ -508,8 +508,9 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
   Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
   Windows, untested). It covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions
-  still raise `BrokenPipeError` when `sys.stdout` fails. `mcmd` now installs a SIGPIPE handler, which ignores every
-  SIGPIPE until stdout is found closed.
+  still raise `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main
+  thread's waits stop the commands at their next step (at most 0.1 s later); `mcmd` leaves SIGPIPE ignored, as Python
+  does, so no signal handler's raise can land inside `Popen` or where Python drops it.
 - Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
   longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
   initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")

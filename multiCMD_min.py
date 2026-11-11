@@ -133,6 +133,8 @@ class _Display:
 	def settle(self):
 		with self.lock:self.redrawable=False
 _display=_Display()
+def _raise_if_stdout_closed():
+	if _display.closed and _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
 		self.max_threads=max_threads
@@ -513,6 +515,7 @@ def _watch(task,proc,timeout):
 	sleep_time=1e-07
 	while proc.poll()is None:
 		if task.stop:return'stop'
+		_raise_if_stdout_closed()
 		if timeout>0 and time.monotonic()-task._last_output>timeout:return'timeout'
 		time.sleep(sleep_time)
 		if sleep_time<.001:sleep_time*=2
@@ -525,6 +528,7 @@ def _join(thread,timeout=None):
 def _drain(task,readers,timeout):
 	while _any_alive(readers):
 		if task.stop:return'stop'
+		_raise_if_stdout_closed()
 		for reader in readers:_join(reader,.05)
 		if timeout>0 and time.monotonic()-task._last_output>timeout and _any_alive(readers):return'timeout'
 def _join_all(threads,limit):
@@ -780,6 +784,7 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 	try:
 		running,error,failed_last=[],None,False
 		for thread in workers:
+			_raise_if_stdout_closed()
 			try:thread.start()
 			except Exception as e:
 				if thread._started.is_set():raise
@@ -791,7 +796,8 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 			for task in tasks:_fail_task(task,f"cannot start a thread to run it: {error}",error,quiet)
 			return
 		if error is not None and not quiet:_write_error(f"multiCMD: started {len(running)} of {wanted} threads: {error}")
-		for thread in running:_join(thread)
+		for thread in running:
+			while not _join(thread,.1):_raise_if_stdout_closed()
 	except BaseException:_stop_tasks(tasks);_join_all(workers,5);raise
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None,pass_fds=()):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error,prefix=prefix,color=color,pty=pty,shell=shell,env=env,extra_env=extra_env,pass_fds=pass_fds)[0]
 def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None,pass_fds=()):
@@ -852,16 +858,8 @@ def _install_cli_signal_handlers():
 		signum=getattr(signal,name,None)
 		if signum is not None and signal.getsignal(signum)!=signal.SIG_IGN:signal.signal(signum,handler)
 	for signum in _TTY_SIGNALS:signal.signal(signum,signal.SIG_IGN)
-	def closed_stdout(signum,frame):
-		if _display.closed:_raise_stdout_closed()
-	if hasattr(signal,'SIGPIPE'):signal.signal(signal.SIGPIPE,closed_stdout)
-def _raise_stdout_closed():
-	if hasattr(signal,'SIGPIPE'):signal.signal(signal.SIGPIPE,signal.SIG_IGN)
-	raise _StdoutClosed()
 def _stdout_closed():
-	if _thread.get_ident()==threading.main_thread().ident:_raise_stdout_closed()
-	if hasattr(signal,'SIGPIPE'):os.kill(os.getpid(),signal.SIGPIPE)
-	else:_end_by_closed_stdout()
+	if _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
 def _end_by_closed_stdout():
 	_kill_running_at_exit()
 	try:sys.stderr.flush()

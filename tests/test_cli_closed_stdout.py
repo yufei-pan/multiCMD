@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -18,12 +19,18 @@ import multiCMD
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='SIGPIPE: POSIX only')
 
 
-def start_cli(args):
-	'''The CLI with its stdout a pipe this test reads ( reader ), and its stderr one that finish() collects'''
+def start_cli(args, driver=None, **fields):
+	'''
+	The CLI with its stdout a pipe this test reads ( reader ), and its stderr one that finish() collects; with a driver
+	( Python code that ends with sys.exit(multiCMD.main()), formatted with {root}, the module's directory, and fields ) in its place
+	'''
 	read_end, write_end = os.pipe()
+	if driver is None:
+		argv = [sys.executable, str(MULTICMD_PY), *args]
+	else:
+		argv = [sys.executable, '-c', driver.format(root=str(MULTICMD_PY.parent), **fields), *args]
 	try:
-		proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL,
-			stdout=write_end, stderr=subprocess.PIPE)
+		proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=write_end, stderr=subprocess.PIPE)
 	except BaseException:
 		os.close(read_end)
 		raise
@@ -146,9 +153,99 @@ def test_a_reader_that_quit_before_help_or_version_ends_the_cli_by_sigpipe(flag)
 	assert err == ''
 
 
+# a driver for the CLI that makes an interrupt raised by a SIGPIPE handler be dropped, where Python drops one: inside a
+# __del__ ( a weakref callback is the same ). Where there is no such handler it leaves the CLI as it is.
+DROPPED_RAISE_DRIVER = '''
+import signal, sys
+sys.path.insert(0, {root!r})
+import multiCMD
+install = multiCMD._install_cli_signal_handlers
+def install_and_drop():
+	install()
+	handler = signal.getsignal(signal.SIGPIPE)
+	if callable(handler):
+		def dropped(signum, frame):
+			class Drops:
+				def __del__(self):
+					handler(signum, frame)
+			Drops()
+		signal.signal(signal.SIGPIPE, dropped)
+multiCMD._install_cli_signal_handlers = install_and_drop
+sys.argv[0] = 'mcmd'
+sys.exit(multiCMD.main())
+'''
+
+
+@posix_only
+@pytest.mark.parametrize('options, count, running', [
+	pytest.param([], 1, 1, id='serial'),
+	pytest.param(['-m', '2'], 2, 2, id='pool'),
+])
+def test_the_stop_does_not_depend_on_one_interrupt_landing(tmp_path, options, count, running):
+	# a signal handler's raise is dropped when it lands in a __del__ or a weakref callback ( Popen.__del__ runs on the main
+	# thread all the time ): the CLI then ran its endless command until a Ctrl-C. The main thread's waits ask for the closed
+	# stdout themselves, so nothing is lost.
+	proc = start_cli(options + [streaming_command(tmp_path, i) for i in range(1, count + 1)], DROPPED_RAISE_DRIVER)
+	try:
+		assert b'Running command' in proc.reader.readline()
+		wait_for_pidfiles(tmp_path, running)
+		proc.reader.close()
+		status, err = finish(proc)
+		assert status == -signal.SIGPIPE
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		proc.reader.close()
+		kill_leftovers(pids_in(tmp_path))
+
+
+# a driver that has a reader's write find stdout closed, from the thread that starts the command, right after Popen forked it
+# ( the thread that sends SIGPIPE in 1.61's first build ). Python 3.11+ runs the command itself, with no wrapper that waits for
+# it to be registered.
+CLOSED_AS_IT_STARTS_DRIVER = '''
+import os, signal, subprocess, sys
+sys.path.insert(0, {root!r})
+import multiCMD
+execute_child = subprocess.Popen._execute_child
+def forked_and_closed(self, *args, **kwargs):
+	execute_child(self, *args, **kwargs)
+	with open({pidfile!r}, 'w') as f:
+		f.write(str(self.pid))
+	multiCMD._display.closed = True
+	os.kill(os.getpid(), signal.SIGPIPE)
+subprocess.Popen._execute_child = forked_and_closed
+sys.argv[0] = 'mcmd'
+sys.exit(multiCMD.main())
+'''
+
+
+@posix_only
+def test_a_closed_stdout_found_as_a_command_starts_does_not_leave_it_running(tmp_path):
+	# a raise from a SIGPIPE handler landed inside Popen, once it had forked and before the command was registered: on Python
+	# 3.11+ the command ran on in a process group of its own, which mcmd knew nothing of ( 12 s here, sleeping )
+	proc = start_cli(['sleep 12'], CLOSED_AS_IT_STARTS_DRIVER, pidfile=str(tmp_path / 'pid1'))
+	try:
+		status, err = finish(proc)
+		assert status == -signal.SIGPIPE
+		assert len(pids_in(tmp_path)) == 1
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		proc.reader.close()
+		kill_leftovers(pids_in(tmp_path))
+
+
+@posix_only
+def test_the_cli_leaves_sigpipe_ignored():
+	# a handler for SIGPIPE that raises runs on the main thread wherever it is: inside Popen once it has forked ( on Python
+	# 3.11+ the command then runs on, known to nobody ), or where Python drops the raise
+	code = ('import signal, sys; sys.path.insert(0, %r); import multiCMD; multiCMD._install_cli_signal_handlers(); '
+		'print(signal.getsignal(signal.SIGPIPE) == signal.SIG_IGN)' % str(MULTICMD_PY.parent))
+	out = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, universal_newlines=True, timeout=30).stdout
+	assert out.strip() == 'True'
+
+
 @posix_only
 def test_a_reader_that_stays_changes_nothing():
-	# the shell's pipeline `mcmd ... | cat` : the handlers installed for a closed stdout leave a full read alone
+	# the shell's pipeline `mcmd ... | cat`: a reader that stays leaves the run alone
 	proc = start_cli(['-p', 'echo line[1-3]'])
 	try:
 		_, err = proc.communicate(timeout=30)
@@ -162,7 +259,7 @@ def test_a_reader_that_stays_changes_nothing():
 
 @posix_only
 def test_a_sigpipe_from_elsewhere_is_ignored():
-	# Python ignores SIGPIPE; the CLI listens to it for one purpose only
+	# Python ignores SIGPIPE, and the CLI leaves it so
 	proc = start_cli(['sleep 0.5'])
 	try:
 		assert b'Running command' in proc.reader.readline()
@@ -178,11 +275,82 @@ def test_a_sigpipe_from_elsewhere_is_ignored():
 			proc.kill()
 
 
+# the waits of a run on the main thread, in this process: a stdout found closed by another thread ( a reader's write ) ends them
+
+
+class CloseOnceStarted:
+	'''
+	Set the display's closed flag, as a reader whose write found no reader does, from another thread: once count commands
+	have written their pid files, and settle seconds after
+	'''
+	def __init__(self, tmp_path, count, settle=0.2):
+		self.cancelled = threading.Event()
+		self.thread = threading.Thread(target=self.run, args=(tmp_path, count, settle), daemon=True)
+		self.thread.start()
+
+	def run(self, tmp_path, count, settle):
+		deadline = time.monotonic() + 20
+		while len(pids_in(tmp_path)) < count and time.monotonic() < deadline:
+			if self.cancelled.wait(0.02):
+				return
+		if not self.cancelled.wait(settle):
+			multiCMD._display.closed = True
+
+	def stop(self):
+		self.cancelled.set()
+		self.thread.join()
+
+
+@pytest.mark.parametrize('kwargs, count', [
+	pytest.param({}, 1, id='serial'),
+	pytest.param({'max_threads': 2}, 2, id='pool'),
+])
+def test_a_closed_stdout_ends_the_wait_for_the_commands(tmp_path, kwargs, count):
+	# ( the commands would sleep 12 s: only the raise, and the stop it starts, ends them sooner )
+	commands = [f'sh -c {shlex.quote(f"echo $$ > {tmp_path}/pid{i}; exec sleep 12")}' for i in range(1, count + 1)]
+	closer = CloseOnceStarted(tmp_path, count)
+	try:
+		with pytest.raises(multiCMD._StdoutClosed):
+			multiCMD.run_commands(commands, quiet=True, **kwargs)
+		assert len(pids_in(tmp_path)) == count
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		closer.stop()
+		kill_leftovers(pids_in(tmp_path))
+
+
+def test_a_closed_stdout_ends_the_wait_for_output_that_a_command_left_open(tmp_path):
+	# the command has exited; what it started holds its output open, and the run reads it to its end
+	closer = CloseOnceStarted(tmp_path, 1)
+	try:
+		with pytest.raises(multiCMD._StdoutClosed):
+			multiCMD.run_command('sh -c ' + shlex.quote(f'sleep 12 & echo $! > {tmp_path}/pid1'), quiet=True)
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		closer.stop()
+		kill_leftovers(pids_in(tmp_path))
+
+
+def test_the_stop_that_a_closed_stdout_starts_is_not_cut_short(tmp_path):
+	# raised once: the waits of the stop ( up to 2 s here: the command ignores SIGINT and SIGTERM, and only SIGKILL ends it )
+	# do not raise it again, so the command is dead when it reaches the caller
+	script = f'trap "" INT TERM; echo $$ > {tmp_path}/pid1; i=0; while [ $i -lt 240 ]; do sleep 0.05; i=$((i+1)); done'
+	closer = CloseOnceStarted(tmp_path, 1)
+	try:
+		with pytest.raises(multiCMD._StdoutClosed):
+			multiCMD.run_command('sh -c ' + shlex.quote(script), quiet=True)
+		assert multiCMD._live_procs == {}
+		assert all(pid_gone(pid, wait=0) for pid in pids_in(tmp_path))
+	finally:
+		closer.stop()
+		kill_leftovers(pids_in(tmp_path))
+
+
 # main() in this process: _end_by_closed_stdout is replaced first, it would end the test run itself
 
 
-def test_main_ends_the_process_when_the_interrupt_was_lost(monkeypatch):
-	# a _StdoutClosed raised where Python drops it ( a weakref callback ) is lost: the run goes on, and main() sees the display closed
+def test_main_ends_the_process_when_no_wait_saw_the_closed_stdout(monkeypatch):
+	# a reader found stdout closed as the run ended, and no wait asked: main() sees the display closed
 	ended = []
 	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', lambda: ended.append(True))
 	def run():
