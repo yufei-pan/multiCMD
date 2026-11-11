@@ -103,9 +103,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A Ctrl-C as a lock is taken or released can leave it held
 - Kind: known limitation
 - What the operator sees: on Python 3.6 - 3.9 and 3.14, a Ctrl-C landing on one instruction of a `with lock:` can
-  leave that lock held. For `threading`'s own locks the program can hang as its threads end (CPython's own). For
-  multiCMD's: an `AsyncExecutor`'s queued commands never start and a later `run_commands()` or `cleanup()` on it
-  blocks, and so does `wait()` if its dispatcher was running; with the live-output lock, the next call that is not
+  leave that lock held. multiCMD starts its threads where no handler runs (1.60), so its own starts no longer reach
+  `threading`'s locks; a program's own `with` on one of them still can. For multiCMD's: an `AsyncExecutor`'s queued
+  commands never start and a later `run_commands()` or `cleanup()` on it blocks, and so does `wait()` if its dispatcher was running; with the live-output lock, the next call that is not
   quiet hangs at its first output line ("Running command: ..."), before it starts its command, and commands still
   running are no longer read, so one that fills its pipe stalls. Only a program that catches the Ctrl-C and keeps
   going (an interactive prompt, say) gets that far; nothing is orphaned, and the exit does not hang. Measured by
@@ -115,30 +115,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   close it, which is new machinery for a one-instruction window in a microsecond call.
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.
 - Approved: 2026-10-23, the user chose "Known limitation (Recommended)".
-
-### A Ctrl-C inside Thread.start() can leave Python's thread lock held
-- Kind: deferred (1.60)
-- What the operator sees: a Ctrl-C (or a signal handler's exception) that Python raises in the calling thread inside
-  `threading.Thread.start()` can leave `threading._active_limbo_lock` held. Every later thread start in the program then
-  blocks, and on Python 3.6 so does its exit (`threading._shutdown`). The calls that start a thread on the calling thread:
-  - a serial `run_command()` or `run_commands()` (`max_threads=1`, waiting): `_execute` starts the command's output
-    readers once it is registered, one thread for stdout and one for stderr (one with a pty), so every command that
-    starts runs two `Thread.start()` calls (a dry run and a command that fails to start run none);
-  - `run_commands()` with `max_threads` above 1 (the pool's workers) and with `wait_for_return=False` (a thread a
-    command);
-  - an `AsyncExecutor`'s dispatcher and its task threads.
-
-  Seen in the 9.87 re-review of hpcp: py-spy showed the main thread in `_join_all` and 1,166 reader threads waiting for
-  that lock, and on 3.6 a hang at exit on it. 2 hangs in about 30,000 stops that landed in such calls, in a probe that
-  stopped one process thousands of times. hpcp's parent runs two serial commands (`cp --version` and a probe's `cp`)
-  before each copy pool: the review estimated about 1 early stop in a million of a real run, ended by Ctrl-\.
-- Why: CPython's own `with` race: a signal that arrives right after `with _active_limbo_lock:` has taken the lock, before
-  the block's exit is armed. It is the `threading`-lock case of "A Ctrl-C as a lock is taken or released can leave it held"
-  (approved above), which a serial run meets on every command it starts.
-- Plan (1.60): `_Thread.start` records a stop that lands while it starts a thread and raises it once the thread is
-  started, as hpcp's `_MAKING` does for the file it makes. Open: multiCMD installs no handler of its own, and blocking the
-  signals in the calling thread does not hold them while another thread exists (see "On Python 3.11+ a Ctrl-C inside
-  Popen ..."), so how to hold a stop for those microseconds is settled first, in a probe like the review's.
-- Revisit when: 1.60.
-- Noted: 2026-11-10, found by the 9.87 fix-round re-review of hpcp (R5); noted without asking, as a deferral. hpcp's
-  docs/limitations.md has a pointer to this entry.
