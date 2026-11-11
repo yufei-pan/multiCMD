@@ -27,9 +27,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.58'
+version = '1.59'
 __version__ = version
-COMMIT_DATE = '2026-11-06'
+COMMIT_DATE = '2026-11-10'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -59,7 +59,10 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # another thread hangs on it.
 # Not a new session ( setsid ) either: that would hide the terminal from sudo.
 # It runs in this process's own environment ( so it starts wherever this Python does, LD_LIBRARY_PATH and the
-# like included ). Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
+# like included ). It runs the command only once the caller has it registered: its second argument is the read end of a
+# pipe ( passed to it alone ) on which the caller writes one byte then ( see _popen ). A caller interrupted inside Popen
+# once it has forked never has the command, and closes the pipe: the wrapper reads its end and exits 125 without running
+# anything. Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
 # the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
 # _MULTICMD_ENV_0 .. _MULTICMD_ENV_<N-1>, handed over by exec itself ( nothing can be cut short ), and it
 # runs with exactly those, found in their PATH like Python 3.11+'s Popen does. A missing or malformed entry
@@ -75,7 +78,11 @@ _PGROUP_EXEC = (
 	"\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\n"
 	"posix.setpgid(0,0)\n"
 	"a=sys.argv\n"
-	"c=a[2]\n"
+	# handed over or not: the byte, or the end of the pipe ( 125, as env and timeout fail on their own )
+	"h=int(a[2])\n"
+	"if not posix.read(h,1):posix._exit(125)\n"
+	"posix.close(h)\n"
+	"c=a[3]\n"
 	"v=None\n"
 	"if a[1]!='-':\n"
 	"\ttry:\n"
@@ -84,8 +91,8 @@ _PGROUP_EXEC = (
 	"\texcept(KeyError,ValueError):\n"
 	"\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\n"
 	"def x(f):\n"
-	"\tif v is None:posix.execv(f,a[2:])\n"
-	"\tposix.execve(f,a[2:],v)\n"
+	"\tif v is None:posix.execv(f,a[3:])\n"
+	"\tposix.execve(f,a[3:],v)\n"
 	"def g(f):\n"
 	"\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n"
 	"\texcept(OSError,ValueError):return False\n"
@@ -158,6 +165,8 @@ class Task:
 		# this command's own environment ( see _check_env ): env replaces the inherited one, extra_env is applied on top
 		self._env = None
 		self._extra_env = None
+		# the descriptors the command inherits, at the same numbers ( see _check_pass_fds ): a sorted tuple of ints
+		self._pass_fds = ()
 		# whether the main thread asked for it once the exit hook had begun ( an atexit handler's call: see _cut_by_exit )
 		self._at_exit = False
 
@@ -416,7 +425,7 @@ class _Display:
 _display = _Display()
 
 class AsyncExecutor:
-	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None):
+	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
 		'''
 		AsyncExecutor class to run commands in parallel asynchronously
 
@@ -438,6 +447,8 @@ class AsyncExecutor:
 			pty: Whether commands write to a pseudo-terminal ( bool, POSIX only )
 			env: The whole environment of each command, replacing the inherited one ( Mapping[str, str] | None: inherit ), as subprocess's env
 			extra_env: Variables added to the inherited environment, or overriding it ( Mapping[str, str | None] | None ); a None value removes the variable
+			pass_fds: Descriptors each command inherits, at the same numbers, as subprocess's pass_fds ( an int, an object with fileno(),
+				or an iterable of either; POSIX only ). Keep them open until the command has started ( its task's start_time is set )
 		'''
 		self.max_threads = max_threads
 		if semaphore is ...:
@@ -457,6 +468,7 @@ class AsyncExecutor:
 		self.env = None if env is None else env.copy()
 		# an empty one ( which _check_env reduces to None ) stays a dict to add to, like env
 		self.extra_env = None if extra_env is None else dict(extra or {})
+		self.pass_fds = _check_pass_fds(pass_fds)
 		# held while tasks, _queue and _dispatching change together
 		self._lock = threading.Lock()
 		# (task, sem, timeout, quiet, dry_run, decor, use_pty) waiting for a permit
@@ -570,7 +582,7 @@ class AsyncExecutor:
 		finally:
 			self._finished.append((threading.current_thread(), None))
 
-	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...):
+	def run_commands(self, commands, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...,pass_fds = ...):
 		'''
 		Run multiple commands in parallel asynchronously. Returns right away, the commands are queued
 		@params:
@@ -587,6 +599,7 @@ class AsyncExecutor:
 			pty: Whether commands write to a pseudo-terminal to override the object default
 			env: The whole environment of the commands to override the object default ( None: inherit )
 			extra_env: Variables added to / overriding the environment, to override the object default ( None: none )
+			pass_fds: Descriptors each command inherits, to override the object default ( see __init__; kept open until each command has started )
 		@returns:
 			list: The Task Object of the commands ( list[Task] )
 		'''
@@ -614,7 +627,9 @@ class AsyncExecutor:
 			env = self.env
 		if extra_env is ...:
 			extra_env = self.extra_env
-		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell, env=env, extra_env=extra_env)
+		if pass_fds is ...:
+			pass_fds = self.pass_fds
+		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell, env=env, extra_env=extra_env, pass_fds=pass_fds)
 		if not sem:
 			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
 		if use_sudo and not dry_run:
@@ -655,7 +670,7 @@ class AsyncExecutor:
 			raise
 		return taskObjects
 	
-	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...):
+	def run_command(self, command, timeout=...,max_threads=...,quiet=...,dry_run=...,parse = ...,sem = ...,shell = ...,prefix = ...,color = ...,pty = ...,env = ...,extra_env = ...,pass_fds = ...):
 		'''
 		Run a command in parallel asynchronously
 		@params:
@@ -664,7 +679,7 @@ class AsyncExecutor:
 		@returns:
 			Task: The Task Object of the command
 		'''
-		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem,shell=shell,prefix=prefix,color=color,pty=pty,env=env,extra_env=extra_env)[0]
+		return self.run_commands([command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,parse=parse,sem=sem,shell=shell,prefix=prefix,color=color,pty=pty,env=env,extra_env=extra_env,pass_fds=pass_fds)[0]
 	
 	def wait(self, timeout=None, threads = ...):
 		'''
@@ -1085,7 +1100,7 @@ def _file_named(command, dirs, start=0):
 			return index, path
 	return None, None
 
-def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
+def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None, pass_fds=()):
 	'''
 	Start a command in a process group of its own ( internal ); see _spawn_process for the arguments
 
@@ -1119,7 +1134,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 		raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), command)
 	if wrapped or not bare:
 		try:
-			return _spawn_process(argv, stdout, stderr, env, explicit, started=started)
+			return _spawn_process(argv, stdout, stderr, env, explicit, started=started, pass_fds=pass_fds)
 		except OSError as e:
 			if wrapped:
 				if e.errno == errno.E2BIG:
@@ -1142,7 +1157,7 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 		index += 1
 		try:
 			# ( one that can run by now just runs, as it would have a moment ago )
-			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path, started=started)
+			return _spawn_process(argv, stdout, stderr, env, explicit, executable=path, started=started, pass_fds=pass_fds)
 		except OSError as e:
 			if e.filename is None:
 				raise
@@ -1156,24 +1171,55 @@ def _spawn(argv, stdout, stderr, env=None, explicit=False, started=None):
 		raise PermissionError(failure.errno, failure.strerror, command)
 	raise _ExecRefused(failure.errno, failure.strerror, command)
 
-def _popen(argv, started=None, grouped=False, **kwargs):
+def _handover_pipe():
+	'''
+	The exec wrapper's hand-over pipe ( internal; see _popen ): ( read end, write end ). The read end is never 0, 1 or 2:
+	in one the caller has closed, Popen would put the command's stdin, stdout or stderr over it in the child
+	'''
+	r, w = os.pipe()
+	low = []
+	while r <= 2:
+		low.append(r)
+		r = os.dup(r)
+	for fd in low:
+		os.close(fd)
+	return r, w
+
+def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 	'''
 	Start a process with subprocess.Popen ( internal )
 	@params:
 		started: A list the command is appended to, as the registry holds it, the moment Popen returns, so a Ctrl-C from
 			there on finds it ( see _execute ). One that Python raises inside Popen, once it has forked, loses the
-			command, which runs on in a process group of its own
+			command: through the exec wrapper ( handover ) it then never runs; with Popen(process_group=) it runs on in
+			a process group of its own ( docs/limitations.md )
 		grouped: Whether the process's pid is its process group id
+		handover: For the exec wrapper, the index in argv of its pipe's read end, filled in here; None otherwise. One
+			byte on the pipe, once the command is in started, lets the wrapper run it; both ends are closed here however
+			Popen ends, and a wrapper that got no byte exits 125 ( see _PGROUP_EXEC )
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
-	proc = subprocess.Popen(argv, **kwargs)
-	command = (proc, proc.pid if grouped else None)
-	if started is not None:
-		started.append(command)
+	pipe = None
+	try:
+		if handover is not None:
+			pipe = _handover_pipe()
+			argv[handover] = str(pipe[0])
+			kwargs['pass_fds'] = tuple(kwargs.get('pass_fds', ())) + (pipe[0],)
+		proc = subprocess.Popen(argv, **kwargs)
+		command = (proc, proc.pid if grouped else None)
+		if started is not None:
+			started.append(command)
+		if pipe is not None:
+			# last in the try: a Ctrl-C that Python 3.6 - 3.9 raise between a try and its finally comes after it
+			os.write(pipe[1], b'1')
+	finally:
+		if pipe is not None:
+			os.close(pipe[0])
+			os.close(pipe[1])
 	return command
 
-def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None, started=None):
+def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=None, started=None, pass_fds=()):
 	'''
 	Start a command in a process group of its own ( internal )
 
@@ -1203,16 +1249,21 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 			is inherited and the wrapper just runs with it, as it always has
 		executable: The file to run as the command, instead of looking argv[0] up ( Popen's executable; not with the wrapper )
 		started: A list the ( Popen, process group id | None ) is appended to the moment Popen returns ( see _popen )
+		pass_fds: Descriptors the command inherits, at the same numbers ( Popen's pass_fds; POSIX only, see _check_pass_fds ).
+			Before 3.11 Popen hands them to the exec wrapper, whose interpreter leaves them alone and whose execv keeps them
 
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
 	kwargs = {'stdin': subprocess.DEVNULL, 'stdout': stdout, 'stderr': stderr, 'env': env}
+	if pass_fds:
+		kwargs['pass_fds'] = pass_fds
 	if executable is not None:
 		kwargs['executable'] = executable
 	if not _IS_POSIX:
 		return _popen(argv, started, **kwargs)
 	grouped = True
+	handover = None
 	if _HAS_PROCESS_GROUP:
 		kwargs['process_group'] = 0
 	elif _uses_wrapper():
@@ -1223,17 +1274,19 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 			kwargs['env'] = dict(_snapshot(os.environb, drop_empty=True))
 			kwargs['env'].update((os.fsencode(_ENV_VAR + str(i)), entry) for i, entry in enumerate(entries))
 			count = str(len(entries))
-		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count] + list(argv)
+		# the hand-over pipe's read end goes in at index 6 ( see _popen )
+		argv = [sys.executable, '-I', '-S', '-c', _PGROUP_EXEC, count, None] + list(argv)
+		handover = 6
 	else:
 		grouped = False
 	if _sigmask is None:
-		return _popen(argv, started, grouped, **kwargs)
+		return _popen(argv, started, grouped, handover, **kwargs)
 	# the mask as it is, read with a call that changes nothing; the block is in the try, as a Ctrl-C can come out of it
 	# with the mask already set ( see _sigmask )
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
 	try:
 		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
-		command = _popen(argv, started, grouped, **kwargs)
+		command = _popen(argv, started, grouped, handover, **kwargs)
 		# ( here too: Python 3.6 - 3.9 can raise a Ctrl-C between the end of a try and its finally, which then never runs )
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
@@ -1750,6 +1803,48 @@ def _check_env(mapping, name, allow_none=False, drop_empty=False):
 		env[key] = value
 	return _EnvSnapshot(env) if env or not allow_none else None
 
+def _check_pass_fds(pass_fds):
+	'''
+	The descriptors a command inherits, as a sorted tuple of ints, checked before anything runs ( internal )
+	It takes an int, an object with fileno(), or an iterable of either ( None or empty: none ), as subprocess's pass_fds
+	does with the first. A descriptor that is negative, a bool, or not open ( os.fstat says so ) is the caller's mistake,
+	which a command started without it would hide: a ValueError naming it. So is any off POSIX, where no command can
+	inherit one. multiCMD neither closes nor duplicates them: the caller keeps them open until the command has started.
+	'''
+	if pass_fds is None:
+		return ()
+	if isinstance(pass_fds, (str, bytes, bytearray)):
+		raise TypeError(f'pass_fds must be a descriptor, an object with fileno() or an iterable of them, not {type(pass_fds).__name__}')
+	if isinstance(pass_fds, int) or hasattr(pass_fds, 'fileno'):
+		pass_fds = (pass_fds,)
+	try:
+		items = list(pass_fds)
+	except TypeError:
+		raise TypeError(f'pass_fds must be a descriptor, an object with fileno() or an iterable of them, not {type(pass_fds).__name__}') from None
+	if items and not _IS_POSIX:
+		raise ValueError('pass_fds needs a POSIX system')
+	fds = set()
+	for item in items:
+		fd = item
+		if not isinstance(item, int) and hasattr(item, 'fileno'):
+			try:
+				fd = item.fileno()
+			except (OSError, ValueError) as e:
+				# a closed file object
+				raise ValueError(f'pass_fds: {item!r} has no open descriptor ( {e} )') from None
+		if isinstance(fd, bool):
+			raise ValueError(f'pass_fds: {item!r} is not a descriptor')
+		if not isinstance(fd, int):
+			raise TypeError(f'pass_fds: {item!r} is not a descriptor or an object with fileno()')
+		if fd < 0:
+			raise ValueError(f'pass_fds: {fd} is not a descriptor')
+		try:
+			os.fstat(fd)
+		except OSError as e:
+			raise ValueError(f'pass_fds: descriptor {fd} is not open ( {e.strerror} )') from None
+		fds.add(fd)
+	return tuple(sorted(fds))
+
 def _apply_extra_env(env, extra_env):
 	'''
 	Add extra_env to env in place; a None value removes the variable ( internal )
@@ -1820,8 +1915,9 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	of multiCMD's: the command is stopped and the caller records it ( -1 ). A second interrupt ends the wait for the
 	stop: the command is sent SIGTERM and stays registered, for kill_all() and the exit hook.
 	The command is registered from the moment Popen has returned it ( see _popen ). An interrupt that Python raises
-	inside Popen, once it has forked, loses it: it runs on in a process group of its own, unknown to kill_all() and
-	the exit hook. Python raises one on the main thread only, some 50 - 70 us per start.
+	inside Popen, once it has forked, loses it. Through the exec wrapper ( Python < 3.11 ) it then never runs: the
+	wrapper waits until the command is registered. With Popen(process_group=) ( 3.11+ ) it runs on in a process group of
+	its own, unknown to kill_all() and the exit hook ( docs/limitations.md ). Python raises one on the main thread only.
 
 	@params:
 		task: The Task
@@ -1848,7 +1944,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			master, slave = _open_pty(len(decor[0]))
 		if master is not None:
 			try:
-				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit, started)
+				proc, pgid = _spawn(task.command, slave, slave, _child_env(task, pager=True), explicit, started, task._pass_fds)
 			finally:
 				# only the command keeps the terminal side open, so the master sees EIO once it is gone
 				os.close(slave)
@@ -1857,7 +1953,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			fd, master = master, None
 			streams = [(io.open(fd, 'rb'), task.stdout)]
 		else:
-			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started)
+			proc, pgid = _spawn(task.command, subprocess.PIPE, subprocess.PIPE, _child_env(task), explicit, started, task._pass_fds)
 			streams = [(proc.stdout, task.stdout), (proc.stderr, task.stderr)]
 		# ( for kill_all() and the exit hook, which know no quiet of their own: see _give_up_on )
 		proc._multicmd_quiet = quiet
@@ -2172,10 +2268,10 @@ def _shell_template(template):
 		i += 1
 	return ''.join(out)
 
-def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, extra_env=None):
+def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, extra_env=None, pass_fds=()):
 	'''
 	Format commands into Tasks, prefixing sudo when requested and available ( internal )
-	env / extra_env ( validated here, before anything runs ) are copied onto every Task
+	env / extra_env / pass_fds ( validated here, before anything runs ) are copied onto every Task
 
 	@returns:
 		tuple[list[Task], bool]: The tasks and whether sudo is used
@@ -2199,6 +2295,7 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 		formatedCommands = [[SUDO_PATH] + command for command in formatedCommands]
 	env = _check_env(env, 'env', drop_empty=True)
 	extra_env = _check_env(extra_env, 'extra_env', allow_none=True)
+	pass_fds = _check_pass_fds(pass_fds)
 	# one snapshot shared by every task of the call
 	tasks = [Task(command) for command in formatedCommands]
 	# a call the main thread makes once the exit hook has begun ( from an atexit handler: see _cut_by_exit )
@@ -2206,6 +2303,7 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 	for task in tasks:
 		task._env = env
 		task._extra_env = extra_env
+		task._pass_fds = pass_fds
 		task._at_exit = at_exit
 	return tasks, bool(use_sudo)
 
@@ -2375,12 +2473,13 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				return_code_only=False,return_object=False,wait_for_return=True, sem = None, 
 				use_sudo = ..., raise_error = False, prefix = False, color = None, pty = False, shell = False,
-				env = None, extra_env = None):
+				env = None, extra_env = None, pass_fds = ()):
 	'''
 	Run a command
 
-	A Ctrl-C ( or a signal handler's exception ) that Python raises inside Popen, once it has forked, leaves the command
-	running unregistered, unknown to kill_all() and the exit hook: some 50 - 70 us per command, and only a serial run
+	A Ctrl-C ( or a signal handler's exception ) that Python raises inside Popen, once it has forked, keeps the command
+	from running on Python < 3.11 ( the exec wrapper waits until it is registered ); on 3.11+ it leaves the command running
+	unregistered, unknown to kill_all() and the exit hook ( some 50 - 70 us per command ). Only a serial run
 	( max_threads=1 ) starts its commands on the main thread, where Python raises them. Anywhere else the command is
 	stopped before the interrupt is re-raised ( see docs/limitations.md for a second one microseconds after it ).
 
@@ -2409,6 +2508,13 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name ( a corrupt os.environ entry ) is left out of the environment of a command given env / extra_env, and out of an env copied from os.environ ( `env=dict(os.environ)` ); a command given neither, with or without pty, inherits it as before. An empty name in extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
+		pass_fds: Descriptors the command inherits, at the same numbers, as subprocess's pass_fds ( POSIX only ): an int, an object
+			with fileno(), or an iterable of either ( empty: none, and every descriptor past 2 is closed in the command, as before ).
+			Checked before anything runs: a negative, bool or closed one is a ValueError, and so is any off POSIX.
+			multiCMD neither closes nor duplicates them: keep them open until the command has started ( with wait_for_return=False,
+			until its task's start_time is set ). With use_sudo, sudo closes descriptors past 2 unless its policy lets the caller
+			keep them ( sudo -C, closefrom_override ); with shell=True the shell inherits them too. dry_run shows the command as it is.
+			Example: run_command(['cp', src, '/dev/fd/%d' % fd], pass_fds=(fd,)) lets cp write a file this process holds open
 
 	@returns:
 		None | int | list[str] | Task: The output of the command
@@ -2416,17 +2522,18 @@ def run_command(command, timeout=0,max_threads=1,quiet=False,dry_run=False,with_
 	return run_commands(commands=[command], timeout=timeout, max_threads=max_threads, quiet=quiet, 
 					 dry_run=dry_run, with_stdErr=with_stdErr, return_code_only=return_code_only, 
 					 return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,
-					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty, shell=shell, env=env, extra_env=extra_env)[0]
+					 use_sudo=use_sudo, raise_error=raise_error, prefix=prefix, color=color, pty=pty, shell=shell, env=env, extra_env=extra_env,
+					 pass_fds=pass_fds)[0]
 
 def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,
 				 return_code_only=False,return_object=False, parse = False, wait_for_return = True, 
 				 sem : threading.Semaphore = None, use_sudo=..., raise_error = False, prefix = False, color = None, pty = False, shell = False,
-				 env = None, extra_env = None):
+				 env = None, extra_env = None, pass_fds = ()):
 	'''
 	Run multiple commands in parallel
 
-	A Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running unregistered
-	( see run_command ).
+	On Python 3.11+ a Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running
+	unregistered ( see run_command ).
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )
@@ -2454,12 +2561,19 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			The inherited environment is os.environ when the command starts ( not variables set behind its back with os.putenv or C setenv ); an inherited variable with an empty name ( a corrupt os.environ entry ) is left out of the environment of a command given env / extra_env, and out of an env copied from os.environ ( `env=dict(os.environ)` ); a command given neither, with or without pty, inherits it as before. An empty name in extra_env is a ValueError.
 			Names and values are str, on POSIX bytes and os.PathLike too; on POSIX the command is looked up in the PATH of the environment it gets ( Windows searches the calling process's PATH )
 			sudo resets the environment by default ( env_reset ), so with use_sudo the variables may not reach the command
+		pass_fds: Descriptors the command inherits, at the same numbers, as subprocess's pass_fds ( POSIX only ): an int, an object
+			with fileno(), or an iterable of either ( empty: none, and every descriptor past 2 is closed in the command, as before ).
+			Checked before anything runs: a negative, bool or closed one is a ValueError, and so is any off POSIX.
+			multiCMD neither closes nor duplicates them: keep them open until the command has started ( with wait_for_return=False,
+			until its task's start_time is set ). With use_sudo, sudo closes descriptors past 2 unless its policy lets the caller
+			keep them ( sudo -C, closefrom_override ); with shell=True the shell inherits them too. dry_run shows the command as it is.
+			Example: run_command(['cp', src, '/dev/fd/%d' % fd], pass_fds=(fd,)) lets cp write a file this process holds open
 
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
 	# initialize the tasks
-	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell, env=env, extra_env=extra_env)
+	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell, env=env, extra_env=extra_env, pass_fds=pass_fds)
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
 	if max_threads < 1:
 		max_threads = len(tasks)

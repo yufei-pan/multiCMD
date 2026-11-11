@@ -66,6 +66,9 @@ def test_timeout_returncode_preserved_after_sigint_handler_stderr():
 			"    sys.stderr.flush()\n"
 			"    sys.exit(0)\n"
 			"signal.signal(signal.SIGINT, handler)\n"
+			# output restarts the inactivity timeout: it fires 0.3 s after the handler is in, however long two interpreter
+			# starts take ( the exec wrapper's and this one's: over 0.3 s at load 200 on 32 cores, 2026-11-10 )
+			"print('ready', flush=True)\n"
 			"time.sleep(10)\n",
 		],
 		timeout=0.3,

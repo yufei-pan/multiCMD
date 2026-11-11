@@ -429,12 +429,29 @@ open(%r, 'w').write(repr((task.returncode, sorted(task.stdout))))
 		assert 'A=x' in eval(out.read_text())[1] and 'PATH=' + os.environ['PATH'] in eval(out.read_text())[1], fd
 
 
+def _handed_over():
+	'''The read end of a pipe holding the byte with which a caller hands the exec wrapper its command ( see _popen )'''
+	r, w = os.pipe()
+	os.write(w, b'1')
+	os.close(w)
+	return r
+
+
+def _run_wrapper(code, count, command, **kwargs):
+	'''Run the exec wrapper ( or code that execs it ) as _spawn_process does, the command handed over'''
+	r = _handed_over()
+	try:
+		return subprocess.run([sys.executable, '-I', '-S', '-c', code, count, str(r)] + command, pass_fds=(r,),
+			stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30, **kwargs)
+	finally:
+		os.close(r)
+
+
 def test_a_missing_part_of_the_environment_stops_the_wrapper_before_it_runs_anything(tmp_path):
 	marker = tmp_path / 'ran'
 	for count, entries in (('3', {b'_MULTICMD_ENV_0': b'A=1', b'_MULTICMD_ENV_1': b'B=2'}), ('1', {b'_MULTICMD_ENV_0': b'NOEQUALS'}), ('x', {})):
-		proc = subprocess.run([sys.executable, '-I', '-S', '-c', multiCMD._PGROUP_EXEC, count, 'touch', str(marker)],
-			env=dict({k.decode(): v.decode() for k, v in entries.items()}, PATH=os.environ['PATH']),
-			stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+		proc = _run_wrapper(multiCMD._PGROUP_EXEC, count, ['touch', str(marker)],
+			env=dict({k.decode(): v.decode() for k, v in entries.items()}, PATH=os.environ['PATH']))
 		assert proc.returncode == 126, (count, proc.stderr)
 		assert 'incomplete environment' in proc.stderr
 		assert not marker.exists()
@@ -713,8 +730,7 @@ def test_the_wrapper_starts_the_command_with_exactly_the_environment_it_was_give
 		"def execve(f, a, e):\n\tprint(sorted(e.items()))\n\tsys.exit(0)\n"
 		"posix.execve = execve\nexec(%r)" % multiCMD._PGROUP_EXEC)
 	env = {'PATH': os.environ['PATH'], '_MULTICMD_ENV_0': 'A=1', '_MULTICMD_ENV_1': 'B=x=y'}
-	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, '2', 'true'], env=env,
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	proc = _run_wrapper(code, '2', ['true'], env=env)
 	assert proc.returncode == 0, proc.stderr
 	assert proc.stdout.strip() == "[(b'A', b'1'), (b'B', b'x=y')]"
 
@@ -725,8 +741,7 @@ def test_the_wrapper_starts_nothing_but_built_in_modules(count):
 	code = ("import posix, sys\nbefore = set(sys.modules)\n"
 		"def run(*a):\n\tprint(sorted(set(sys.modules) - before))\n\tsys.exit(0)\n"
 		"posix.execv = posix.execve = run\nexec(%r)" % multiCMD._PGROUP_EXEC)
-	proc = subprocess.run([sys.executable, '-I', '-S', '-c', code, count, 'sh'], env={'PATH': '/usr/bin:/bin'},
-		stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	proc = _run_wrapper(code, count, ['sh'], env={'PATH': '/usr/bin:/bin'})
 	assert proc.returncode == 0, proc.stderr
 	assert proc.stdout.strip() == '[]'
 

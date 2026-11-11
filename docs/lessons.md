@@ -3,3 +3,4 @@
 One line per change to an API, format or agreed behaviour; the full story of each is in `docs/lessons-full.md`.
 
 - **2026-11-06 multiCMD: a command that differs from another only in case is a script file, not an entry point**: a command name is also a config key to the tools that install it. pip 9 (stock on EL7 and EL8) reads `entry_points.txt` case-folded and fails on upgrade or uninstall, so keep one spelling as the entry point and ship the other as a script file.
+- **2026-11-10 multiCMD: a child that runs code before its exec waits for its parent's go-ahead**: a start interrupted after the fork loses the child. Where the child runs code first (an exec wrapper), have it wait for one byte on a pipe that the parent writes once it has the child registered; an interrupted start closes the pipe, and the child exits without running anything. Measure a race's window on the oldest, slowest platform supported, inside the real program.
