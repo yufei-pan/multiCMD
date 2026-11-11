@@ -179,3 +179,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   loss of about 1 in 700 of the first Ctrl-Cs that land in those few ms, with the next one working.
 - Revisit when: someone hits it, or CPython stops ignoring an exception in a weakref callback.
 - Approved: 2026-11-11, the user chose "Release; note it (Recommended)".
+
+### Check a closed stdout on Windows (EINVAL)
+- Kind: deferred
+- What the operator sees: on Windows, `mcmd ... | head` may not end as on POSIX. A write to a pipe whose reader quit may be
+  reported there as `OSError` with `errno` EINVAL, not as `BrokenPipeError`, and the display catches only the latter, so
+  it would behave as 1.60 did: a traceback from each reader and exit status 120. 1.61's `--help` and README say the
+  closed-stdout status on Windows (1) is untested.
+- Why: there is no Windows host to try it on, and 1.61 does not make it worse.
+- Revisit when: 1.62. Check on Windows and, if confirmed, treat that `OSError` as a closed stdout.

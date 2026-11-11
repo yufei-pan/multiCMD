@@ -93,7 +93,7 @@ exit status:
   N      several commands: how many failed, capped at 101
   2      usage error
   130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
-  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )
 ```
 
 ### Examples
@@ -167,7 +167,7 @@ mcmd --shell -m 4 "dmesg | tail -n 5" "journalctl -n 5 > /tmp/j.log"
 | Several commands | the number that failed, capped at `101` |
 | Usage error (bad option, unbalanced quote, no commands) | `2` |
 | Ctrl-C | `130` (`128+N` after SIGTERM / SIGHUP) |
-| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows |
+| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows (untested there) |
 
 ### Input files and templates
 
@@ -507,10 +507,11 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   and exited 120 (Python's status for a stdout it cannot flush) or 2, and the commands were left to run on: a quiet one,
   or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
   Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
-  Windows, untested). It covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions
-  still raise `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main
-  thread's waits stop the commands at their next step (at most 0.1 s later); `mcmd` leaves SIGPIPE ignored, as Python
-  does, so no signal handler's raise can land inside `Popen` or where Python drops it.
+  Windows, untested: a closed pipe may show there as an `OSError` that `mcmd` does not catch yet, planned for 1.62). It
+  covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions still raise
+  `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main thread's
+  waits stop the commands at their next step (at most 0.1 s later); `mcmd` leaves SIGPIPE ignored, as Python does, so
+  no signal handler's raise can land inside `Popen` or where Python drops it.
 - Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
   longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
   initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")
