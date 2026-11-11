@@ -93,6 +93,7 @@ exit status:
   N      several commands: how many failed, capped at 101
   2      usage error
   130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )
 ```
 
 ### Examples
@@ -166,6 +167,7 @@ mcmd --shell -m 4 "dmesg | tail -n 5" "journalctl -n 5 > /tmp/j.log"
 | Several commands | the number that failed, capped at `101` |
 | Usage error (bad option, unbalanced quote, no commands) | `2` |
 | Ctrl-C | `130` (`128+N` after SIGTERM / SIGHUP) |
+| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows |
 
 ### Input files and templates
 
@@ -415,7 +417,9 @@ Signals sent to your program's group do not reach the commands, so multiCMD stop
 Ctrl-C (or a SIGTERM handler's `sys.exit()`) in a call waiting on the main thread, `join_threads()`
 and `AsyncExecutor.wait()` included, stops every command, skips the queued ones and
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
-commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`). At interpreter exit
+commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
+has no reader (`mcmd ... | head`): it stops them as a Ctrl-C does, and ends by SIGPIPE, as `yes | head` does, with
+nothing on stderr. A program that imports multiCMD still gets the `BrokenPipeError`. At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -423,7 +427,7 @@ multiCMD from its own threads (where Ctrl-C never arrives), can call `multiCMD.k
 handler. A command not seen to exit a second after SIGKILL is no longer tracked; its pid is named on
 stderr, unless quiet.
 
-multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
+multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP / SIGPIPE handlers, nothing
 else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
 
 A command is registered from the moment `Popen` returns it. Before Python 3.11 the exec wrapper runs
@@ -499,6 +503,13 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ## Upgrading to 1.61 from 1.60
 
 - Nothing needs doing to upgrade.
+- Fix: `mcmd ... | head` (a reader that quits early) ends quietly. It printed a traceback or an "Exception ignored" message
+  and exited 120 (Python's status for a stdout it cannot flush) or 2, and the commands were left to run on: a quiet one,
+  or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
+  Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
+  Windows, untested). It covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions
+  still raise `BrokenPipeError` when `sys.stdout` fails. `mcmd` now installs a SIGPIPE handler, which ignores every
+  SIGPIPE until stdout is found closed.
 - Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
   longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
   initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")

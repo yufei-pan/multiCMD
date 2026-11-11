@@ -437,6 +437,12 @@ def _check_started(threads):
 		if not isinstance(thread, _Thread) and thread.ident is None:
 			raise RuntimeError('cannot join thread before it is started')
 
+class _StdoutClosed(BaseException):
+	'''
+	The CLI's stdout has no reader any more ( `mcmd ... | head` ): raised on the main thread, where multiCMD takes it as
+	any interrupt a signal handler raises ( every command stopped ) and main() ends the process ( internal )
+	'''
+
 class _Display:
 	'''
 	Writes multiCMD's live output to sys.stdout, one write per call under one lock ( internal )
@@ -444,11 +450,35 @@ class _Display:
 	Command output lines are written newline-first, so the cursor stays at the end of the last
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
+
+	A write that finds stdout without a reader ( BrokenPipeError ) raises it, as any write does, unless on_closed is set,
+	as the CLI does ( main() ): then it is closed for good, on_closed is called once, in the thread that found it, and
+	every later write is dropped.
+	@attributes:
+		on_closed: Called, without arguments, by the thread whose write found stdout closed ( None: the write raises )
+		closed: Whether a write found stdout closed with on_closed set
 	'''
 	def __init__(self):
 		self.lock = threading.Lock()
 		self.redrawable = False
 		self.at_line_start = True
+		self.on_closed = None
+		self.closed = False
+
+	def _write(self, text):
+		'''
+		Write text to stdout and flush it, with the lock held ( internal )
+		'''
+		if self.closed:
+			return
+		try:
+			sys.stdout.write(text)
+			sys.stdout.flush()
+		except BrokenPipeError:
+			if self.on_closed is None:
+				raise
+			self.closed = True
+			self.on_closed()
 
 	def lines(self, texts, decor=('', '', ''), replace_first=False, ends_with_cr=False):
 		'''
@@ -469,8 +499,7 @@ class _Display:
 					parts.append('\n' + prefix + start + text + end)
 			self.redrawable = ends_with_cr
 			self.at_line_start = False
-			sys.stdout.write(''.join(parts))
-			sys.stdout.flush()
+			self._write(''.join(parts))
 
 	def message(self, text, decor=('', '', '')):
 		'''
@@ -483,8 +512,7 @@ class _Display:
 		with self.lock:
 			lead = '' if self.at_line_start else '\n'
 			body = '\n'.join(prefix + start + line + end for line in text.split('\n'))
-			sys.stdout.write(lead + body + '\n')
-			sys.stdout.flush()
+			self._write(lead + body + '\n')
 			self.redrawable = False
 			self.at_line_start = True
 
@@ -2767,7 +2795,8 @@ _EXIT_STATUS_HELP = '''exit status:
   N      one command: its own exit code ( killed by signal S: 128+S )
   N      several commands: how many failed, capped at 101
   2      usage error
-  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'''
+  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )'''
 
 def _exit_status(tasks):
 	'''
@@ -2790,6 +2819,10 @@ def _install_cli_signal_handlers():
 	SIGTTIN / SIGTTOU are ignored, which every command inherits through exec and through any
 	shell ( dash clears the blocked mask _spawn sets ), so a command that reads the terminal from
 	its background group fails at once instead of hanging.
+	SIGPIPE is how a thread tells the main one that stdout has no reader ( _stdout_closed ): the main thread raises
+	_StdoutClosed, which the run takes as any interrupt a signal handler raises. The kernel sends one for every write to
+	a pipe nobody reads, and so does that thread: until stdout is known closed they are ignored, as Python ignores
+	SIGPIPE, and the first after it raises ( see _raise_stdout_closed ).
 	'''
 	def handler(signum, frame):
 		kill_all(signum)
@@ -2800,6 +2833,56 @@ def _install_cli_signal_handlers():
 			signal.signal(signum, handler)
 	for signum in _TTY_SIGNALS:
 		signal.signal(signum, signal.SIG_IGN)
+	def closed_stdout(signum, frame):
+		if _display.closed:
+			_raise_stdout_closed()
+	if hasattr(signal, 'SIGPIPE'):
+		signal.signal(signal.SIGPIPE, closed_stdout)
+
+def _raise_stdout_closed():
+	'''
+	Raise _StdoutClosed in the main thread, once ( internal )
+	SIGPIPE goes back to being ignored first: the writes that fail meanwhile, and the one that told the main thread, send
+	it again, and a second raise would cut the stop short.
+	'''
+	if hasattr(signal, 'SIGPIPE'):
+		signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+	raise _StdoutClosed()
+
+def _stdout_closed():
+	'''
+	What the CLI does when stdout has no reader ( _Display.on_closed ), in the thread whose write found it ( internal )
+	The main thread raises _StdoutClosed. Another thread has the main one raise it, by SIGPIPE ( see
+	_install_cli_signal_handlers ); where there is no SIGPIPE ( Windows ) it ends the process itself.
+	'''
+	if _thread.get_ident() == threading.main_thread().ident:
+		_raise_stdout_closed()
+	if hasattr(signal, 'SIGPIPE'):
+		os.kill(os.getpid(), signal.SIGPIPE)
+	else:
+		_end_by_closed_stdout()
+
+def _end_by_closed_stdout():
+	'''
+	End the process as one that wrote to a closed pipe ends, as `yes | head` does: by SIGPIPE, which a shell reports as
+	141; Windows has no SIGPIPE: exit status 1 ( internal )
+	The run has stopped its commands by now ( _StdoutClosed went through it as any interrupt ); the exit hook
+	( _kill_running_at_exit ) stops what is left, as when the interpreter exits. Then nothing
+	runs: no traceback, and no flush of the output nobody reads, which Python would report as "Exception ignored" and
+	exit status 120. signal.signal() needs the main thread, which is where this is called on POSIX.
+	'''
+	_kill_running_at_exit()
+	try:
+		sys.stderr.flush()
+	except Exception:
+		pass
+	sigpipe = getattr(signal, 'SIGPIPE', None)
+	if sigpipe is None:
+		os._exit(1)
+	signal.signal(sigpipe, signal.SIG_DFL)
+	os.kill(os.getpid(), sigpipe)
+	# not reached, unless the calling thread blocks SIGPIPE: then the status alone says so
+	os._exit(128 + sigpipe)
 
 _RETURNCODE_LABELS = {124: 'timeout', 126: 'cannot execute', 127: 'not found'}
 
@@ -2920,6 +3003,29 @@ def _cli_commands(args):
 	return commands
 
 def main():
+	'''
+	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) is taken as an interrupt: every
+	command is stopped, as a Ctrl-C stops them, and the process ends by SIGPIPE with nothing on stderr
+	( _end_by_closed_stdout ). The library's functions keep raising BrokenPipeError as they did.
+	@returns:
+		int: The exit status
+	'''
+	_display.on_closed = _stdout_closed
+	try:
+		try:
+			status = _run_cli()
+		finally:
+			# what argparse's -h and -V left in the buffer: Python's own flush at exit would fail with a message and status 120
+			if sys.stdout is not None:
+				sys.stdout.flush()
+		if _display.closed:
+			# an interrupt that was raised where Python drops it ( a weakref callback ) lost it, and the run went on
+			raise _StdoutClosed()
+	except (BrokenPipeError, _StdoutClosed):
+		_end_by_closed_stdout()
+	return status
+
+def _run_cli():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
 		formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('commands', metavar='command', type=str, nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )')

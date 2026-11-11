@@ -110,8 +110,15 @@ def _any_alive(threads):
 def _check_started(threads):
 	for thread in threads:
 		if not isinstance(thread,_Thread)and thread.ident is None:raise RuntimeError('cannot join thread before it is started')
+class _StdoutClosed(BaseException):0
 class _Display:
-	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True
+	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_closed=None;self.closed=False
+	def _write(self,text):
+		if self.closed:return
+		try:sys.stdout.write(text);sys.stdout.flush()
+		except BrokenPipeError:
+			if self.on_closed is None:raise
+			self.closed=True;self.on_closed()
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
 		with self.lock:
@@ -119,10 +126,10 @@ class _Display:
 			for(i,text)in enumerate(texts):
 				if i==0 and replace_first and self.redrawable:parts.append('\r'+prefix+start+text+end+('\x1b[K'if _stdout_isatty()else''))
 				else:parts.append('\n'+prefix+start+text+end)
-			self.redrawable=ends_with_cr;self.at_line_start=False;sys.stdout.write(''.join(parts));sys.stdout.flush()
+			self.redrawable=ends_with_cr;self.at_line_start=False;self._write(''.join(parts))
 	def message(self,text,decor=('','','')):
 		prefix,start,end=decor
-		with self.lock:lead=''if self.at_line_start else'\n';body='\n'.join(prefix+start+line+end for line in text.split('\n'));sys.stdout.write(lead+body+'\n');sys.stdout.flush();self.redrawable=False;self.at_line_start=True
+		with self.lock:lead=''if self.at_line_start else'\n';body='\n'.join(prefix+start+line+end for line in text.split('\n'));self._write(lead+body+'\n');self.redrawable=False;self.at_line_start=True
 	def settle(self):
 		with self.lock:self.redrawable=False
 _display=_Display()
@@ -832,7 +839,7 @@ def join_threads(threads=...,timeout=None):
 		for thread in threads:_join(thread,timeout)
 	except BaseException:ours=[thread for thread in threads if isinstance(thread,_Thread)and thread.task is not None];_stop_tasks([thread.task for thread in ours]);_join_all(ours,5);raise
 	__reap_finished_threads()
-_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'
+_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )\n  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )'
 def _exit_status(tasks):
 	if len(tasks)==1:
 		returncode=tasks[0].returncode
@@ -845,6 +852,23 @@ def _install_cli_signal_handlers():
 		signum=getattr(signal,name,None)
 		if signum is not None and signal.getsignal(signum)!=signal.SIG_IGN:signal.signal(signum,handler)
 	for signum in _TTY_SIGNALS:signal.signal(signum,signal.SIG_IGN)
+	def closed_stdout(signum,frame):
+		if _display.closed:_raise_stdout_closed()
+	if hasattr(signal,'SIGPIPE'):signal.signal(signal.SIGPIPE,closed_stdout)
+def _raise_stdout_closed():
+	if hasattr(signal,'SIGPIPE'):signal.signal(signal.SIGPIPE,signal.SIG_IGN)
+	raise _StdoutClosed()
+def _stdout_closed():
+	if _thread.get_ident()==threading.main_thread().ident:_raise_stdout_closed()
+	if hasattr(signal,'SIGPIPE'):os.kill(os.getpid(),signal.SIGPIPE)
+	else:_end_by_closed_stdout()
+def _end_by_closed_stdout():
+	_kill_running_at_exit()
+	try:sys.stderr.flush()
+	except Exception:pass
+	sigpipe=getattr(signal,'SIGPIPE',None)
+	if sigpipe is None:os._exit(1)
+	signal.signal(sigpipe,signal.SIG_DFL);os.kill(os.getpid(),sigpipe);os._exit(128+sigpipe)
 _RETURNCODE_LABELS={124:'timeout',126:'cannot execute',127:'not found'}
 def _format_returncode(task):
 	returncode=task.returncode
@@ -894,6 +918,15 @@ def _cli_commands(args):
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
+	_display.on_closed=_stdout_closed
+	try:
+		try:status=_run_cli()
+		finally:
+			if sys.stdout is not None:sys.stdout.flush()
+		if _display.closed:raise _StdoutClosed()
+	except(BrokenPipeError,_StdoutClosed):_end_by_closed_stdout()
+	return status
+def _run_cli():
 	parser=argparse.ArgumentParser(description='Run multiple commands in parallel',epilog=_EXIT_STATUS_HELP,formatter_class=argparse.RawDescriptionHelpFormatter);parser.add_argument('commands',metavar='command',type=str,nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='SECONDS',type=float,default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of commands to run at once ( 0 = all )');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode: hide command output ( the summary still shows )');parser.add_argument('-n','--dry-run',action='store_true',help='print each command, quoted, instead of running it');parser.add_argument('--shell',action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )');parser.add_argument('-e','--env',metavar='NAME=VALUE',action='append',help='set NAME to VALUE in the environment of every command ( repeatable ); NAME alone removes it');parser.add_argument('-f','--file',metavar='FILE',action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )');parser.add_argument('-a','--arg-file',metavar='FILE',action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )');summary=parser.add_mutually_exclusive_group();summary.add_argument('--summary',dest='summary',action='store_const',const='all',help='list every command in the end-of-run summary ( default: only failed ones )');summary.add_argument('--no-summary',dest='summary',action='store_const',const='none',help='do not print the end-of-run summary');parser.add_argument('--no-prefix',action='store_true',help='do not prefix output lines with [#] when commands run at once');parser.add_argument('--no-color',action='store_true',help='do not color output lines per command');pty_mode=parser.add_mutually_exclusive_group();pty_mode.add_argument('--pty',dest='pty',action='store_true',help='give commands a pseudo-terminal so they print live ( default when stdout is a terminal )');pty_mode.add_argument('--no-pty',dest='pty',action='store_false',help='give commands plain pipes');parser.set_defaults(summary='failed',pty=None);parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args()
 	if not args.commands and not args.file:parser.error('no commands given')
 	if args.arg_file and not args.commands:parser.error('-a/--arg-file needs at least one command template')
