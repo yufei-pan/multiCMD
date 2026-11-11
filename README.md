@@ -498,13 +498,14 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   process, hung 3 of 3 runs with 1.59 on Python 3.14 (after 4,690 to 9,000 calls) and finished 3 of 3 with 1.60.
 - A command's output readers are now threads started with `_thread.start_new_thread`: they are not in
   `threading.enumerate()` or `threading.active_count()`, `threading.settrace()`, `setprofile()` and `excepthook` do not
-  reach them, and an error in one is reported through `sys.unraisablehook` (from Python 3.8). A serial run costs what it
-  did (a serial `true`: 331 µs against 342 µs with 1.59 on 3.14, medians timed side by side).
+  reach them, and an error in one is reported through `sys.unraisablehook` (from Python 3.8). A serial run is no slower:
+  its median was 0 to 4 % below 1.59's, timed side by side on 3.6, 3.12 and 3.14.
 - The threads multiCMD starts on the main thread (a pool's workers, fire-and-forget commands, an `AsyncExecutor`'s
-  dispatcher) start through a helper thread, so no signal handler runs inside `threading`'s start: about 25 µs more per
-  start on 3.12 and 3.14, 50 µs on 3.6 (medians, on a busy host). A pool is no slower for it: 200 `true`s on 16 workers
-  took 54 ms against 65 ms with 1.59 on 3.14, as its readers no longer wait for `threading`'s start. A Ctrl-C that lands
-  while such a thread starts is raised once the start is done (1 s at most), so multiCMD knows whether the thread runs.
+  dispatcher) start through a helper thread, so no signal handler runs inside `threading`'s start: about 20 µs more per
+  start on 3.12 and 3.14 and 10 µs on 3.6 (medians: 40 µs against 22 µs on 3.14; 61 µs against 34 µs on a host loaded
+  past its cores). A pool is no slower for it: 200 `true`s on 16 workers took 35 ms against 47 ms with 1.59 on 3.14, as
+  its readers no longer wait for `threading`'s start. A Ctrl-C that lands while such a thread starts is raised once the
+  start is done (1 s at most), so multiCMD knows whether the thread runs.
 - The embeddable copy for programs that paste multiCMD is now `multiCMD_min_zlib_a85.py`, in place of
   `multiCMD_min_lzma_a85.py`. It decodes with zlib, so it runs on a Python built without lzma, where the lzma one made
   the program fail to import unless its installed multiCMD was new enough. It is about 7 % larger. Its block may be
