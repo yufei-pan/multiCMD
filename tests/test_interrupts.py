@@ -647,9 +647,10 @@ print('%d calls, %d stopped, %d other errors' % (n, stops, others), flush=True)
 @pytest.mark.skipif(not hasattr(signal, 'setitimer'), reason='POSIX timers')
 def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
 	# ( the 1.60 plan, K; seen in hpcp 9.87's re-review ) a stop inside an output reader's Thread.start() on the main thread
-	# left threading's _active_limbo_lock held, and every later thread start hung: up to 1.59 on 3.14 this probe hung after
-	# 30, 130 and 1,800 calls in the plan's three runs. 3.6 never hung so in 60,000 calls. 5,000 calls take about 75 s on
-	# 3.6 ( a call and the sleep after it ): 600 s leaves eight times that under -n auto
+	# left threading's _active_limbo_lock held, and every later thread start hung: up to 1.59 on 3.14 this probe hung in 6 of
+	# 6 runs of 20,000 calls, after 30 to 9,000 calls ( three runs by the plan, three by the build ). 3.6 never hung so in
+	# 60,000 calls. 5,000 calls take about 75 s on 3.6 ( a call and the sleep after it ): 600 s leaves eight times that
+	# under -n auto
 	probe = tmp_path / 'probe.py'
 	probe.write_text(STOP_PROBE)
 	run = subprocess.run([sys.executable, '-I', str(probe), str(PACKAGE_ROOT), '5000'], stdout=subprocess.PIPE,

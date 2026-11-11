@@ -287,8 +287,8 @@ class _Done:
 		return True
 
 # How long an interrupted _Thread.start waits for its helper to finish the start, so _started is right when the interrupt
-# reaches the caller: a main-thread start through the helper took 40 us (median) and 74 us (p90) on Python 3.14, and at most
-# 2 ms (3.6's p90) on a host loaded past its 32 cores ( measured for 1.60 ); 1 s is the bound in which hpcp acts on a stop
+# reaches the caller: a main-thread start through the helper took 40 us (median) and 74 us (p90) on Python 3.14, and 2 ms
+# at 3.6's p90 on a host loaded past its 32 cores ( measured for 1.60 ); 1 s is the bound in which hpcp acts on a stop
 # (_check_stop), so the wait never holds an interrupt longer than that.
 _START_WAIT = 1
 

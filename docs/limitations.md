@@ -102,16 +102,70 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### A Ctrl-C as a lock is taken or released can leave it held
 - Kind: known limitation
-- What the operator sees: on Python 3.6 - 3.9 and 3.14, a Ctrl-C landing on one instruction of a `with lock:` can
-  leave that lock held. multiCMD starts its threads where no handler runs (1.60), so its own starts no longer reach
-  `threading`'s locks; a program's own `with` on one of them still can. For multiCMD's: an `AsyncExecutor`'s queued
-  commands never start and a later `run_commands()` or `cleanup()` on it blocks, and so does `wait()` if its dispatcher was running; with the live-output lock, the next call that is not
-  quiet hangs at its first output line ("Running command: ..."), before it starts its command, and commands still
-  running are no longer read, so one that fills its pipe stalls. Only a program that catches the Ctrl-C and keeps
-  going (an interactive prompt, say) gets that far; nothing is orphaned, and the exit does not hang. Measured by
-  the 1.56 review with real signals aimed at the executor's locked region: about 60% of those interrupts left the
-  lock held on 3.14, 0.2 - 0.5% on 3.6 - 3.9, none on 3.10 and 3.12. The same in 1.55.
+- What the operator sees: a Ctrl-C landing on one instruction of a `with lock:` can leave that lock held, or, for a
+  semaphore, take a permit that is never given back. Which Pythons depends on the lock:
+  - **A C-level lock** (`threading.Lock` and the locks multiCMD keeps on it): on Python 3.6 - 3.9 and 3.14.
+    multiCMD starts its threads where no handler runs (1.60), so its own starts no longer reach `threading`'s
+    locks; a program's own `with` on one of them still can. For multiCMD's: an `AsyncExecutor`'s queued
+    commands never start and a later `run_commands()` or `cleanup()` on it blocks, and so does `wait()` if its dispatcher was running; with the live-output lock, the next call that is not
+    quiet hangs at its first output line ("Running command: ..."), before it starts its command, and commands still
+    running are no longer read, so one that fills its pipe stalls. Only a program that catches the Ctrl-C and keeps
+    going (an interactive prompt, say) gets that far; nothing is orphaned, and the exit does not hang. Measured by
+    the 1.56 review with real signals aimed at the executor's locked region: about 60% of those interrupts left the
+    lock held on 3.14, 0.2 - 0.5% on 3.6 - 3.9, none on 3.10 and 3.12. The same in 1.55.
+  - **A Python-level primitive** (`threading.Semaphore`, `Condition`): on every Python, 3.10 to 3.13 included,
+    because their `acquire`, `release`, `__enter__` and `__exit__` are Python code, where the Ctrl-C can land
+    between any two calls. multiCMD reaches one only through a caller's own `sem=` (a `threading.Semaphore`) in a
+    serial `run_command()` or `run_commands()` (`max_threads=1`, waiting) on the main thread, where `with sem:` takes
+    the permit. A program that catches the Ctrl-C and keeps going can then find the permit lost (with `Semaphore(1)`
+    its next call waits for ever, or until another Ctrl-C if it waits on the main thread) or the semaphore's internal
+    lock jammed (every later `acquire()` or `release()` of it blocks, on any thread, and no Ctrl-C reaches another
+    thread's run that shares it). Measured by the 1.60 review (3.11 and 3.13 by its fixer, with the same probe): a serial `run_command(['true'], sem=S)` with
+    `S = Semaphore(1)`, stopped at a random moment of its 0.2 - 5 ms by a SIGALRM handler raising `KeyboardInterrupt`,
+    5,000 times per Python (Docker):
+
+    | Python | stopped | permits lost | locks jammed | together |
+    |---|---|---|---|---|
+    | 3.6 | 4,996 | 1 | 0 | 0.02 % |
+    | 3.9 | 5,000 | 2 | 2 | 0.08 % |
+    | 3.10 | 4,997 | 1 | 1 | 0.04 % |
+    | 3.11 | 4,972 | 13 | 8 | 0.42 % |
+    | 3.12 | 4,973 | 5 | 8 | 0.26 % |
+    | 3.13 | 4,986 | 4 | 3 | 0.14 % |
+    | 3.14 | 4,953 | 8 | 10 | 0.36 % |
+
+    The window is a few µs per command, so a command that runs longer meets it proportionally less often. It is
+    not new: 1.60 leaves `with sem:` as it was, and 1.59 on 3.6 lost a permit at the same rate (1 in 4,992).
+    Not reached: the default per-call semaphore (it dies with the call that the Ctrl-C ends); pools, fire-and-forget
+    runs and executors, which take theirs off the main thread, where no handler runs; hpcp, statblk and statbtrfs,
+    which pass no `sem=`.
 - Why: writing the acquire and `try` out by hand leaves the same gap on 3.14; only lock-free structures would
-  close it, which is new machinery for a one-instruction window in a microsecond call.
+  close it, which is new machinery for a one-instruction window in a microsecond call. For a caller's `sem=`, the
+  fix would be to take its permit on a helper thread, as `_Thread.start` starts threads: a thread start for each
+  serial command that has one (about 20 - 40 µs, about 10 % of a 230 µs `true`), and logic to give back a permit that
+  the helper gets after the caller was interrupted.
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.
-- Approved: 2026-10-23, the user chose "Known limitation (Recommended)".
+- Approved: 2026-10-23, the user chose "Known limitation (Recommended)". Amended 2026-11-11 (a caller's `sem=` in a serial run; every Python for `Semaphore` and `Condition`): the user chose "Amend the KL (Recommended)".
+
+### A first Ctrl-C in the start of a fire-and-forget batch can be dropped
+- Kind: known limitation
+- What the operator sees: in the first milliseconds of a fire-and-forget batch (`run_commands(...,
+  wait_for_return=False)`), a first Ctrl-C can do nothing: Python prints "Exception ignored" with the
+  `KeyboardInterrupt`'s traceback (naming `WeakSet.__init__.<locals>._remove`) on stderr, and the program goes on
+  with every command still running. The next Ctrl-C works. CPython ignores an exception raised inside a weakref
+  callback, and `threading` keeps every `Thread` in a `WeakSet` (`threading._dangling`), whose callback runs on the
+  main thread when a finished thread is freed there.
+  - Measured by the 1.60 review: stops at random moments in the first 4 ms of an 8-command batch, 1.60 against 1.59.
+  - 3 times 5,000 stops: 3.12 dropped 23 (0.15 %) against 11 (0.07 %); 3.14 dropped 22 (0.15 %), and 1.59 hung in
+    all three runs (the thread-start hang that 1.60 fixes).
+  - 1,500 stops: 3.6 dropped 1 against 0, 3.13 2 against 0, 3.14 3 against 0, and the free-threaded 3.13t 53
+    against 52.
+  - Serial runs drop fewer stops with 1.60 than with 1.59, since a command's readers are no longer `Thread`s in that
+    `WeakSet`; pools dropped none with either.
+- Why: 1.60's helper that starts a thread allocates a few objects on the main thread at each start, so the cyclic
+  garbage collection that frees finished fire-and-forget threads (each points at its `Task` and the `Task` at it)
+  often runs on the main thread now, with the `WeakSet` callbacks it sets off. Keeping that garbage off the main
+  thread means breaking the documented `task.thread` link or allocating nothing there per start; neither is worth a
+  loss of about 1 in 700 of the first Ctrl-Cs that land in those few ms, with the next one working.
+- Revisit when: someone hits it, or CPython stops ignoring an exception in a weakref callback.
+- Approved: Fire-and-forget start window noted 2026-11-11: the user chose "Release; note it (Recommended)".

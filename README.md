@@ -432,10 +432,19 @@ starts a command keeps that command from running at all; on 3.11+ such a Ctrl-C 
 50-70 µs per start) can leave it running, unknown to `kill_all()`. Two Ctrl-Cs microseconds apart can leave a command running, still registered, until
 `kill_all()` or the exit stops it. On Python 3.6-3.9, which raise a Ctrl-C at nearly any instruction,
 even one at a few points between the steps of a run can leave its command registered but not signalled.
-On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a lock can leave it held: one of
+On Python 3.6-3.9 and 3.14 a Ctrl-C at the wrong instruction of a `with` on a C-level lock can leave it held: one of
 `threading`'s, in your program's own code, can hang the program as its threads end (CPython's own; multiCMD starts
 its threads where no handler runs), and one of multiCMD's (an `AsyncExecutor`'s queue, the live output) hangs that
 executor, or the next call that is not quiet, if the program keeps going.
+A Python-level primitive such as `threading.Semaphore` or `Condition` is reached on every Python, 3.10 to 3.13
+included: if your program passes its own `Semaphore` as `sem=` to a serial `run_command()` or `run_commands()` on the
+main thread, and keeps going after it catches a Ctrl-C, the Ctrl-C can lose a permit (with `Semaphore(1)` the next
+call waits for ever) or leave the semaphore's internal lock held (every later `acquire()` or `release()` of it blocks,
+on any thread). Measured at 0.02 to 0.42 % of the Ctrl-Cs that land during a 0.2 to 5 ms command, and the same in
+1.59. In the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C can also be
+dropped, about 1 in 700 of those that land there on 3.12 and 3.14 (1.59: 1 in 1,400, and it hung on 3.14): Python
+ignores an exception raised in a weakref callback and prints "Exception ignored", the program goes on, and the next
+Ctrl-C works.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
@@ -495,7 +504,7 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   leave `threading`'s `_active_limbo_lock`, or the new thread's `_started` Event, held: every later thread start then
   blocked, and on Python 3.6 the exit too. A serial run starts two output readers per command on the main thread, so a
   program stopped often met it: a probe that stops a serial `run_command(['true'])` at random, 20,000 times in one
-  process, hung 3 of 3 runs with 1.59 on Python 3.14 (after 4,690 to 9,000 calls) and finished 3 of 3 with 1.60.
+  process, hung 6 of 6 runs with 1.59 on Python 3.14 (after 30 to 9,000 calls) and finished 3 of 3 with 1.60.
 - A command's output readers are now threads started with `_thread.start_new_thread`: they are not in
   `threading.enumerate()` or `threading.active_count()`, `threading.settrace()`, `setprofile()` and `excepthook` do not
   reach them, and an error in one is reported through `sys.unraisablehook` (from Python 3.8). A serial run is no slower:
