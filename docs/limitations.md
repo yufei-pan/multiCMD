@@ -178,4 +178,4 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   thread means breaking the documented `task.thread` link or allocating nothing there per start; neither is worth a
   loss of about 1 in 700 of the first Ctrl-Cs that land in those few ms, with the next one working.
 - Revisit when: someone hits it, or CPython stops ignoring an exception in a weakref callback.
-- Approved: Fire-and-forget start window noted 2026-11-11: the user chose "Release; note it (Recommended)".
+- Approved: 2026-11-11, the user chose "Release; note it (Recommended)".

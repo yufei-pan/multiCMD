@@ -515,10 +515,17 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   its median was 0 to 4 % below 1.59's, timed side by side on 3.6, 3.12 and 3.14.
 - The threads multiCMD starts on the main thread (a pool's workers, fire-and-forget commands, an `AsyncExecutor`'s
   dispatcher) start through a helper thread, so no signal handler runs inside `threading`'s start: about 20 µs more per
-  start on 3.12 and 3.14 and 10 µs on 3.6 (medians: 40 µs against 22 µs on 3.14; 61 µs against 34 µs on a host loaded
-  past its cores). A pool is no slower for it: 200 `true`s on 16 workers took 35 ms against 47 ms with 1.59 on 3.14, as
-  its readers no longer wait for `threading`'s start. A Ctrl-C that lands while such a thread starts is raised once the
-  start is done (1 s at most), so multiCMD knows whether the thread runs.
+  start on 3.12 and 3.14 and 10 µs on 3.6 with nothing else running (medians: 40 µs against 22 µs on 3.14; 61 µs
+  against 34 µs on a host loaded past its cores). In a batch whose first commands already run, each hand-off to the
+  helper waits for the GIL, and the main thread spends 0.1 to 0.35 ms more per start on 3.12 and 3.14 (0.35 to 1.1 ms
+  on 3.6): 2.1 ms against 1.3 ms to start 8 workers on 3.14. The batch as a whole still ends sooner, and a pool is no
+  slower for it: 200 `true`s on 16 workers took 35 ms against 47 ms with 1.59 on 3.14, as its readers no longer wait
+  for `threading`'s start. A Ctrl-C that lands while such a thread starts is raised once the start is done (1 s at
+  most), so multiCMD knows whether the thread runs.
+- Known: in the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C is dropped about
+  twice as often as with 1.59 (about 1 in 700 of those that land there, against 1 in 1,400; 1.59 also hung on 3.14
+  there): Python prints "Exception ignored" and the program goes on, and the next Ctrl-C works. See
+  [docs/limitations.md](docs/limitations.md).
 - The embeddable copy for programs that paste multiCMD is now `multiCMD_min_zlib_a85.py`, in place of
   `multiCMD_min_lzma_a85.py`. It decodes with zlib, so it runs on a Python built without lzma, where the lzma one made
   the program fail to import unless its installed multiCMD was new enough. It is about 7 % larger. Its block may be

@@ -3,7 +3,7 @@ import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,ma
 from pprint import pformat
 version='1.60'
 __version__=version
-COMMIT_DATE='2026-11-10'
+COMMIT_DATE='2026-11-11'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
