@@ -1,3 +1,6 @@
+import errno
+import sys
+
 import pytest
 
 import multiCMD
@@ -113,3 +116,48 @@ def test_resolve_color(monkeypatch):
 def test_quote_command():
 	assert multiCMD._quote_command(['echo', 'a b', "it's"]) == "echo 'a b' 'it'\"'\"'s'"
 	assert multiCMD._quote_command('echo hi') == 'echo hi'
+
+
+class ClosedPipe:
+	'''A stdout nobody reads: every write fails as a pipe whose reader quit does'''
+	def write(self, text):
+		raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
+
+	def flush(self):
+		pass
+
+
+def test_a_closed_stdout_raises_for_the_library(monkeypatch):
+	# on_closed is the CLI's: a program that imports multiCMD gets the BrokenPipeError, as it always did
+	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
+	display = multiCMD._Display()
+	with pytest.raises(BrokenPipeError):
+		display.message('header')
+	with pytest.raises(BrokenPipeError):
+		display.lines(['a'])
+	assert not display.closed
+
+
+def test_on_closed_is_called_once_and_every_later_write_is_dropped(monkeypatch):
+	calls = []
+	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
+	display = multiCMD._Display()
+	display.on_closed = lambda: calls.append('closed')
+	display.message('header')
+	assert display.closed
+	display.lines(['a'])
+	display.message('footer')
+	assert calls == ['closed']
+
+
+def test_on_closed_may_raise_in_the_writing_thread(monkeypatch):
+	# the main thread's answer ( _stdout_closed ): the write is the one that raises, with the lock let go
+	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
+	display = multiCMD._Display()
+	def stop():
+		raise multiCMD._StdoutClosed()
+	display.on_closed = stop
+	with pytest.raises(multiCMD._StdoutClosed):
+		display.message('header')
+	assert display.closed
+	assert display.lock.acquire(False)

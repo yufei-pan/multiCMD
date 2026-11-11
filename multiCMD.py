@@ -28,7 +28,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.60'
+version = '1.61'
 __version__ = version
 COMMIT_DATE = '2026-11-11'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -63,7 +63,10 @@ _HAS_PROCESS_GROUP = sys.version_info >= (3, 11)
 # like included ). It runs the command only once the caller has it registered: its second argument is the read end of a
 # pipe ( passed to it alone ) on which the caller writes one byte then ( see _popen ). A caller interrupted inside Popen
 # once it has forked never has the command, and closes the pipe: the wrapper reads its end and exits 125 without running
-# anything. Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
+# anything. It starts with SIGINT blocked, as a Python that a SIGINT reaches while it initializes aborts with a core dump
+# ( 3.6, 3.7 ) or exits 1 with 'Fatal Python error' ( 3.8 - 3.10 ), and a stop sends SIGINT first: the byte b'2' has it
+# unblock SIGINT ( b'1': the caller had it blocked, and so does the command ).
+# Its first argument is '-' ( the command inherits the wrapper's environment as it is ) or N:
 # the command's own environment is then the N NAME=VALUE entries in the wrapper's variables
 # _MULTICMD_ENV_0 .. _MULTICMD_ENV_<N-1>, handed over by exec itself ( nothing can be cut short ), and it
 # runs with exactly those, found in their PATH like Python 3.11+'s Popen does. A missing or malformed entry
@@ -81,8 +84,14 @@ _PGROUP_EXEC = (
 	"a=sys.argv\n"
 	# handed over or not: the byte, or the end of the pipe ( 125, as env and timeout fail on their own )
 	"h=int(a[2])\n"
-	"if not posix.read(h,1):posix._exit(125)\n"
+	"b=posix.read(h,1)\n"
+	"if not b:posix._exit(125)\n"
 	"posix.close(h)\n"
+	# b'2': SIGINT was blocked for the start only ( see _spawn_process ). A stop's SIGINT that came meanwhile ends the
+	# wrapper now, as it would end the command; an ignored SIGINT stays ignored
+	"if b==b'2':\n"
+	"\tif _signal.getsignal(_signal.SIGINT)!=_signal.SIG_IGN:_signal.signal(_signal.SIGINT,_signal.SIG_DFL)\n"
+	"\t_signal.pthread_sigmask(_signal.SIG_UNBLOCK,(_signal.SIGINT,))\n"
 	"c=a[3]\n"
 	"v=None\n"
 	"if a[1]!='-':\n"
@@ -428,6 +437,14 @@ def _check_started(threads):
 		if not isinstance(thread, _Thread) and thread.ident is None:
 			raise RuntimeError('cannot join thread before it is started')
 
+class _StdoutClosed(BaseException):
+	'''
+	The CLI's stdout has no reader any more ( `mcmd ... | head` ): raised on the main thread, where multiCMD takes it as
+	any interrupt a signal handler raises ( every command stopped ) and main() ends the process ( internal )
+	It is raised by the main thread's own code, never by a signal handler: a handler's raise lands wherever the main thread
+	is, inside Popen once it has forked, or in a __del__ or a weakref callback, where Python drops it, and the stop is lost.
+	'''
+
 class _Display:
 	'''
 	Writes multiCMD's live output to sys.stdout, one write per call under one lock ( internal )
@@ -435,11 +452,35 @@ class _Display:
 	Command output lines are written newline-first, so the cursor stays at the end of the last
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
+
+	A write that finds stdout without a reader ( BrokenPipeError ) raises it, as any write does, unless on_closed is set,
+	as the CLI does ( main() ): then it is closed for good, on_closed is called once, in the thread that found it, and
+	every later write is dropped.
+	@attributes:
+		on_closed: Called, without arguments, by the thread whose write found stdout closed ( None: the write raises )
+		closed: Whether a write found stdout closed with on_closed set
 	'''
 	def __init__(self):
 		self.lock = threading.Lock()
 		self.redrawable = False
 		self.at_line_start = True
+		self.on_closed = None
+		self.closed = False
+
+	def _write(self, text):
+		'''
+		Write text to stdout and flush it, with the lock held ( internal )
+		'''
+		if self.closed:
+			return
+		try:
+			sys.stdout.write(text)
+			sys.stdout.flush()
+		except BrokenPipeError:
+			if self.on_closed is None:
+				raise
+			self.closed = True
+			self.on_closed()
 
 	def lines(self, texts, decor=('', '', ''), replace_first=False, ends_with_cr=False):
 		'''
@@ -460,8 +501,7 @@ class _Display:
 					parts.append('\n' + prefix + start + text + end)
 			self.redrawable = ends_with_cr
 			self.at_line_start = False
-			sys.stdout.write(''.join(parts))
-			sys.stdout.flush()
+			self._write(''.join(parts))
 
 	def message(self, text, decor=('', '', '')):
 		'''
@@ -474,8 +514,7 @@ class _Display:
 		with self.lock:
 			lead = '' if self.at_line_start else '\n'
 			body = '\n'.join(prefix + start + line + end for line in text.split('\n'))
-			sys.stdout.write(lead + body + '\n')
-			sys.stdout.flush()
+			self._write(lead + body + '\n')
 			self.redrawable = False
 			self.at_line_start = True
 
@@ -487,6 +526,17 @@ class _Display:
 			self.redrawable = False
 
 _display = _Display()
+
+def _raise_if_stdout_closed():
+	'''
+	Raise _StdoutClosed in the main thread if a write found stdout closed, as the CLI's waits for its commands do ( internal )
+	A reader or pool worker that finds it only sets _display.closed ( see _stdout_closed ); the main thread, which is the one
+	that stops the commands, looks at each step of its waits ( _watch, _drain, the pool's join loop ). The waits of a stop do
+	not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command: before
+	its header and again after it, as that write raises nothing on a worker thread ).
+	'''
+	if _display.closed and _thread.get_ident() == threading.main_thread().ident:
+		raise _StdoutClosed()
 
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
@@ -1249,7 +1299,7 @@ def _handover_pipe():
 		os.close(fd)
 	return r, w
 
-def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
+def _popen(argv, started=None, grouped=False, handover=None, go=b'1', **kwargs):
 	'''
 	Start a process with subprocess.Popen ( internal )
 	@params:
@@ -1261,6 +1311,7 @@ def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 		handover: For the exec wrapper, the index in argv of its pipe's read end, filled in here; None otherwise. One
 			byte on the pipe, once the command is in started, lets the wrapper run it; both ends are closed here however
 			Popen ends, and a wrapper that got no byte exits 125 ( see _PGROUP_EXEC )
+		go: That byte: b'2' has the wrapper unblock SIGINT first, b'1' leaves the mask as it is
 	@returns:
 		( subprocess.Popen, int | None ): The process and its process group id ( None without a group of its own )
 	'''
@@ -1276,7 +1327,7 @@ def _popen(argv, started=None, grouped=False, handover=None, **kwargs):
 			started.append(command)
 		if pipe is not None:
 			# last in the try: a Ctrl-C that Python 3.6 - 3.9 raise between a try and its finally comes after it
-			os.write(pipe[1], b'1')
+			os.write(pipe[1], go)
 	finally:
 		if pipe is not None:
 			os.close(pipe[0])
@@ -1292,7 +1343,8 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	terminal from its background group the read fails with EIO instead of the kernel stopping it.
 	The calling thread's mask is set back as it was however the start ends, a Ctrl-C anywhere included.
 	Python 3.11+ uses Popen(process_group=0); older Pythons run the command through the exec
-	wrapper _PGROUP_EXEC. Windows gets a plain Popen.
+	wrapper _PGROUP_EXEC, which also starts with SIGINT blocked, until it has the command: a stop's
+	SIGINT could otherwise reach its Python as it initializes. Windows gets a plain Popen.
 
 	The wrapper itself always starts in this process's environment. A command given an environment of
 	its own ( explicit ) gets it as reserved variables of the wrapper's, which the wrapper unpacks and
@@ -1348,9 +1400,13 @@ def _spawn_process(argv, stdout, stderr, env=None, explicit=False, executable=No
 	# the mask as it is, read with a call that changes nothing; the block is in the try, as a Ctrl-C can come out of it
 	# with the mask already set ( see _sigmask )
 	old_mask = _sigmask(signal.SIG_BLOCK, ())
+	block, go = _TTY_SIGNALS, b'1'
+	if handover is not None and signal.SIGINT not in old_mask:
+		# the wrapper's Python starts with SIGINT blocked and unblocks it once handed over ( see _PGROUP_EXEC )
+		block, go = _TTY_SIGNALS | {signal.SIGINT}, b'2'
 	try:
-		_sigmask(signal.SIG_BLOCK, _TTY_SIGNALS)
-		command = _popen(argv, started, grouped, handover, **kwargs)
+		_sigmask(signal.SIG_BLOCK, block)
+		command = _popen(argv, started, grouped, handover, go, **kwargs)
 		# ( here too: Python 3.6 - 3.9 can raise a Ctrl-C between the end of a try and its finally, which then never runs )
 		_sigmask(signal.SIG_SETMASK, old_mask)
 	finally:
@@ -1711,6 +1767,7 @@ def _watch(task, proc, timeout):
 	while proc.poll() is None:  # while the process is still running
 		if task.stop:
 			return 'stop'
+		_raise_if_stdout_closed()
 		if timeout > 0 and time.monotonic() - task._last_output > timeout:
 			return 'timeout'
 		time.sleep(sleep_time)
@@ -1754,6 +1811,7 @@ def _drain(task, readers, timeout):
 	while _any_alive(readers):
 		if task.stop:
 			return 'stop'
+		_raise_if_stdout_closed()
 		for reader in readers:
 			_join(reader, 0.05)
 		# tested after a step, not on entry: a command that exits just past the threshold, before _watch() looked
@@ -1974,10 +2032,11 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	running in the background on purpose.
 	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is re-raised once the
 	command is dead, the task finalized as stopped. So is anything else that is not an Exception ( a SIGTERM handler's
-	SystemExit ), and, once the command runs, whatever a signal handler raises: multiCMD then only waits for it
-	( _watch, _drain: polls, sleeps and joins, no I/O of their own ). An Exception raised while it starts is a failure
-	of multiCMD's: the command is stopped and the caller records it ( -1 ). A second interrupt ends the wait for the
-	stop: the command is sent SIGTERM and stays registered, for kill_all() and the exit hook.
+	SystemExit, the CLI's _StdoutClosed from _watch or _drain ), and, once the command runs, whatever a signal handler
+	raises: multiCMD then only waits for it ( _watch, _drain: polls, sleeps and joins, no I/O of their own ). An
+	Exception raised while it starts is a failure of multiCMD's: the command is stopped and the caller records it ( -1 ).
+	A second interrupt ends the wait for the stop: the command is sent SIGTERM and stays registered, for kill_all() and
+	the exit hook.
 	The command is registered from the moment Popen has returned it ( see _popen ). An interrupt that Python raises
 	inside Popen, once it has forked, loses it. Through the exec wrapper ( Python < 3.11 ) it then never runs: the
 	wrapper waits until the command is registered. With Popen(process_group=) ( 3.11+ ) it runs on in a process group of
@@ -2145,8 +2204,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		list[str]: The output of the command
 	'''
 	with sem:
-		if task.stop:
-			# stopped before it started: it stays unfinished, like a skipped queued command
+		if task.stop or _display.closed:
+			# stopped before it started, or stdout was found closed ( the CLI: its stop is on the way ): it stays unfinished,
+			# like a skipped queued command
 			task._env = task._extra_env = None
 			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
@@ -2162,6 +2222,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if not quiet:
 				_display.message('Running command: ' + _quote_command(task.command), decor)
 				_display.message('-' * 100, decor)
+			if _display.closed:
+				# one of those writes found stdout closed, on a worker thread, where it raises nothing ( 1.60 raised, and the
+				# start never happened ): skipped as at the top, unfinished ( the finally below marks it finalized, which
+				# nothing reads for a task the CLI skips )
+				return task.stdout + task.stderr if with_stdErr else task.stdout
 			_execute(task, timeout, quiet, decor, use_pty)
 		except Exception as e:
 			if task._finalized:
@@ -2531,7 +2596,8 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			# commands that must run at the same time may then wait on each other for good: say so
 			_write_error(f'multiCMD: started {len(running)} of {wanted} threads: {error}')
 		for thread in running:
-			_join(thread)
+			while not _join(thread, 0.1):
+				_raise_if_stdout_closed()
 	except BaseException:
 		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will
 		_stop_tasks(tasks)
@@ -2752,7 +2818,8 @@ _EXIT_STATUS_HELP = '''exit status:
   N      one command: its own exit code ( killed by signal S: 128+S )
   N      several commands: how many failed, capped at 101
   2      usage error
-  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'''
+  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )'''
 
 def _exit_status(tasks):
 	'''
@@ -2775,6 +2842,8 @@ def _install_cli_signal_handlers():
 	SIGTTIN / SIGTTOU are ignored, which every command inherits through exec and through any
 	shell ( dash clears the blocked mask _spawn sets ), so a command that reads the terminal from
 	its background group fails at once instead of hanging.
+	SIGPIPE stays ignored, as Python leaves it, and no handler of ours raises for it: the main thread would raise wherever it is,
+	and a raise Python drops ( in a __del__ ) loses the stop ( see _StdoutClosed, _raise_if_stdout_closed ).
 	'''
 	def handler(signum, frame):
 		kill_all(signum)
@@ -2785,6 +2854,37 @@ def _install_cli_signal_handlers():
 			signal.signal(signum, handler)
 	for signum in _TTY_SIGNALS:
 		signal.signal(signum, signal.SIG_IGN)
+
+def _stdout_closed():
+	'''
+	What the CLI does when stdout has no reader ( _Display.on_closed ), in the thread whose write found it ( internal )
+	The main thread raises _StdoutClosed. Another thread has set _display.closed by now, and that is all it does: the
+	main thread's waits look at it ( _raise_if_stdout_closed ).
+	'''
+	if _thread.get_ident() == threading.main_thread().ident:
+		raise _StdoutClosed()
+
+def _end_by_closed_stdout():
+	'''
+	End the process as one that wrote to a closed pipe ends, as `yes | head` does: by SIGPIPE, which a shell reports as
+	141; Windows has no SIGPIPE: exit status 1 ( internal )
+	The run has stopped its commands by now ( _StdoutClosed went through it as any interrupt ); the exit hook
+	( _kill_running_at_exit ) stops what is left, as when the interpreter exits. Then nothing
+	runs: no traceback, and no flush of the output nobody reads, which Python would report as "Exception ignored" and
+	exit status 120. signal.signal() needs the main thread, which is where main() calls this.
+	'''
+	_kill_running_at_exit()
+	try:
+		sys.stderr.flush()
+	except Exception:
+		pass
+	sigpipe = getattr(signal, 'SIGPIPE', None)
+	if sigpipe is None:
+		os._exit(1)
+	signal.signal(sigpipe, signal.SIG_DFL)
+	os.kill(os.getpid(), sigpipe)
+	# not reached, unless the calling thread blocks SIGPIPE: then the status alone says so
+	os._exit(128 + sigpipe)
 
 _RETURNCODE_LABELS = {124: 'timeout', 126: 'cannot execute', 127: 'not found'}
 
@@ -2905,6 +3005,35 @@ def _cli_commands(args):
 	return commands
 
 def main():
+	'''
+	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) is taken as an interrupt: every
+	command is stopped, as a Ctrl-C stops them, and the process ends by SIGPIPE with nothing on stderr
+	( _end_by_closed_stdout ). The library's functions keep raising BrokenPipeError as they did.
+	@returns:
+		int: The exit status
+	'''
+	_display.on_closed = _stdout_closed
+	try:
+		try:
+			status = _run_cli()
+		finally:
+			# what argparse's -h and -V left in the buffer: Python's own flush at exit would fail with a message and status 120
+			if sys.stdout is not None:
+				try:
+					sys.stdout.flush()
+				except BrokenPipeError:
+					raise
+				except OSError:
+					# a full disk, an I/O error: Python's own flush at exit says so, as it did before the CLI flushed itself
+					pass
+		if _display.closed:
+			# a reader found it closed as the run ended, and no wait looked again
+			raise _StdoutClosed()
+	except (BrokenPipeError, _StdoutClosed):
+		_end_by_closed_stdout()
+	return status
+
+def _run_cli():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
 		formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('commands', metavar='command', type=str, nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )')

@@ -93,6 +93,7 @@ exit status:
   N      several commands: how many failed, capped at 101
   2      usage error
   130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )
 ```
 
 ### Examples
@@ -166,6 +167,7 @@ mcmd --shell -m 4 "dmesg | tail -n 5" "journalctl -n 5 > /tmp/j.log"
 | Several commands | the number that failed, capped at `101` |
 | Usage error (bad option, unbalanced quote, no commands) | `2` |
 | Ctrl-C | `130` (`128+N` after SIGTERM / SIGHUP) |
+| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows (untested there) |
 
 ### Input files and templates
 
@@ -415,7 +417,11 @@ Signals sent to your program's group do not reach the commands, so multiCMD stop
 Ctrl-C (or a SIGTERM handler's `sys.exit()`) in a call waiting on the main thread, `join_threads()`
 and `AsyncExecutor.wait()` included, stops every command, skips the queued ones and
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
-commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`). At interpreter exit
+commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
+has no reader (`mcmd ... | head`): it stops them as a Ctrl-C does, and ends by SIGPIPE, as `yes | head` does, with
+nothing on stderr. It learns that stdout has no reader only when a write to it fails, so a command that prints nothing
+more runs to its end first (`mcmd 'sleep 4' | head -2` takes 4 s, as `sleep 4 | head -2` does). A program that imports
+multiCMD still gets the `BrokenPipeError`. At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -444,7 +450,11 @@ on any thread). Measured at 0.02 to 0.42 % of the Ctrl-Cs that land during a 0.2
 1.59. In the first milliseconds of a fire-and-forget batch (`wait_for_return=False`) a first Ctrl-C can also be
 dropped, about 1 in 700 of those that land there on 3.12 and 3.14 (1.59: 1 in 1,400, and it hung on 3.14): Python
 ignores an exception raised in a weakref callback and prints "Exception ignored", the program goes on, and the next
-Ctrl-C works.
+Ctrl-C works. A serial run can drop one too, in `Popen`'s cleanup (`Popen.__del__`) of a command that has finished (12 of
+about 6,000 aimed Ctrl-Cs with 1.60, 3 with 1.61): the same message, and the next Ctrl-C works. On Python 3.6-3.10 a
+Ctrl-C that arrives as a command starts waits for the exec wrapper's `Popen`, normally about 1 ms (2-5 ms at p99); if the
+exec of the Python binary itself hangs (a venv on an NFS mount that stopped answering), it does nothing until the mount
+answers.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
@@ -495,6 +505,46 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
+
+## Upgrading to 1.61 from 1.60
+
+- Nothing needs doing to upgrade.
+- Fix: `mcmd ... | head` (a reader that quits early) ends quietly. It printed a traceback or an "Exception ignored" message
+  and exited 120 (Python's status for a stdout it cannot flush), and the commands were left to run on: a quiet one,
+  or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
+  Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
+  Windows, untested: a closed pipe may show there as an `OSError` that `mcmd` does not catch yet, planned for 1.62). It
+  covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions still raise
+  `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main thread's
+  waits stop the commands at their next step (at most 0.1 s later), while a command not started yet is skipped;
+  `mcmd` leaves SIGPIPE ignored, as Python does, so no signal handler's raise can land inside `Popen` or where Python
+  drops it. `mcmd` learns that stdout has no reader only when a write to it fails: a command that prints nothing after
+  the reader quit (`mcmd 'sleep 4' | head -2`, a `-q` run, one under `-t`) runs to its end first, as it did, and then
+  `mcmd` ends 141. Planned for 1.62: asking the pipe instead of waiting for a write.
+- Changed: a closed stderr with a working stdout can now end `mcmd` by SIGPIPE (141) when `mcmd` itself prints an error
+  there; it ended 120 with 1.60. Measured: on 3.9 and 3.10 an unbalanced quote, a usage error and "no commands given" all
+  end 141; on 3.12 and 3.14 only the unbalanced quote does, as argparse's own errors stay 120; on 3.6 nothing changes
+  (all 120). The error of a command that cannot run ends as before on every Python.
+- Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
+  longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
+  initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")
+  and exits 1 with that message on 3.8 to 3.10; a little later in its start it prints a `KeyboardInterrupt` traceback.
+  Each landed in that command's stderr, and each core dump in the host's crash handler (systemd-coredump, apport, abrt).
+  Aimed at random into 400 starts each with 1.60: 80 aborted on 3.6 (1.59 the same) and 63 on 3.7; 54, 41 and 42 exited
+  with "Fatal Python error" on 3.8, 3.9 and 3.10; with 1.61 every one ended by SIGINT or ran to its end, without a
+  word. It is not new: every version with the exec wrapper (1.52 on) had it. The wrapper now starts with SIGINT
+  blocked and unblocks it once it has the command, so such a stop ends it by SIGINT, as it ends the command; a command
+  still inherits SIGINT blocked from a calling thread that has it blocked. On GitHub's runners the core dumps of
+  1.60's new stop test (5,000 stops in one process) each started an apport process, which drove the load to 250 and
+  timed the 3.6 job out.
+- Known: on Python 3.6 to 3.10 a Ctrl-C that arrives as a command starts waits for the exec wrapper's `Popen` (the fork,
+  the exec of the Python binary, the read of its error pipe), normally about 1 ms (2 to 5 ms at p99), where 1.60 stopped
+  at once. If the exec of the Python binary itself hangs (a venv on an NFS mount that stopped answering), Ctrl-C does
+  nothing until the mount answers; 1.60 exited 130. See [docs/limitations.md](docs/limitations.md).
+- Known: a Ctrl-C that lands in `Popen`'s cleanup (`Popen.__del__`) of a command that has finished, in a serial run, is
+  dropped (12 of about 6,000 aimed Ctrl-Cs with 1.60, 3 with 1.61): Python prints "Exception ignored" and the run goes
+  on; press it again. It is the dropped Ctrl-C of 1.60's note below, in serial runs too. See
+  [docs/limitations.md](docs/limitations.md).
 
 ## Upgrading to 1.60 from 1.59
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.60'
+version='1.61'
 __version__=version
 COMMIT_DATE='2026-11-11'
 __running_threads=set()
@@ -16,7 +16,7 @@ USE_SUDO=False
 _IS_POSIX=os.name=='posix'
 _HAS_PROCESS_GROUP=sys.version_info>=(3,11)
 _ENV_VAR='_MULTICMD_ENV_'
-_PGROUP_EXEC="import posix,_signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\nposix.setpgid(0,0)\na=sys.argv\nh=int(a[2])\nif not posix.read(h,1):posix._exit(125)\nposix.close(h)\nc=a[3]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:posix.execv(f,a[3:])\n\tposix.execve(f,a[3:],v)\ndef g(f):\n\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n\texcept(OSError,ValueError):return False\ntry:\n\tif '/' in c:x(c)\n\tp=(posix.environ if v is None else v).get(b'PATH')\n\tr=None\n\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n\t\td=d or '.'\n\t\tf=d+c if d.endswith('/') else d+'/'+c\n\t\tif g(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,posix.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
+_PGROUP_EXEC="import posix,_signal,sys\nfor n in ('SIGPIPE','SIGXFSZ'):\n\tif hasattr(_signal,n):_signal.signal(getattr(_signal,n),_signal.SIG_DFL)\nposix.setpgid(0,0)\na=sys.argv\nh=int(a[2])\nb=posix.read(h,1)\nif not b:posix._exit(125)\nposix.close(h)\nif b==b'2':\n\tif _signal.getsignal(_signal.SIGINT)!=_signal.SIG_IGN:_signal.signal(_signal.SIGINT,_signal.SIG_DFL)\n\t_signal.pthread_sigmask(_signal.SIG_UNBLOCK,(_signal.SIGINT,))\nc=a[3]\nv=None\nif a[1]!='-':\n\ttry:\n\t\tv=dict(posix.environ[b'_MULTICMD_ENV_%d'%i].split(b'=',1) for i in range(int(a[1])))\n\texcept(KeyError,ValueError):\n\t\tsys.stderr.write('multiCMD: incomplete environment for %r\\n'%c);sys.exit(126)\ndef x(f):\n\tif v is None:posix.execv(f,a[3:])\n\tposix.execve(f,a[3:],v)\ndef g(f):\n\ttry:return posix.stat(f).st_mode&0o170000==0o100000\n\texcept(OSError,ValueError):return False\ntry:\n\tif '/' in c:x(c)\n\tp=(posix.environ if v is None else v).get(b'PATH')\n\tr=None\n\tfor d in ("+repr(os.defpath)+" if p is None else p.decode(sys.getfilesystemencoding(),'surrogateescape')).split(':'):\n\t\td=d or '.'\n\t\tf=d+c if d.endswith('/') else d+'/'+c\n\t\tif g(f):\n\t\t\ttry:x(f)\n\t\t\texcept(FileNotFoundError,NotADirectoryError):pass\n\t\t\texcept OSError as e:r=r or e\n\traise r or FileNotFoundError(2,posix.strerror(2),c)\nexcept OSError as e:\n\tsys.stderr.write((str(e) if a[1]=='-' else str(OSError(e.errno,e.strerror,c)))+'\\n')\n\tsys.exit(127 if isinstance(e,FileNotFoundError) else 126)\n"
 _TTY_SIGNALS={signal.SIGTTIN,signal.SIGTTOU}if _IS_POSIX else set()
 try:import _signal
 except ImportError:_signal=None
@@ -110,8 +110,15 @@ def _any_alive(threads):
 def _check_started(threads):
 	for thread in threads:
 		if not isinstance(thread,_Thread)and thread.ident is None:raise RuntimeError('cannot join thread before it is started')
+class _StdoutClosed(BaseException):0
 class _Display:
-	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True
+	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_closed=None;self.closed=False
+	def _write(self,text):
+		if self.closed:return
+		try:sys.stdout.write(text);sys.stdout.flush()
+		except BrokenPipeError:
+			if self.on_closed is None:raise
+			self.closed=True;self.on_closed()
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
 		with self.lock:
@@ -119,13 +126,15 @@ class _Display:
 			for(i,text)in enumerate(texts):
 				if i==0 and replace_first and self.redrawable:parts.append('\r'+prefix+start+text+end+('\x1b[K'if _stdout_isatty()else''))
 				else:parts.append('\n'+prefix+start+text+end)
-			self.redrawable=ends_with_cr;self.at_line_start=False;sys.stdout.write(''.join(parts));sys.stdout.flush()
+			self.redrawable=ends_with_cr;self.at_line_start=False;self._write(''.join(parts))
 	def message(self,text,decor=('','','')):
 		prefix,start,end=decor
-		with self.lock:lead=''if self.at_line_start else'\n';body='\n'.join(prefix+start+line+end for line in text.split('\n'));sys.stdout.write(lead+body+'\n');sys.stdout.flush();self.redrawable=False;self.at_line_start=True
+		with self.lock:lead=''if self.at_line_start else'\n';body='\n'.join(prefix+start+line+end for line in text.split('\n'));self._write(lead+body+'\n');self.redrawable=False;self.at_line_start=True
 	def settle(self):
 		with self.lock:self.redrawable=False
 _display=_Display()
+def _raise_if_stdout_closed():
+	if _display.closed and _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
 		self.max_threads=max_threads
@@ -368,13 +377,13 @@ def _handover_pipe():
 	while r<=2:low.append(r);r=os.dup(r)
 	for fd in low:os.close(fd)
 	return r,w
-def _popen(argv,started=None,grouped=False,handover=None,**kwargs):
+def _popen(argv,started=None,grouped=False,handover=None,go=b'1',**kwargs):
 	pipe=None
 	try:
 		if handover is not None:pipe=_handover_pipe();argv[handover]=str(pipe[0]);kwargs['pass_fds']=tuple(kwargs.get('pass_fds',()))+(pipe[0],)
 		proc=subprocess.Popen(argv,**kwargs);command=proc,proc.pid if grouped else None
 		if started is not None:started.append(command)
-		if pipe is not None:os.write(pipe[1],b'1')
+		if pipe is not None:os.write(pipe[1],go)
 	finally:
 		if pipe is not None:os.close(pipe[0]);os.close(pipe[1])
 	return command
@@ -391,8 +400,9 @@ def _spawn_process(argv,stdout,stderr,env=None,explicit=False,executable=None,st
 		argv=[sys.executable,'-I','-S','-c',_PGROUP_EXEC,count,None]+list(argv);handover=6
 	else:grouped=False
 	if _sigmask is None:return _popen(argv,started,grouped,handover,**kwargs)
-	old_mask=_sigmask(signal.SIG_BLOCK,())
-	try:_sigmask(signal.SIG_BLOCK,_TTY_SIGNALS);command=_popen(argv,started,grouped,handover,**kwargs);_sigmask(signal.SIG_SETMASK,old_mask)
+	old_mask=_sigmask(signal.SIG_BLOCK,());block,go=_TTY_SIGNALS,b'1'
+	if handover is not None and signal.SIGINT not in old_mask:block,go=_TTY_SIGNALS|{signal.SIGINT},b'2'
+	try:_sigmask(signal.SIG_BLOCK,block);command=_popen(argv,started,grouped,handover,go,**kwargs);_sigmask(signal.SIG_SETMASK,old_mask)
 	finally:_sigmask(signal.SIG_SETMASK,old_mask)
 	return command
 def _stdout_isatty():
@@ -505,6 +515,7 @@ def _watch(task,proc,timeout):
 	sleep_time=1e-07
 	while proc.poll()is None:
 		if task.stop:return'stop'
+		_raise_if_stdout_closed()
 		if timeout>0 and time.monotonic()-task._last_output>timeout:return'timeout'
 		time.sleep(sleep_time)
 		if sleep_time<.001:sleep_time*=2
@@ -517,6 +528,7 @@ def _join(thread,timeout=None):
 def _drain(task,readers,timeout):
 	while _any_alive(readers):
 		if task.stop:return'stop'
+		_raise_if_stdout_closed()
 		for reader in readers:_join(reader,.05)
 		if timeout>0 and time.monotonic()-task._last_output>timeout and _any_alive(readers):return'timeout'
 def _join_all(threads,limit):
@@ -654,7 +666,7 @@ def _execute(task,timeout,quiet,decor,use_pty=False):
 	if interrupted is not None:raise interrupted
 def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=False,decor=('','',''),use_pty=False):
 	with sem:
-		if task.stop:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
+		if task.stop or _display.closed:task._env=task._extra_env=None;return task.stdout+task.stderr if with_stdErr else task.stdout
 		try:
 			_starting[task]=None
 			if _cut_by_exit(task):raise RuntimeError('not started: the interpreter is exiting')
@@ -662,6 +674,7 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 				if not quiet:_display.message(_dry_run_line(task))
 				return task.stdout+task.stderr if with_stdErr else task.stdout
 			if not quiet:_display.message('Running command: '+_quote_command(task.command),decor);_display.message('-'*100,decor)
+			if _display.closed:return task.stdout+task.stderr if with_stdErr else task.stdout
 			_execute(task,timeout,quiet,decor,use_pty)
 		except Exception as e:
 			if task._finalized:raise
@@ -783,7 +796,8 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 			for task in tasks:_fail_task(task,f"cannot start a thread to run it: {error}",error,quiet)
 			return
 		if error is not None and not quiet:_write_error(f"multiCMD: started {len(running)} of {wanted} threads: {error}")
-		for thread in running:_join(thread)
+		for thread in running:
+			while not _join(thread,.1):_raise_if_stdout_closed()
 	except BaseException:_stop_tasks(tasks);_join_all(workers,5);raise
 def run_command(command,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None,pass_fds=()):return run_commands(commands=[command],timeout=timeout,max_threads=max_threads,quiet=quiet,dry_run=dry_run,with_stdErr=with_stdErr,return_code_only=return_code_only,return_object=return_object,parse=False,wait_for_return=wait_for_return,sem=sem,use_sudo=use_sudo,raise_error=raise_error,prefix=prefix,color=color,pty=pty,shell=shell,env=env,extra_env=extra_env,pass_fds=pass_fds)[0]
 def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with_stdErr=False,return_code_only=False,return_object=False,parse=False,wait_for_return=True,sem=None,use_sudo=...,raise_error=False,prefix=False,color=None,pty=False,shell=False,env=None,extra_env=None,pass_fds=()):
@@ -831,7 +845,7 @@ def join_threads(threads=...,timeout=None):
 		for thread in threads:_join(thread,timeout)
 	except BaseException:ours=[thread for thread in threads if isinstance(thread,_Thread)and thread.task is not None];_stop_tasks([thread.task for thread in ours]);_join_all(ours,5);raise
 	__reap_finished_threads()
-_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )'
+_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )\n  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )'
 def _exit_status(tasks):
 	if len(tasks)==1:
 		returncode=tasks[0].returncode
@@ -844,6 +858,15 @@ def _install_cli_signal_handlers():
 		signum=getattr(signal,name,None)
 		if signum is not None and signal.getsignal(signum)!=signal.SIG_IGN:signal.signal(signum,handler)
 	for signum in _TTY_SIGNALS:signal.signal(signum,signal.SIG_IGN)
+def _stdout_closed():
+	if _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
+def _end_by_closed_stdout():
+	_kill_running_at_exit()
+	try:sys.stderr.flush()
+	except Exception:pass
+	sigpipe=getattr(signal,'SIGPIPE',None)
+	if sigpipe is None:os._exit(1)
+	signal.signal(sigpipe,signal.SIG_DFL);os.kill(os.getpid(),sigpipe);os._exit(128+sigpipe)
 _RETURNCODE_LABELS={124:'timeout',126:'cannot execute',127:'not found'}
 def _format_returncode(task):
 	returncode=task.returncode
@@ -893,6 +916,18 @@ def _cli_commands(args):
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
+	_display.on_closed=_stdout_closed
+	try:
+		try:status=_run_cli()
+		finally:
+			if sys.stdout is not None:
+				try:sys.stdout.flush()
+				except BrokenPipeError:raise
+				except OSError:pass
+		if _display.closed:raise _StdoutClosed()
+	except(BrokenPipeError,_StdoutClosed):_end_by_closed_stdout()
+	return status
+def _run_cli():
 	parser=argparse.ArgumentParser(description='Run multiple commands in parallel',epilog=_EXIT_STATUS_HELP,formatter_class=argparse.RawDescriptionHelpFormatter);parser.add_argument('commands',metavar='command',type=str,nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='SECONDS',type=float,default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of commands to run at once ( 0 = all )');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode: hide command output ( the summary still shows )');parser.add_argument('-n','--dry-run',action='store_true',help='print each command, quoted, instead of running it');parser.add_argument('--shell',action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )');parser.add_argument('-e','--env',metavar='NAME=VALUE',action='append',help='set NAME to VALUE in the environment of every command ( repeatable ); NAME alone removes it');parser.add_argument('-f','--file',metavar='FILE',action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )');parser.add_argument('-a','--arg-file',metavar='FILE',action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )');summary=parser.add_mutually_exclusive_group();summary.add_argument('--summary',dest='summary',action='store_const',const='all',help='list every command in the end-of-run summary ( default: only failed ones )');summary.add_argument('--no-summary',dest='summary',action='store_const',const='none',help='do not print the end-of-run summary');parser.add_argument('--no-prefix',action='store_true',help='do not prefix output lines with [#] when commands run at once');parser.add_argument('--no-color',action='store_true',help='do not color output lines per command');pty_mode=parser.add_mutually_exclusive_group();pty_mode.add_argument('--pty',dest='pty',action='store_true',help='give commands a pseudo-terminal so they print live ( default when stdout is a terminal )');pty_mode.add_argument('--no-pty',dest='pty',action='store_false',help='give commands plain pipes');parser.set_defaults(summary='failed',pty=None);parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args()
 	if not args.commands and not args.file:parser.error('no commands given')
 	if args.arg_file and not args.commands:parser.error('-a/--arg-file needs at least one command template')
