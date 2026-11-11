@@ -521,9 +521,10 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   drops it. `mcmd` learns that stdout has no reader only when a write to it fails: a command that prints nothing after
   the reader quit (`mcmd 'sleep 4' | head -2`, a `-q` run, one under `-t`) runs to its end first, as it did, and then
   `mcmd` ends 141. Planned for 1.62: asking the pipe instead of waiting for a write.
-- Changed: a closed stderr with a working stdout now ends `mcmd` by SIGPIPE (141) when `mcmd` itself prints an error
-  there (seen for an unbalanced quote on 3.10 and 3.14, and for a usage error on 3.10); it ended 120 with 1.60. The
-  error of a command that cannot run still ends as before.
+- Changed: a closed stderr with a working stdout can now end `mcmd` by SIGPIPE (141) when `mcmd` itself prints an error
+  there; it ended 120 with 1.60. Measured: on 3.9 and 3.10 an unbalanced quote, a usage error and "no commands given" all
+  end 141; on 3.12 and 3.14 only the unbalanced quote does, as argparse's own errors stay 120; on 3.6 nothing changes
+  (all 120). The error of a command that cannot run ends as before on every Python.
 - Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
   longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
   initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")
