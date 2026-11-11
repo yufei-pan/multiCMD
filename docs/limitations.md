@@ -32,8 +32,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 
 ### On Python 3.11+ a Ctrl-C inside Popen during a serial start can orphan the command
 - Kind: known limitation
-- What the operator sees: on Python 3.11+, on Windows, and in a frozen app (whose `sys.executable` is the app
-  itself, so it has no wrapper to run, on any Python), a single Ctrl-C (or a signal handler's exception) landing
+- What the operator sees: on Python 3.11+, on Windows, in a frozen app (whose `sys.executable` is the app
+  itself) and in an embedded Python whose `sys.executable` is empty (neither has a Python to run the exec
+  wrapper with, on any Python), a single Ctrl-C (or a signal handler's exception) landing
   while Popen starts a command in a serial run can leave that command running, never registered, after the
   program exits. About 51 µs per start on Python 3.14 (1.56's measurement); in hpcp's early-stop test (Docker,
   3.14, 8 copy workers, 400 small files) 3 commands in 200 stops ran so, with hpcp 9.86 and 9.87 alike, and each
@@ -47,7 +48,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it, or CPython offers a way to start a process with its pid known before any
   Python code can raise.
 - Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+,
-  Windows and frozen apps (the 2026-10-23 approval covered every Python; 1.59 closed it only where the exec wrapper runs).
+  Windows, frozen apps and an embedded Python with no `sys.executable` (the 2026-10-23 approval covered every Python; 1.59 closed it only where the exec wrapper runs).
 
 ### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
@@ -114,3 +115,30 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   close it, which is new machinery for a one-instruction window in a microsecond call.
 - Revisit when: someone hits it, or CPython moves the signal check out of the gap.
 - Approved: 2026-10-23, the user chose "Known limitation (Recommended)".
+
+### A Ctrl-C inside Thread.start() can leave Python's thread lock held
+- Kind: deferred (1.60)
+- What the operator sees: a Ctrl-C (or a signal handler's exception) that Python raises in the calling thread inside
+  `threading.Thread.start()` can leave `threading._active_limbo_lock` held. Every later thread start in the program then
+  blocks, and on Python 3.6 so does its exit (`threading._shutdown`). The calls that start a thread on the calling thread:
+  - a serial `run_command()` or `run_commands()` (`max_threads=1`, waiting): `_execute` starts the command's output
+    readers once it is registered, one thread for stdout and one for stderr (one with a pty), so every command that
+    starts runs two `Thread.start()` calls (a dry run and a command that fails to start run none);
+  - `run_commands()` with `max_threads` above 1 (the pool's workers) and with `wait_for_return=False` (a thread a
+    command);
+  - an `AsyncExecutor`'s dispatcher and its task threads.
+
+  Seen in the 9.87 re-review of hpcp: py-spy showed the main thread in `_join_all` and 1,166 reader threads waiting for
+  that lock, and on 3.6 a hang at exit on it. 2 hangs in about 30,000 stops that landed in such calls, in a probe that
+  stopped one process thousands of times. hpcp's parent runs two serial commands (`cp --version` and a probe's `cp`)
+  before each copy pool: the review estimated about 1 early stop in a million of a real run, ended by Ctrl-\.
+- Why: CPython's own `with` race: a signal that arrives right after `with _active_limbo_lock:` has taken the lock, before
+  the block's exit is armed. It is the `threading`-lock case of "A Ctrl-C as a lock is taken or released can leave it held"
+  (approved above), which a serial run meets on every command it starts.
+- Plan (1.60): `_Thread.start` records a stop that lands while it starts a thread and raises it once the thread is
+  started, as hpcp's `_MAKING` does for the file it makes. Open: multiCMD installs no handler of its own, and blocking the
+  signals in the calling thread does not hold them while another thread exists (see "On Python 3.11+ a Ctrl-C inside
+  Popen ..."), so how to hold a stop for those microseconds is settled first, in a probe like the review's.
+- Revisit when: 1.60.
+- Noted: 2026-11-10, found by the 9.87 fix-round re-review of hpcp (R5); noted without asking, as a deferral. hpcp's
+  docs/limitations.md has a pointer to this entry.
