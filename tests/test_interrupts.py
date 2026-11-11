@@ -657,3 +657,111 @@ def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
 	# ( Python 3.6 - 3.8 buffer stderr, where the stops that landed in a finalizer are told, until the exit )
 	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors$', run.stdout, re.M), run.stdout[-4000:]
 
+
+def _dummy_threads():
+	return {thread for thread in threading.enumerate() if isinstance(thread, threading._DummyThread)}
+
+
+def test_a_main_thread_start_runs_in_a_helper(monkeypatch):
+	# ( 1.60 ) from the main thread, where Python runs signal handlers, threading's own start runs on a helper thread; from
+	# another thread it runs right there; and what it raises in the helper reaches the caller
+	real_start = threading.Thread.start
+	ran_on, fail = [], [None]
+	def spy(self):
+		ran_on.append(_thread.get_ident())
+		if fail[0] is not None:
+			raise fail[0]
+		real_start(self)
+	monkeypatch.setattr(threading.Thread, 'start', spy)
+	dummies = _dummy_threads()
+	main = threading.main_thread().ident
+	thread = multiCMD._Thread(time.sleep, (0,))
+	thread.start()
+	assert multiCMD._join(thread, 5)
+	assert ran_on[-1] != main and thread.done.flag
+	# from another thread ( a bare one, whose own start is not what is checked; it waits on done, as Thread.join() would
+	# make threading register it )
+	started_by, finished = [], multiCMD._Done()
+	def start_one():
+		try:
+			started_by.append(_thread.get_ident())
+			inner = multiCMD._Thread(time.sleep, (0,))
+			inner.start()
+			inner.done.wait(5)
+		finally:
+			finished.set()
+	_thread.start_new_thread(start_one, ())
+	assert finished.wait(5)
+	assert ran_on[-1] == started_by[0] != main
+	# a thread that cannot start, from the main thread: the helper's error is raised in the caller
+	fail[0] = RuntimeError("can't start new thread")
+	thread = multiCMD._Thread(time.sleep, (0,))
+	with pytest.raises(RuntimeError, match="can't start new thread"):
+		thread.start()
+	assert not thread._started.is_set() and not thread.is_alive()
+	# the helper never makes threading register a thread of its own ( a _DummyThread )
+	assert _dummy_threads() <= dummies
+
+
+@pytest.mark.skipif(not hasattr(signal, 'pthread_kill'), reason='POSIX signals')
+@pytest.mark.parametrize('what', ['a thread', 'the dispatcher'])
+def test_an_interrupted_start_waits_for_its_helper(monkeypatch, request, what):
+	# ( the 1.60 plan, G3 ) a Ctrl-C while the main thread waits for its helper to start a thread is raised once the start
+	# is done ( _START_WAIT at most ), so _started says whether the thread runs. Without that wait it was still unset, and
+	# an AsyncExecutor took a dispatcher that came up a moment later for one that never would: the next run_commands()
+	# started a second one, which wait() then did not cover
+	previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+	request.addfinalizer(lambda: signal.signal(signal.SIGINT, previous))
+	main = threading.main_thread().ident
+	real_helper = multiCMD._start_in_helper
+	armed = [True]
+	def slow_helper(*args):
+		# the Ctrl-C lands once the helper exists, while the main thread waits for it
+		if armed[0]:
+			armed[0] = False
+			signal.pthread_kill(main, signal.SIGINT)
+		time.sleep(0.05)
+		real_helper(*args)
+	monkeypatch.setattr(multiCMD, '_start_in_helper', slow_helper)
+	if what == 'a thread':
+		release = threading.Event()
+		thread = multiCMD._Thread(release.wait, (10,))
+		with pytest.raises(KeyboardInterrupt):
+			thread.start()
+		# before: unset, though the thread came up a moment later
+		assert thread._started.is_set() and thread.is_alive()
+		release.set()
+		assert multiCMD._join(thread, 5)
+		return
+	class Gate:
+		'''A semaphore with no permit that records the threads waiting on it'''
+		def __init__(self):
+			self.waiting = set()
+		def acquire(self, blocking=True, timeout=None):
+			self.waiting.add(threading.current_thread())
+			time.sleep(timeout or 0)
+			return False
+		def release(self):
+			pass
+	gate = Gate()
+	ex = AsyncExecutor(semaphore=gate, quiet=True)
+	dispatchers = []
+	real_track = ex._track
+	def track(thread):
+		if thread._target == ex._dispatch:
+			dispatchers.append(thread)
+		real_track(thread)
+	monkeypatch.setattr(ex, '_track', track)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			ex.run_commands([['true']])
+		# two commands: two dispatchers would each take one and wait for a permit
+		ex.run_commands([['true'], ['true']])
+		deadline = time.monotonic() + 5
+		while not all(d._started.is_set() and (d.done.flag or d in gate.waiting) for d in dispatchers) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		# before: two
+		assert sum(d.is_alive() for d in dispatchers) == 1
+	finally:
+		ex.stop()
+	assert not any(d.is_alive() for d in dispatchers)

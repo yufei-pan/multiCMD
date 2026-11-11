@@ -286,6 +286,21 @@ class _Done:
 				self._wake.release()
 		return True
 
+# How long an interrupted _Thread.start waits for its helper to finish the start, so _started is right when the interrupt
+# reaches the caller: a main-thread start through the helper took 61 us (median) and 106 us (p90) on Python 3.14, 104 us and
+# 2 ms on 3.6, measured for 1.60 on a host with a load average of 60 to 95 on 32 cores; 1 s is the bound in which hpcp acts
+# on a stop (_check_stop), so the wait never holds an interrupt longer than that.
+_START_WAIT = 1
+
+def _start_in_helper(thread, done, failed):
+	'''threading.Thread.start( thread ) in a thread no signal handler runs in ( internal, see _Thread.start )'''
+	try:
+		threading.Thread.start(thread)
+	except BaseException as e:
+		failed.append(e)
+	finally:
+		done.set()
+
 class _Thread(threading.Thread):
 	'''
 	A daemon thread that reports itself done, for every thread multiCMD starts and waits for but a command's output
@@ -314,17 +329,26 @@ class _Thread(threading.Thread):
 		self._pid = os.getpid()
 
 	def start(self):
-		# what the caller is handling already: a Ctrl-C it handles is not one that landed in this start
-		handling = sys.exc_info()[1]
+		'''
+		threading.Thread.start(), from a helper thread when called on the main thread: Python runs a signal's handler only
+		on the main thread, and one that raised inside start() there could leave threading's own locks held ( see
+		_Reader ). The helper is started by one C call, its ident stored by C ( list.extend over map ) before Python can
+		raise, and the caller waits on a _Done. An interrupt there waits for the helper ( _START_WAIT at most ), then is
+		raised: _started then says whether the thread runs. Off the main thread no handler runs, and start() is called
+		directly.
+		'''
+		if _thread.get_ident() != threading.main_thread().ident:
+			return super().start()
+		done, failed, helper = _Done(), [], []
 		try:
-			super().start()
-		except RuntimeError as e:
-			# a Ctrl-C inside start()'s wait for the thread to come up can come out as RuntimeError('release unlocked
-			# lock') ( seen on 3.12 and free-threaded 3.13t ): the Ctrl-C is what happened
-			context = e.__context__
-			if context is not None and context is not handling and not isinstance(context, Exception):
-				raise context
+			helper.extend(map(_thread.start_new_thread, (_start_in_helper,), ((self, done, failed),)))
+			done.wait()
+		except BaseException:
+			if helper:
+				done.wait(_START_WAIT)
 			raise
+		if failed:
+			raise failed[0]
 
 	def run(self):
 		try:
