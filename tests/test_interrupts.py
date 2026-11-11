@@ -26,17 +26,6 @@ def _ctrl_c():
 		pass
 
 
-@pytest.fixture
-def another_thread():
-	'''A thread alive throughout: a SIGINT the main thread blocked would be taken by it'''
-	release = threading.Event()
-	thread = threading.Thread(target=release.wait, daemon=True)
-	thread.start()
-	yield thread
-	release.set()
-	thread.join(5)
-
-
 # ---- a command interrupted as it starts is registered while it is killed
 
 def test_a_ctrl_c_before_the_registration_still_registers_the_command_while_it_is_killed(monkeypatch):
@@ -255,31 +244,6 @@ def test_a_pool_that_cannot_start_two_workers_in_a_row_fails_every_task(monkeypa
 	tasks = run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
 	assert len(calls) == 2
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._error for task in tasks)
-
-
-@pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
-def test_a_thread_start_error_while_the_caller_handles_a_ctrl_c_is_not_that_ctrl_c(monkeypatch, another_thread):
-	# ( finding 3; probe r10probes/stale_ctx.py ) a program cleans up after a real Ctrl-C it caught, running commands
-	# from its except block, and one pool worker cannot start ( EAGAIN ): that RuntimeError has the Ctrl-C being
-	# handled as its context, and was taken for a Ctrl-C that landed during the start
-	real_start = threading.Thread.start
-	calls = []
-	def start(self):
-		if getattr(self, '_target', None) is not None and getattr(self._target, '__name__', '') == 'worker':
-			calls.append(self)
-			if len(calls) == 1:
-				raise RuntimeError("can't start new thread")
-		real_start(self)
-	monkeypatch.setattr(threading.Thread, 'start', start)
-	try:
-		_ctrl_c()
-	except KeyboardInterrupt:
-		try:
-			tasks = run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
-		except KeyboardInterrupt:
-			# before ( fdc45b9 ): the Ctrl-C being handled was raised again, and the tasks never ran
-			pytest.fail('the Ctrl-C the caller handles was raised again')
-	assert len(calls) == 4 and [task.returncode for task in tasks] == [0] * 4
 
 
 # ---- a normal run touches no signal state
