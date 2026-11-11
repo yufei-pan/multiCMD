@@ -46,8 +46,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   turns a missing command's 127 into a stop.
 - Revisit when: someone hits it, or CPython offers a way to start a process with its pid known before any
   Python code can raise.
-- Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+
-  and Windows.
+- Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+,
+  Windows and frozen apps (the 2026-10-23 approval covered every Python; 1.59 closed it only where the exec wrapper runs).
 
 ### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
