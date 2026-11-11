@@ -505,6 +505,10 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   blocked, and on Python 3.6 the exit too. A serial run starts two output readers per command on the main thread, so a
   program stopped often met it: a probe that stops a serial `run_command(['true'])` at random, 20,000 times in one
   process, hung 6 of 6 runs with 1.59 on Python 3.14 (after 30 to 9,000 calls) and finished 3 of 3 with 1.60.
+- Fix: what your own signal handler raises (an ordinary exception, a `TimeoutError` from SIGALRM) while a pool or a
+  fire-and-forget batch starts its threads is raised as an interrupt, every command stopped. Before, it was taken for a
+  thread that could not start, and lost. A few microseconds of each start remain (about 4 µs, before the helper that
+  starts the thread exists), see [docs/limitations.md](docs/limitations.md).
 - A command's output readers are now threads started with `_thread.start_new_thread`: they are not in
   `threading.enumerate()` or `threading.active_count()`, `threading.settrace()`, `setprofile()` and `excepthook` do not
   reach them, and an error in one is reported through `sys.unraisablehook` (from Python 3.8). A serial run is no slower:

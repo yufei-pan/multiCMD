@@ -72,11 +72,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   raised, so the program's own timeout never fires. While multiCMD only waits (the pool, `join_threads()`, the
   executor) such an exception is still raised as an interrupt; a `KeyboardInterrupt` or `SystemExit` always
   is. 1.54 behaved the same.
+  - The start of a pool's workers or of a fire-and-forget batch's threads, on the main thread, can still lose such
+    an exception in its first few microseconds, about 4 µs per start, before the helper that starts the thread
+    exists. The exception is then taken for a thread that could not start: the pool (unless quiet) says "started 7
+    of 8 threads" and runs its commands to the end, a fire-and-forget batch records that command as failed (-1) and
+    runs it anyway, and the program's own timeout never fires.
+  - Measured by the fix round, with 1,000 exceptions aimed at random into the first 2 ms (6 ms on 3.6) of an
+    8-command batch: 7 to 16 of the pools and 8 to 13 of the fire-and-forget batches lost it, on 3.6, 3.12 and
+    3.14; without the fix, 928 of 1,000 pools did, on 3.12. 1.59 lost it for the whole of its starts too (a median
+    1.3 ms of an 8-worker batch's), and 1.60 without the fix for 2.2 ms.
 - Why: telling it apart took about 50 lines that read every installed handler and search the traceback for its
   code, with a blind spot of their own; none of our tools installs such a handler.
 - Revisit when: someone hits it.
 - Approved: 2026-10-23, the user asked "will this happen? what's the cost of keeping?", then chose "Drop it
   (Recommended)".
+  Pool and fire-and-forget starts added 2026-11-11 after the 1.60 fix (N1): the user chose "Fix now, note the rest (Recommended)".
 
 ### join_threads() on another thread can return before a batch still starting
 - Kind: known limitation

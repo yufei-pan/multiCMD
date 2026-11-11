@@ -774,6 +774,7 @@ def _run_pool(tasks,decors,sem,timeout,quiet,dry_run,max_threads,use_pty=False):
 		for thread in workers:
 			try:thread.start()
 			except Exception as e:
+				if thread._started.is_set():raise
 				error=e
 				if failed_last:break
 				failed_last=True
@@ -802,7 +803,9 @@ def run_commands(commands,timeout=0,max_threads=1,quiet=False,dry_run=False,with
 			__running_threads.update(threads)
 			for thread in threads:
 				try:thread.start()
-				except Exception as e:__running_threads.discard(thread);_fail_task(thread.task,f"cannot start its thread: {e}",e,quiet)
+				except Exception as e:
+					if thread._started.is_set():raise
+					__running_threads.discard(thread);_fail_task(thread.task,f"cannot start its thread: {e}",e,quiet)
 		except BaseException:
 			_stop_tasks(tasks)
 			for thread in threads:

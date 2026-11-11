@@ -2510,6 +2510,10 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			try:
 				thread.start()
 			except Exception as e:
+				if thread._started.is_set():
+					# it runs: what a signal handler raised while the main thread waited for its start ( see _Thread.start )
+					# is an interrupt, not a thread that cannot start
+					raise
 				# one failed start may be passing ( EAGAIN ): the next worker is tried; two in a row end the starts, as
 				# the next would most likely fail the same way
 				error = e
@@ -2670,6 +2674,9 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 				try:
 					thread.start()
 				except Exception as e:
+					if thread._started.is_set():
+						# it runs: an interrupt, not a thread that cannot start ( see _run_pool )
+						raise
 					# that command fails, the others run; its task keeps the thread ( task.thread.join() returns at once )
 					__running_threads.discard(thread)
 					_fail_task(thread.task, f'cannot start its thread: {e}', e, quiet)

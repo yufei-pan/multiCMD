@@ -246,6 +246,35 @@ def test_a_pool_that_cannot_start_two_workers_in_a_row_fails_every_task(monkeypa
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._error for task in tasks)
 
 
+@pytest.mark.skipif(not hasattr(signal, 'pthread_kill'), reason='POSIX signals')
+@pytest.mark.parametrize('how', ['pool', 'fire-and-forget'])
+def test_what_a_handler_raises_while_a_thread_starts_is_an_interrupt(monkeypatch, request, how):
+	# a program's own handler raising an ordinary exception ( TimeoutError from SIGALRM ) while the main thread waits for a
+	# thread it starts: the thread runs, so this is an interrupt, raised on with every command stopped. Before, it was
+	# taken for a thread that could not start: the pool said "started 3 of 4 threads" and ran its commands to the end, the
+	# batch recorded one running command as failed, and the program's timeout never fired
+	def handler(signum, frame):
+		raise TimeoutError("the program's own timeout")
+	previous = signal.signal(signal.SIGALRM, handler)
+	request.addfinalizer(lambda: signal.signal(signal.SIGALRM, previous))
+	main = threading.main_thread().ident
+	real_helper = multiCMD._start_in_helper
+	armed = [True]
+	def slow_helper(*args):
+		# the signal lands once the helper exists, while the main thread waits for it
+		if armed[0]:
+			armed[0] = False
+			signal.pthread_kill(main, signal.SIGALRM)
+		time.sleep(0.05)
+		real_helper(*args)
+	monkeypatch.setattr(multiCMD, '_start_in_helper', slow_helper)
+	started = time.monotonic()
+	with pytest.raises(TimeoutError):
+		run_commands([['sleep', '5']] * 4, max_threads=4, quiet=True, wait_for_return=how == 'pool')
+	multiCMD.join_threads(timeout=5)
+	assert time.monotonic() - started < 4 and not multiCMD._live_procs
+
+
 # ---- a normal run touches no signal state
 
 def _normal_runs():
