@@ -2032,9 +2032,10 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 	Sets task.returncode ( 124 after a timeout ), start_time and end_time. A KeyboardInterrupt is re-raised once the
 	command is dead, the task finalized as stopped. So is anything else that is not an Exception ( a SIGTERM handler's
 	SystemExit, the CLI's _StdoutClosed from _watch or _drain ), and, once the command runs, whatever a signal handler
-	raises: multiCMD then only waits for it ( _watch, _drain: polls, sleeps and joins, no I/O of their own ). An Exception raised while it starts is a failure
-	of multiCMD's: the command is stopped and the caller records it ( -1 ). A second interrupt ends the wait for the
-	stop: the command is sent SIGTERM and stays registered, for kill_all() and the exit hook.
+	raises: multiCMD then only waits for it ( _watch, _drain: polls, sleeps and joins, no I/O of their own ). An
+	Exception raised while it starts is a failure of multiCMD's: the command is stopped and the caller records it ( -1 ).
+	A second interrupt ends the wait for the stop: the command is sent SIGTERM and stays registered, for kill_all() and
+	the exit hook.
 	The command is registered from the moment Popen has returned it ( see _popen ). An interrupt that Python raises
 	inside Popen, once it has forked, loses it. Through the exec wrapper ( Python < 3.11 ) it then never runs: the
 	wrapper waits until the command is registered. With Popen(process_group=) ( 3.11+ ) it runs on in a process group of
