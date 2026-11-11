@@ -3,6 +3,7 @@ A Ctrl-C ( or what a program's signal handler raises ) while multiCMD starts, ru
 and the commands are stopped, or left registered for kill_all() and the exit hook
 '''
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -13,7 +14,7 @@ import _thread
 import pytest
 
 import multiCMD
-from conftest import pid_gone, sigint_main_after
+from conftest import PACKAGE_ROOT, pid_gone, sigint_main_after
 from multiCMD import AsyncExecutor, run_commands
 
 
@@ -129,13 +130,6 @@ def _left_running(before, wait=6.0):
 		time.sleep(0.02)
 
 
-# on Python 3.6 - 3.9 and 3.14 a Ctrl-C at one instruction of a `with lock:` can leave the lock held, and
-# Thread.start() takes threading's own _active_limbo_lock so: every thread then hangs as it ends ( CPython's own, see
-# the README ). The stress test below keeps its Ctrl-Cs out of the output readers' Thread.start() there: one that would
-# land inside it is taken right after it
-_WITH_MAY_JAM = sys.version_info < (3, 10) or sys.version_info >= (3, 14)
-
-
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='checks processes through /proc')
 def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_popen(launcher, monkeypatch, request):
 	# a real SIGINT from another thread lands anywhere in the start ( 0 - 0.5 ms after the spawn begins ). A command is
@@ -159,19 +153,6 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_popen(launcher, 
 	if hasattr(sys, 'unraisablehook'):
 		# ( CPython drops one raised in a finalizer: not pytest's to report )
 		monkeypatch.setattr(sys, 'unraisablehook', lambda dropped: None)
-	if _WITH_MAY_JAM:
-		real_start = threading.Thread.start
-		def start(self):
-			if getattr(self, '_target', None) is multiCMD._read_stream:
-				# ( unblocked whatever happens: a Ctrl-C that landed before the block is raised right after it )
-				try:
-					signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
-					real_start(self)
-				finally:
-					signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
-			else:
-				real_start(self)
-		monkeypatch.setattr(threading.Thread, 'start', start)
 	spawning = threading.Event()
 	real_spawn = multiCMD._spawn
 	def spawn(*args, **kwargs):
@@ -197,7 +178,8 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_popen(launcher, 
 		try:
 			try:
 				armed[0] = True
-				# ( a bare thread: Thread.start() and join() take threading's own locks with `with`, see _WITH_MAY_JAM )
+				# ( a bare thread: Thread.start() and join() on the main thread take threading's own locks, which a Ctrl-C
+				# can leave held, see docs/limitations.md )
 				_thread.start_new_thread(send, ())
 				multiCMD.run_command(['sleep', '3'], quiet=True)
 			finally:
@@ -233,7 +215,7 @@ def test_a_ctrl_c_while_the_command_starts_loses_it_only_inside_popen(launcher, 
 	assert described == [], len(inside_popen)
 
 
-# ---- a thread that cannot start: the pool tries the next worker once, and a Ctrl-C start() turns into RuntimeError is raised
+# ---- a thread that cannot start: the pool tries the next worker once
 
 def _failing_worker_starts(monkeypatch, failing):
 	'''Make the pool's worker starts whose 1-based number is in failing raise; returns the list of starts tried'''
@@ -273,28 +255,6 @@ def test_a_pool_that_cannot_start_two_workers_in_a_row_fails_every_task(monkeypa
 	tasks = run_commands([['true']] * 4, max_threads=4, quiet=True, return_object=True)
 	assert len(calls) == 2
 	assert [task.returncode for task in tasks] == [-1] * 4 and all(task._error for task in tasks)
-
-
-def test_a_ctrl_c_that_thread_start_turns_into_another_error_is_still_raised(monkeypatch):
-	# ( seen on 3.12 and free-threaded 3.13t ) a Ctrl-C inside Condition.wait()'s _acquire_restore(), as Thread.start()
-	# waits for an output reader: the Condition's release then raises RuntimeError, and the reader runs all the same.
-	# Taken for a reader that cannot start, the Ctrl-C was lost
-	real_start = threading.Thread.start
-	armed = [True]
-	def start(self):
-		real_start(self)
-		if armed[0] and getattr(self, '_target', None) is multiCMD._read_stream:
-			armed[0] = False
-			try:
-				raise KeyboardInterrupt
-			except KeyboardInterrupt:
-				raise RuntimeError('release unlocked lock')
-	monkeypatch.setattr(threading.Thread, 'start', start)
-	started = time.monotonic()
-	with pytest.raises(KeyboardInterrupt):
-		multiCMD.run_command(['sleep', '2'], quiet=True)
-	# before: the command ran to its end and the call returned
-	assert time.monotonic() - started < 1.5 and not multiCMD._live_procs
 
 
 @pytest.mark.skipif(not hasattr(signal, 'pthread_sigmask'), reason='POSIX signals')
@@ -544,20 +504,16 @@ def test_a_ctrl_c_anywhere_in_a_start_leaves_the_signal_mask_as_it_was(launcher)
 	assert state['k'] > 5
 
 
-# ( a Ctrl-C inside Thread.start()'s wait can leave that thread's Event inconsistent, CPython's own: the thread fails
-# as it comes up, and CPython reports that as unraisable )
-@pytest.mark.filterwarnings('ignore::pytest.PytestUnraisableExceptionWarning')
 @pytest.mark.skipif(not sys.platform.startswith('linux'), reason='POSIX commands')
 @pytest.mark.parametrize('command', [['true'], ['mcmd-no-such-command-xyz']], ids=['true', 'missing'])
 def test_a_ctrl_c_at_any_point_of_a_serial_run_is_raised(command):
 	# ( matrix of round 12, finding 4 ) one KeyboardInterrupt at each call, return and C-call return of a serial run in
-	# turn, in every frame of the main thread ( subprocess's, os's ... ): run_command() raises it every time, for a
-	# command that runs and for one that is not found. It found a Ctrl-C that Thread.start() turns into RuntimeError on
-	# 3.12 ( see _Thread.start ). threading's own frames are left out where a Ctrl-C at one instruction of a `with lock:`
-	# can leave the lock held ( 3.6 - 3.9, 3.14: CPython's own, see the README )
-	skipped = {threading.__file__} if _WITH_MAY_JAM else set()
+	# turn, in every frame of the main thread ( subprocess's, os's, threading's ... ): run_command() raises it every time,
+	# for a command that runs and for one that is not found. Up to 1.59 threading's own frames were left out on 3.6 - 3.9
+	# and 3.14: a Ctrl-C at one instruction of the output readers' Thread.start() could leave _active_limbo_lock held, and
+	# every later thread start hung. From 1.60 the readers start by one C call ( see _Reader )
 	def counted(frame, event):
-		return frame.f_code.co_filename not in skipped
+		return True
 	state = {'k': 0}
 	returned = []
 	while True:
@@ -622,3 +578,82 @@ def test_the_only_ctrl_c_anywhere_while_a_missing_command_is_dealt_with_is_raise
 		state['k'] += 1
 	assert lost == []
 	assert state['k'] > 5 and not multiCMD._live_procs
+
+
+# ---- a Ctrl-C as a thread starts never leaves threading's own locks held ( 1.60 )
+
+# a serial run_command(['true']) stopped at a random moment by a SIGALRM handler that raises KeyboardInterrupt, many times
+# in one process; after each stop threading._active_limbo_lock must be free, and the next call must finish
+STOP_PROBE = r'''
+import _thread, os, random, signal, sys, threading, time, traceback
+sys.path.insert(0, sys.argv[1])
+import multiCMD
+n = int(sys.argv[2])
+done = [0]
+def watchdog():
+	# no call finished for 20 s is a hang: a call takes 0.2 - 5 ms, a stop at most about 3 s ( the jammed Popen lock in
+	# docs/limitations.md ). A bare thread, as it starts while nothing is stopped yet
+	last, since = -1, time.monotonic()
+	while True:
+		time.sleep(1)
+		if done[0] != last:
+			last, since = done[0], time.monotonic()
+		elif time.monotonic() - since > 20:
+			stack = sys._current_frames().get(threading.main_thread().ident)
+			print('HANG after %d calls; the main thread:\n%s' % (done[0], ''.join(traceback.format_stack(stack))), flush=True)
+			os._exit(3)
+_thread.start_new_thread(watchdog, ())
+armed = [False]
+def handler(signum, frame):
+	# ( one that the kernel hands to another thread can run on the main thread after the call: only while armed )
+	if armed[0]:
+		armed[0] = False
+		raise KeyboardInterrupt
+signal.signal(signal.SIGALRM, handler)
+times = []
+for _ in range(50):
+	start = time.perf_counter()
+	multiCMD.run_command(['true'], quiet=True)
+	times.append(time.perf_counter() - start)
+window = sorted(times)[len(times) // 2] * 1.5
+stops = others = 0
+for i in range(n):
+	try:
+		try:
+			armed[0] = True
+			signal.setitimer(signal.ITIMER_REAL, random.uniform(1e-6, window))
+			multiCMD.run_command(['true'], quiet=True)
+			# the alarm lands here if it did not land in the call
+			time.sleep(window)
+		finally:
+			armed[0] = False
+			signal.setitimer(signal.ITIMER_REAL, 0)
+	except KeyboardInterrupt:
+		stops += 1
+	except Exception as e:
+		others += 1
+		print('not a KeyboardInterrupt: %r' % (e,), flush=True)
+	if not threading._active_limbo_lock.acquire(True, 2):
+		print('LEAK: threading._active_limbo_lock held after %d calls' % (i + 1), flush=True)
+		os._exit(2)
+	threading._active_limbo_lock.release()
+	done[0] = i + 1
+assert multiCMD.run_command(['true'], quiet=True, return_code_only=True) == 0
+print('%d calls, %d stopped, %d other errors' % (n, stops, others), flush=True)
+'''
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not hasattr(signal, 'setitimer'), reason='POSIX timers')
+def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
+	# ( the 1.60 plan, K; seen in hpcp 9.87's re-review ) a stop inside an output reader's Thread.start() on the main thread
+	# left threading's _active_limbo_lock held, and every later thread start hung: up to 1.59 on 3.14 this probe hung after
+	# 30, 130 and 1,800 calls in the plan's three runs. 3.6 never hung so in 60,000 calls. 5,000 calls take about 75 s on
+	# 3.6 ( a call and the sleep after it ): 600 s leaves eight times that under -n auto
+	probe = tmp_path / 'probe.py'
+	probe.write_text(STOP_PROBE)
+	run = subprocess.run([sys.executable, '-I', str(probe), str(PACKAGE_ROOT), '5000'], stdout=subprocess.PIPE,
+		stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
+	# ( Python 3.6 - 3.8 buffer stderr, where the stops that landed in a finalizer are told, until the exit )
+	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors$', run.stdout, re.M), run.stdout[-4000:]
+

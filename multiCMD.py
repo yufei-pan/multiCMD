@@ -4,6 +4,7 @@
 # dependencies = []
 # ///
 #%% imports
+import _thread
 import argparse
 import atexit
 import collections
@@ -287,7 +288,8 @@ class _Done:
 
 class _Thread(threading.Thread):
 	'''
-	A daemon thread that reports itself done, for every thread multiCMD starts and waits for ( internal )
+	A daemon thread that reports itself done, for every thread multiCMD starts and waits for but a command's output
+	readers ( _Reader ) ( internal )
 
 	On Python 3.9.8 through 3.12 a Thread.join() that a KeyboardInterrupt interrupts leaves the thread flagged
 	as stopped while it still runs ( CPython bpo-45274 ): Thread.is_alive() is then False and Thread.join()
@@ -301,7 +303,7 @@ class _Thread(threading.Thread):
 	  returns at once for it.
 	done is a _Done, not a threading.Event, so no interrupt can leave it blocking anyone.
 	@attributes:
-		task: The Task the thread runs ( None for a dispatcher, pool worker or output reader )
+		task: The Task the thread runs ( None for a dispatcher or pool worker )
 		done: Set once the target has returned or raised ( a _Done )
 	'''
 	def __init__(self, target, args=(), task=None):
@@ -345,6 +347,44 @@ class _Thread(threading.Thread):
 			# its target has finished, so it is only leaving: never block on a lock an interrupted join left held
 			left = 1 if left is None else min(left, 1)
 		super().join(left)
+
+class _Reader:
+	'''
+	A command's output reader ( internal ): a thread started by one C call, _thread.start_new_thread, so its start takes no
+	threading lock in the calling thread and waits on nothing there. threading.Thread.start() takes _active_limbo_lock and
+	waits on the new thread's _started Event: a Ctrl-C that Python raised inside it on the main thread left either held, and
+	every later thread start blocked. A serial run starts two readers per command on the main thread. done and _started are
+	_Done ( no interrupt jams them ); is_alive() and join() go by them, as _Thread's do. Not in threading.enumerate(), and
+	threading's trace, profile and excepthook do not reach it: an exception _read_stream raises is reported by Python's
+	hook for a thread it started ( sys.unraisablehook from 3.8 ). Detached: its stack goes when it ends.
+	'''
+	__slots__ = ('_target', '_args', 'done', '_started', '_pid')
+
+	def __init__(self, target, args=()):
+		self._target, self._args = target, args
+		self.done = _Done()
+		self._started = _Done()
+		# ( in a child forked meanwhile only the forking thread exists )
+		self._pid = os.getpid()
+
+	def start(self):
+		_thread.start_new_thread(self._run, ())
+		# ( the thread sets it too, first thing: a stop that lands right here leaves it to the thread )
+		self._started.set()
+
+	def _run(self):
+		self._started.set()
+		try:
+			self._target(*self._args)
+		finally:
+			self.done.set()
+
+	def is_alive(self):
+		return self._started.flag and not self.done.flag and self._pid == os.getpid()
+
+	def join(self, timeout=None):
+		if self._pid == os.getpid() and self._started.flag:
+			self.done.wait(timeout)
 
 def _any_alive(threads):
 	'''
@@ -1659,8 +1699,8 @@ def _join(thread, timeout=None):
 	'''
 	Wait for a thread to finish, in short steps ( internal )
 	A plain join() blocks in C, where a KeyboardInterrupt only arrives if the signal happens to
-	land on this very thread; short steps let the waiting thread see it within 0.1s. A _Thread
-	waits in such steps by itself ( see _Thread ). Like Thread.join(), this raises RuntimeError for
+	land on this very thread; short steps let the waiting thread see it within 0.1s. A _Thread or
+	_Reader waits in such steps by itself ( see _Thread ). Like Thread.join(), this raises RuntimeError for
 	a threading.Thread that was never started.
 	@params:
 		thread: The thread to wait for
@@ -1966,7 +2006,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		task._env = task._extra_env = None
 		task.start_time = time.time()
 		task._last_output = time.monotonic()
-		readers = [_Thread(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
+		readers = [_Reader(_read_stream, (stream, target, task, decor, quiet)) for stream, target in streams]
 		for reader in readers:
 			reader.start()
 		waiting = True

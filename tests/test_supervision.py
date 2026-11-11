@@ -236,15 +236,15 @@ def test_exit_leaves_alone_what_a_finished_fire_and_forget_command_started(tmp_p
 
 @pytest.mark.parametrize('exc', [KeyboardInterrupt, RuntimeError], ids=['ctrl-c', 'cannot-start'])
 def test_a_reader_start_that_fails_still_stops_the_command(monkeypatch, exc):
-	real_start = multiCMD._Thread.start
+	real_start = multiCMD._Reader.start
 	count = [0]
 	def start(self):
-		if getattr(self, '_target', None) is multiCMD._read_stream:
+		if self._target is multiCMD._read_stream:
 			count[0] += 1
 			if count[0] == 2:
 				raise exc("can't start new thread")
 		real_start(self)
-	monkeypatch.setattr(multiCMD._Thread, 'start', start)
+	monkeypatch.setattr(multiCMD._Reader, 'start', start)
 	procs = []
 	real_register = multiCMD._register
 	monkeypatch.setattr(multiCMD, '_register', lambda proc, pgid: (procs.append(proc), real_register(proc, pgid)))

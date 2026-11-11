@@ -8,7 +8,7 @@ import time
 import pytest
 
 import multiCMD
-from conftest import sigint_main_after
+from conftest import os_threads, sigint_main_after
 from multiCMD import AsyncExecutor, run_commands
 
 
@@ -78,13 +78,13 @@ def test_executor_queues_commands_instead_of_parking_threads(monkeypatch):
 	run_task = multiCMD._run_executor_task
 	monkeypatch.setattr(multiCMD, '_run_executor_task', lambda task, *args: (ran.append(task), run_task(task, *args)))
 	gate = threading.Semaphore(0)
-	baseline = threading.active_count()
+	baseline = os_threads()
 	ex = AsyncExecutor(semaphore=gate, quiet=True, dry_run=True)
 	start = time.monotonic()
 	tasks = [ex.run_command(['true']) for _ in range(5000)]
 	assert time.monotonic() - start < 5
 	# no permit is free, so only the dispatcher exists and it waits for one
-	assert threading.active_count() <= baseline + 1
+	assert os_threads() <= baseline + 1
 	assert all(task.thread is None for task in tasks)
 	for _ in range(len(tasks)):
 		gate.release()
@@ -96,15 +96,16 @@ def test_executor_queues_commands_instead_of_parking_threads(monkeypatch):
 
 @pytest.mark.slow
 def test_executor_thread_count_stays_bounded():
-	baseline = threading.active_count()
+	baseline = os_threads()
 	ex = AsyncExecutor(semaphore=threading.Semaphore(3), quiet=True)
 	ex.run_commands([['sleep', '0.05']] * 60)
 	peak = 0
 	while ex.runningThreads:
-		peak = max(peak, threading.active_count())
+		peak = max(peak, os_threads())
 		time.sleep(0.005)
-	# the dispatcher, plus a runner and two stream readers per running command
-	assert peak - baseline <= 1 + 3 * 3
+	# the dispatcher, plus a runner and two stream readers per running command, and the two readers of the command that ran
+	# before it, which may still be leaving ( see test_pool_keeps_threads_bounded )
+	assert peak - baseline <= 1 + 3 * 3 + 3 * 2
 	assert ex.get_return_codes() == [0] * 60
 
 
@@ -121,7 +122,11 @@ def test_executor_releases_finished_thread_stacks():
 		ex.wait(timeout=-1)
 		# the executor and its tasks are still referenced: every finished thread must already be joined
 		assert ex.get_return_codes() == [0] * 1200
-		# glibc keeps a few freed stacks cached for reuse
+		# glibc keeps a few freed stacks cached for reuse. The last commands' output readers may still be leaving ( done,
+		# their last step not yet run ): a stack nobody frees stays for good, so a few seconds for theirs prove the same
+		deadline = time.monotonic() + 5
+		while _stack_mappings(stack) > 8 and time.monotonic() < deadline:
+			time.sleep(0.05)
 		assert _stack_mappings(stack) <= 8
 	finally:
 		threading.stack_size(old_stack)
