@@ -419,7 +419,9 @@ and `AsyncExecutor.wait()` included, stops every command, skips the queued ones 
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
 commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
 has no reader (`mcmd ... | head`): it stops them as a Ctrl-C does, and ends by SIGPIPE, as `yes | head` does, with
-nothing on stderr. A program that imports multiCMD still gets the `BrokenPipeError`. At interpreter exit
+nothing on stderr. It learns that stdout has no reader only when a write to it fails, so a command that prints nothing
+more runs to its end first (`mcmd 'sleep 4' | head -2` takes 4 s, as `sleep 4 | head -2` does). A program that imports
+multiCMD still gets the `BrokenPipeError`. At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -508,14 +510,20 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 - Nothing needs doing to upgrade.
 - Fix: `mcmd ... | head` (a reader that quits early) ends quietly. It printed a traceback or an "Exception ignored" message
-  and exited 120 (Python's status for a stdout it cannot flush) or 2, and the commands were left to run on: a quiet one,
+  and exited 120 (Python's status for a stdout it cannot flush), and the commands were left to run on: a quiet one,
   or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
   Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
   Windows, untested: a closed pipe may show there as an `OSError` that `mcmd` does not catch yet, planned for 1.62). It
   covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions still raise
   `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main thread's
-  waits stop the commands at their next step (at most 0.1 s later); `mcmd` leaves SIGPIPE ignored, as Python does, so
-  no signal handler's raise can land inside `Popen` or where Python drops it.
+  waits stop the commands at their next step (at most 0.1 s later), while a command not started yet is skipped;
+  `mcmd` leaves SIGPIPE ignored, as Python does, so no signal handler's raise can land inside `Popen` or where Python
+  drops it. `mcmd` learns that stdout has no reader only when a write to it fails: a command that prints nothing after
+  the reader quit (`mcmd 'sleep 4' | head -2`, a `-q` run, one under `-t`) runs to its end first, as it did, and then
+  `mcmd` ends 141. Planned for 1.62: asking the pipe instead of waiting for a write.
+- Changed: a closed stderr with a working stdout now ends `mcmd` by SIGPIPE (141) when `mcmd` itself prints an error
+  there (seen for an unbalanced quote on 3.10 and 3.14, and for a usage error on 3.10); it ended 120 with 1.60. The
+  error of a command that cannot run still ends as before.
 - Fix, Python 3.6 to 3.10: a stop (a Ctrl-C, `stop()`, `kill_all(signal.SIGINT)`) that lands as a command starts no
   longer crashes the exec wrapper's Python. A stop sends SIGINT first, and a Python that SIGINT reaches while it
   initializes aborts with a core dump on 3.6 and 3.7 ("Fatal Python error: ... can't initialize sys standard streams")

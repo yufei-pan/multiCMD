@@ -214,3 +214,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   closed-stdout status on Windows (1) is untested.
 - Why: there is no Windows host to try it on, and 1.61 does not make it worse.
 - Revisit when: 1.62. Check on Windows and, if confirmed, treat that `OSError` as a closed stdout.
+
+### Poll stdout for a reader that quit, so mcmd does not wait for a write to find out
+- Kind: deferred
+- What the operator sees: `mcmd` learns that stdout has no reader only when a write to it fails. A command that prints
+  nothing after the reader quit runs to its end first: `mcmd 'sleep 4' | head -2` takes 4 s, and so do a `-q` run and one
+  under `-t`, then `mcmd` ends 141. It is the same as 1.60 and as any filter (`sleep 4 | head -2`); 1.61 stops the
+  commands of a run whose output keeps coming (`mcmd "sh -c 'sleep 0.3; echo a; sleep 4'" | head -1` ends in 0.4 s, 4.4 s
+  with 1.60).
+- Why: 1.61 stops a run from the write that fails. The 1.61 final review's probe shows `select.poll()` on the write end
+  of a pipe reports POLLERR as soon as the reader closes (Linux; macOS and Windows are not checked).
+- Revisit when: 1.62. Have the main thread's waits (`_watch`, `_drain`, the pool's join loop) poll stdout for POLLERR where
+  `select.poll` exists, and treat it as a closed stdout.
+
