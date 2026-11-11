@@ -674,6 +674,7 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 				if not quiet:_display.message(_dry_run_line(task))
 				return task.stdout+task.stderr if with_stdErr else task.stdout
 			if not quiet:_display.message('Running command: '+_quote_command(task.command),decor);_display.message('-'*100,decor)
+			if _display.closed:return task.stdout+task.stderr if with_stdErr else task.stdout
 			_execute(task,timeout,quiet,decor,use_pty)
 		except Exception as e:
 			if task._finalized:raise

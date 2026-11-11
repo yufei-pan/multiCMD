@@ -134,6 +134,29 @@ def test_a_reader_that_quit_before_the_summary_ends_the_cli_by_sigpipe():
 
 
 @posix_only
+@pytest.mark.parametrize('options, count', [
+	pytest.param(['-m', '2'], 3, id='pool-2'),
+	pytest.param(['-m', '4'], 8, id='pool-4'),
+])
+def test_a_reader_that_quit_before_the_first_write_starts_no_command(tmp_path, options, count):
+	# the first write, a worker's "Running command" header, finds stdout closed: in 1.60 it raised and the start never
+	# happened. Quiet commands that end at once cannot be told from the stop, so the pipe is closed before mcmd starts, and
+	# each command leaves a file the moment it runs.
+	read_end, write_end = os.pipe()
+	os.close(read_end)
+	try:
+		proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), *options] +
+			['touch %s/f%d' % (tmp_path, i) for i in range(1, count + 1)],
+			stdin=subprocess.DEVNULL, stdout=write_end, stderr=subprocess.PIPE)
+	finally:
+		os.close(write_end)
+	status, err = finish(proc)
+	assert status == -signal.SIGPIPE
+	assert err == ''
+	assert sorted(path.name for path in tmp_path.iterdir()) == []
+
+
+@posix_only
 def test_a_reader_that_quit_before_a_dry_run_ends_the_cli_by_sigpipe():
 	proc = start_cli(['-n', '-p', 'echo x[1-3000]'])
 	proc.reader.close()

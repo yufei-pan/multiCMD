@@ -532,7 +532,8 @@ def _raise_if_stdout_closed():
 	Raise _StdoutClosed in the main thread if a write found stdout closed, as the CLI's waits for its commands do ( internal )
 	A reader or pool worker that finds it only sets _display.closed ( see _stdout_closed ); the main thread, which is the one
 	that stops the commands, looks at each step of its waits ( _watch, _drain, the pool's join loop ). The waits of a stop do
-	not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command ).
+	not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command: before
+	its header and again after it, as that write raises nothing on a worker thread ).
 	'''
 	if _display.closed and _thread.get_ident() == threading.main_thread().ident:
 		raise _StdoutClosed()
@@ -2221,6 +2222,11 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if not quiet:
 				_display.message('Running command: ' + _quote_command(task.command), decor)
 				_display.message('-' * 100, decor)
+			if _display.closed:
+				# one of those writes found stdout closed, on a worker thread, where it raises nothing ( 1.60 raised, and the
+				# start never happened ): skipped as at the top, unfinished ( the finally below marks it finalized, which
+				# nothing reads for a task the CLI skips )
+				return task.stdout + task.stderr if with_stdErr else task.stdout
 			_execute(task, timeout, quiet, decor, use_pty)
 		except Exception as e:
 			if task._finalized:
