@@ -275,6 +275,17 @@ def test_a_sigpipe_from_elsewhere_is_ignored():
 			proc.kill()
 
 
+@pytest.mark.skipif(not os.path.exists('/dev/full'), reason='needs /dev/full')
+def test_a_stdout_that_fails_for_another_reason_than_a_broken_pipe_adds_no_traceback():
+	# a full disk under stdout: Python's own flush at exit says so, with status 120, as it did before the CLI flushed on its own
+	with open('/dev/full', 'wb') as full:
+		proc = subprocess.run([sys.executable, str(MULTICMD_PY), 'echo hi'], stdin=subprocess.DEVNULL, stdout=full,
+			stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+	assert proc.returncode == 120
+	assert 'Exception ignored' in proc.stderr
+	assert 'Traceback' not in proc.stderr
+
+
 # the waits of a run on the main thread, in this process: a stdout found closed by another thread ( a reader's write ) ends them
 
 

@@ -3013,7 +3013,13 @@ def main():
 		finally:
 			# what argparse's -h and -V left in the buffer: Python's own flush at exit would fail with a message and status 120
 			if sys.stdout is not None:
-				sys.stdout.flush()
+				try:
+					sys.stdout.flush()
+				except BrokenPipeError:
+					raise
+				except OSError:
+					# a full disk, an I/O error: Python's own flush at exit says so, as it did before the CLI flushed itself
+					pass
 		if _display.closed:
 			# a reader found it closed as the run ended, and no wait looked again
 			raise _StdoutClosed()

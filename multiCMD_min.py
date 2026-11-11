@@ -919,7 +919,10 @@ def main():
 	try:
 		try:status=_run_cli()
 		finally:
-			if sys.stdout is not None:sys.stdout.flush()
+			if sys.stdout is not None:
+				try:sys.stdout.flush()
+				except BrokenPipeError:raise
+				except OSError:pass
 		if _display.closed:raise _StdoutClosed()
 	except(BrokenPipeError,_StdoutClosed):_end_by_closed_stdout()
 	return status
