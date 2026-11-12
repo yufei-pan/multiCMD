@@ -29,9 +29,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.62'
+version = '1.63'
 __version__ = version
-COMMIT_DATE = '2026-11-11'
+COMMIT_DATE = '2026-11-12'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -454,12 +454,15 @@ class _Display:
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
 
-	A write that finds stdout without a reader ( see _no_reader ) raises, as any write does, unless on_closed is set,
-	as the CLI does ( main() ): then it is closed for good, on_closed is called once, in the thread that found it, and
-	every later write is dropped.
+	A write that fails never raises. It loses the output ( lose ): every later write is dropped, one line on stderr says so,
+	and the commands run on, as their readers keep reading. That is all a program that imports multiCMD gets, whatever the
+	error: its own writes to that stdout meet it themselves. The CLI sets on_failed ( _stdout_failed ), which gets the error
+	instead, in the thread that wrote, with the lock held: it sets closed for a reader that quit ( see _no_reader ), and
+	loses the output for anything else.
 	@attributes:
-		on_closed: Called, without arguments, by the thread whose write found stdout closed ( None: the write raises )
-		closed: Whether a write found stdout closed with on_closed set, or watch saw its reader quit
+		on_failed: Called with the OSError by the thread whose write failed ( None: lose )
+		closed: Whether stdout's reader quit, as the CLI's write or watch found it: the CLI stops its commands; writes dropped
+		lost: Whether a write failed ( for the CLI: for another reason, a terminal that hung up, a full disk ); writes dropped
 		watch: A select.poll() with stdout's descriptor in it, that the main thread's waits ask whether the reader quit
 			( see _raise_if_stdout_closed; the CLI's, from _watch_stdout ). None: only a write finds out
 	'''
@@ -467,24 +470,39 @@ class _Display:
 		self.lock = threading.Lock()
 		self.redrawable = False
 		self.at_line_start = True
-		self.on_closed = None
+		self.on_failed = None
 		self.closed = False
+		self.lost = False
 		self.watch = None
 
 	def _write(self, text):
 		'''
 		Write text to stdout and flush it, with the lock held ( internal )
 		'''
-		if self.closed:
+		if self.closed or self.lost:
 			return
 		try:
 			sys.stdout.write(text)
 			sys.stdout.flush()
 		except OSError as e:
-			if self.on_closed is None or not _no_reader(e):
-				raise
-			self.closed = True
-			self.on_closed()
+			if self.on_failed is None:
+				self.lose(e, 'multiCMD')
+			else:
+				self.on_failed(e)
+
+	def lose(self, error, name):
+		'''
+		Drop every later write, and say once on stderr that error lost the output, as name ( internal )
+		'''
+		self.lost = True
+		_write_error(f'{name}: cannot write to stdout ({error}): its output is dropped from here on')
+
+	def flush(self):
+		'''
+		Flush stdout as a write does, so that what another writer left in its buffer ( argparse ) meets the same rule ( internal )
+		'''
+		with self.lock:
+			self._write('')
 
 	def lines(self, texts, decor=('', '', ''), replace_first=False, ends_with_cr=False):
 		'''
@@ -533,10 +551,23 @@ _display = _Display()
 
 def _no_reader(error):
 	'''
-	Whether an OSError from a write to stdout says its reader quit ( internal ): BrokenPipeError, or on Windows EINVAL, which
-	Windows reports for a write to a pipe whose reader closed it ( seen with Python 3.9, 3.12 and 3.14 )
+	Whether an OSError from a write to stdout says its reader quit ( internal ), the one place that tells it from any other
+	failure: BrokenPipeError ( EPIPE ), ConnectionResetError ( ECONNRESET: a socket its peer reset ), or on Windows EINVAL
+	when stdout is a pipe, which Windows reports for a write to a pipe whose reader closed it ( seen with Python 3.9, 3.12
+	and 3.14 ). Windows' C runtime gives EINVAL for other write errors too, so on any other stdout it is not one.
 	'''
-	return isinstance(error, BrokenPipeError) or (not _IS_POSIX and error.errno == errno.EINVAL)
+	if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+		return True
+	return not _IS_POSIX and error.errno == errno.EINVAL and _stdout_is_pipe()
+
+def _stdout_is_pipe():
+	'''
+	Whether stdout is a pipe, a named FIFO included ( internal ). On Windows os.fstat gives a pipe handle S_IFIFO.
+	'''
+	try:
+		return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+	except (AttributeError, OSError, ValueError):
+		return False
 
 # what poll() reports for a pipe whose reader closed it: POLLERR on Linux, POLLHUP on macOS ( not POLLNVAL, which poll answers
 # for a descriptor that is not open )
@@ -549,24 +580,19 @@ def _watch_stdout():
 	Only a pipe is asked: POLLHUP is also what a terminal answers once it hung up, which a job left running on purpose
 	( `mcmd ... &` then `exit` or `disown`, or `setsid mcmd ...` ) outlives, and what macOS answers for a socket whose peer only
 	half-closed ( shutdown( SHUT_WR ), as socat or an HTTP/1.0 client does ) while it is still reading. For those, a write
-	that fails still finds a reader that quit.
+	that fails still finds a reader that quit ( EPIPE, ECONNRESET ), and a terminal that hung up fails with EIO, which the run
+	outlives without its output ( see _stdout_failed ).
 	'''
-	if not hasattr(select, 'poll'):
-		return None
-	try:
-		fd = sys.stdout.fileno()
-		if not stat.S_ISFIFO(os.fstat(fd).st_mode):
-			return None
-	except (AttributeError, OSError, ValueError):
+	if not hasattr(select, 'poll') or not _stdout_is_pipe():
 		return None
 	watch = select.poll()
-	watch.register(fd, _READER_QUIT)
+	watch.register(sys.stdout.fileno(), _READER_QUIT)
 	return watch
 
 def _raise_if_stdout_closed():
 	'''
 	Raise _StdoutClosed in the main thread if stdout has no reader any more, as the CLI's waits for its commands do ( internal )
-	A reader or pool worker whose write finds it only sets _display.closed ( see _stdout_closed ); the main thread, which is the
+	A reader or pool worker whose write finds it only sets _display.closed ( see _stdout_failed ); the main thread, which is the
 	one that stops the commands, looks at each step of its waits ( _watch, _drain, the pool's join loop ), and asks
 	_display.watch too, if set, so a reader that quits while the commands print nothing ends the run as well. The waits of a
 	stop do not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command:
@@ -2898,14 +2924,32 @@ def _install_cli_signal_handlers():
 	for signum in _TTY_SIGNALS:
 		signal.signal(signum, signal.SIG_IGN)
 
-def _stdout_closed():
+def _stdout_failed(error):
 	'''
-	What the CLI does when stdout has no reader ( _Display.on_closed ), in the thread whose write found it ( internal )
-	The main thread raises _StdoutClosed. Another thread has set _display.closed by now, and that is all it does: the
-	main thread's waits look at it ( _raise_if_stdout_closed ).
+	What the CLI does when a write to stdout fails ( _Display.on_failed ), in the thread that wrote, with the display's
+	lock held ( internal )
+	A reader that quit ( _no_reader ) stops the run: _display.closed is set, the main thread raises _StdoutClosed, and another
+	thread leaves the flag to the main thread's waits ( _raise_if_stdout_closed ). Any other failure ( EIO from a terminal that
+	hung up, ENOSPC from a full disk ) loses the output and nothing else, as in the library ( _Display.lose ): every later
+	write is dropped, the commands run on, queued ones too, their readers draining as before, and one line on stderr says so.
+	The CLI also points stdout's descriptor at os.devnull, so that what the failed write left in Python's buffer goes there at
+	exit, instead of failing again ( "Exception ignored" and exit status 120, in place of the commands' own ).
 	'''
-	if _thread.get_ident() == threading.main_thread().ident:
-		raise _StdoutClosed()
+	if _no_reader(error):
+		_display.closed = True
+		if _thread.get_ident() == threading.main_thread().ident:
+			raise _StdoutClosed()
+		return
+	try:
+		devnull = os.open(os.devnull, os.O_WRONLY)
+		try:
+			os.dup2(devnull, sys.stdout.fileno())
+		finally:
+			os.close(devnull)
+	except (AttributeError, OSError, ValueError):
+		# ( no descriptor to point elsewhere: the writes are dropped all the same )
+		pass
+	_display.lose(error, 'mcmd')
 
 def _end_by_closed_stdout():
 	'''
@@ -3051,24 +3095,22 @@ def main():
 	'''
 	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) is taken as an interrupt: every
 	command is stopped, as a Ctrl-C stops them, and the process ends by SIGPIPE with nothing on stderr
-	( _end_by_closed_stdout ). The library's functions keep raising what the write raised ( BrokenPipeError ), as they did.
+	( _end_by_closed_stdout ). A write to stdout that fails for any other reason ( a terminal that hung up, a full disk ) only
+	loses the output: every command runs, one line on stderr says so, and the exit status is theirs ( _stdout_failed ).
+	The library's functions only lose the output, whatever the error ( see _Display ): they have no run of their own to end.
 	@returns:
 		int: The exit status
 	'''
-	_display.on_closed = _stdout_closed
+	_display.on_failed = _stdout_failed
 	_display.watch = _watch_stdout()
 	try:
 		try:
 			status = _run_cli()
 		finally:
-			# what argparse's -h and -V left in the buffer: Python's own flush at exit would fail with a message and status 120
+			# what argparse's -h and -V left in the buffer, under the same rule: Python's own flush at exit would fail with a
+			# message and status 120
 			if sys.stdout is not None:
-				try:
-					sys.stdout.flush()
-				except OSError as e:
-					if _no_reader(e):
-						raise
-					# a full disk, an I/O error: Python's own flush at exit says so, as it did before the CLI flushed itself
+				_display.flush()
 		if _display.closed:
 			# a reader found it closed as the run ended, and no wait looked again
 			raise _StdoutClosed()

@@ -215,28 +215,6 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: `Popen` gains a way to set the child's signal mask.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)".
 
-### A stdout write that fails for another reason than a broken pipe is not designed
-- Kind: deferred
-- What the operator sees: not designed, as in 1.61. A write to stdout that fails for another reason than a broken pipe (EIO
-  once its terminal hung up, ECONNRESET from a reset socket, a full disk) is raised where it happens, and nothing decides
-  what follows. Seen, not promised, with a hung-up terminal and a reset socket (Linux, Python 3.6 and 3.14 in Docker, 1.61
-  and 1.62 alike: the same status, traceback and commands left in every pair): a traceback on stderr (not always); the
-  commands still queued not started, serial or with `-m`; a running command that loses its output and usually dies at a later
-  line, though one that ignores its failed writes ran to its end; exit status 120 (Python cannot flush the dead stdout) or
-  141 (ended by SIGPIPE), depending on the error, `-q`, `-m`, the summary, `--no-pty` and the command. A run that writes
-  nothing to stdout (`-q` with one command, or `-q --no-summary`) meets no failed write. Until 1.63, a run that must outlive
-  its terminal sends its stdout to a file or `/dev/null`, as the README says.
-- Why: on Linux and macOS 1.62 does not touch this path (on Windows it now takes EINVAL from a write to any stdout as a
-  broken pipe). `_Display._write` raises every write error that `_no_reader` does not take (it takes `BrokenPipeError`, and
-  on Windows EINVAL), in the thread that wrote, and the outcome then depends on that thread, the error, `-q`, `-m`, the
-  summary, the command's pty and what the command does when its own output dies. That is too many cases to describe right, so
-  the docs describe none; one rule replaces them. Nothing got worse than 1.61.
-- Revisit when: 1.63 (it starts as 1.62 ships), with one rule: a reader that quit stops the run (a pipe's poll answer, EPIPE
-  and Windows' EINVAL, as now, and ECONNRESET, which 1.62 still raises); any other failed stdout write drops the output from
-  then on, keeps the readers draining, runs every command (running and queued) and says so once on stderr. What a full disk
-  under stdout does (the queue runs on, or stops), and the exit status when output was lost, are questions for the 1.63
-  design.
-
 ### Under ksh93 on Linux, a reader that quit is found by the next write
 - Kind: known limitation
 - What the operator sees: on Linux, ksh93 builds its pipelines from `socketpair()`, so in `mcmd ... | head` run from ksh93

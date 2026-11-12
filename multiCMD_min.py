@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.62'
+version='1.63'
 __version__=version
-COMMIT_DATE='2026-11-11'
+COMMIT_DATE='2026-11-12'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -112,13 +112,16 @@ def _check_started(threads):
 		if not isinstance(thread,_Thread)and thread.ident is None:raise RuntimeError('cannot join thread before it is started')
 class _StdoutClosed(BaseException):0
 class _Display:
-	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_closed=None;self.closed=False;self.watch=None
+	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_failed=None;self.closed=False;self.lost=False;self.watch=None
 	def _write(self,text):
-		if self.closed:return
+		if self.closed or self.lost:return
 		try:sys.stdout.write(text);sys.stdout.flush()
 		except OSError as e:
-			if self.on_closed is None or not _no_reader(e):raise
-			self.closed=True;self.on_closed()
+			if self.on_failed is None:self.lose(e,'multiCMD')
+			else:self.on_failed(e)
+	def lose(self,error,name):self.lost=True;_write_error(f"{name}: cannot write to stdout ({error}): its output is dropped from here on")
+	def flush(self):
+		with self.lock:self._write('')
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
 		with self.lock:
@@ -133,15 +136,16 @@ class _Display:
 	def settle(self):
 		with self.lock:self.redrawable=False
 _display=_Display()
-def _no_reader(error):return isinstance(error,BrokenPipeError)or not _IS_POSIX and error.errno==errno.EINVAL
+def _no_reader(error):
+	if isinstance(error,(BrokenPipeError,ConnectionResetError)):return True
+	return not _IS_POSIX and error.errno==errno.EINVAL and _stdout_is_pipe()
+def _stdout_is_pipe():
+	try:return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+	except(AttributeError,OSError,ValueError):return False
 _READER_QUIT=getattr(select,'POLLERR',0)|getattr(select,'POLLHUP',0)
 def _watch_stdout():
-	if not hasattr(select,'poll'):return
-	try:
-		fd=sys.stdout.fileno()
-		if not stat.S_ISFIFO(os.fstat(fd).st_mode):return
-	except(AttributeError,OSError,ValueError):return
-	watch=select.poll();watch.register(fd,_READER_QUIT);return watch
+	if not hasattr(select,'poll')or not _stdout_is_pipe():return
+	watch=select.poll();watch.register(sys.stdout.fileno(),_READER_QUIT);return watch
 def _raise_if_stdout_closed():
 	if _thread.get_ident()!=threading.main_thread().ident:return
 	if not _display.closed and _display.watch is not None:
@@ -871,8 +875,17 @@ def _install_cli_signal_handlers():
 		signum=getattr(signal,name,None)
 		if signum is not None and signal.getsignal(signum)!=signal.SIG_IGN:signal.signal(signum,handler)
 	for signum in _TTY_SIGNALS:signal.signal(signum,signal.SIG_IGN)
-def _stdout_closed():
-	if _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
+def _stdout_failed(error):
+	if _no_reader(error):
+		_display.closed=True
+		if _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
+		return
+	try:
+		devnull=os.open(os.devnull,os.O_WRONLY)
+		try:os.dup2(devnull,sys.stdout.fileno())
+		finally:os.close(devnull)
+	except(AttributeError,OSError,ValueError):pass
+	_display.lose(error,'mcmd')
 def _end_by_closed_stdout():
 	_kill_running_at_exit()
 	try:sys.stderr.flush()
@@ -929,14 +942,11 @@ def _cli_commands(args):
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
-	_display.on_closed=_stdout_closed;_display.watch=_watch_stdout()
+	_display.on_failed=_stdout_failed;_display.watch=_watch_stdout()
 	try:
 		try:status=_run_cli()
 		finally:
-			if sys.stdout is not None:
-				try:sys.stdout.flush()
-				except OSError as e:
-					if _no_reader(e):raise
+			if sys.stdout is not None:_display.flush()
 		if _display.closed:raise _StdoutClosed()
 	except _StdoutClosed:_end_by_closed_stdout()
 	except OSError as e:

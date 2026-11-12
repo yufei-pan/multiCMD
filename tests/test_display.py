@@ -127,36 +127,81 @@ class ClosedPipe:
 		pass
 
 
-def test_a_closed_stdout_raises_for_the_library(monkeypatch):
-	# on_closed is the CLI's: a program that imports multiCMD gets the BrokenPipeError, as it always did
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
-	display = multiCMD._Display()
-	with pytest.raises(BrokenPipeError):
-		display.message('header')
-	with pytest.raises(BrokenPipeError):
-		display.lines(['a'])
-	assert not display.closed
+class FailingStdout:
+	'''A stdout every write and flush of which fails with error'''
+	def __init__(self, error):
+		self.error = error
+		self.writes = 0
+
+	def write(self, text):
+		self.writes += 1
+		raise self.error
+
+	def flush(self):
+		raise self.error
 
 
-def test_on_closed_is_called_once_and_every_later_write_is_dropped(monkeypatch):
-	calls = []
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
+@pytest.mark.parametrize('error', [BrokenPipeError(errno.EPIPE, 'Broken pipe'), OSError(errno.EIO, 'Input/output error')],
+	ids=['EPIPE', 'EIO'])
+def test_a_failed_write_loses_the_output_for_the_library(monkeypatch, capfd, error):
+	# on_failed is the CLI's: a program that imports multiCMD has no run of multiCMD's to end, whatever the error. 1.62 raised
+	# it in the thread that wrote: a command whose header failed did not run, a reader died with a traceback
+	stdout = FailingStdout(error)
+	monkeypatch.setattr(sys, 'stdout', stdout)
 	display = multiCMD._Display()
-	display.on_closed = lambda: calls.append('closed')
 	display.message('header')
-	assert display.closed
+	display.lines(['a'])
+	display.flush()
+	assert display.lost and not display.closed
+	assert stdout.writes == 1
+	err = capfd.readouterr().err
+	assert err.count('multiCMD: cannot write to stdout') == 1 and len(err.splitlines()) == 1
+
+
+@pytest.mark.parametrize('flag', ['closed', 'lost'])
+def test_on_failed_gets_the_error_once_and_every_later_write_is_dropped(monkeypatch, flag):
+	# the CLI's hook sets closed ( a reader that quit ) or lost ( anything else ): either drops the writes that follow
+	stdout = FailingStdout(OSError(errno.EIO, 'Input/output error'))
+	monkeypatch.setattr(sys, 'stdout', stdout)
+	display = multiCMD._Display()
+	calls = []
+	def failed(error):
+		calls.append(error.errno)
+		setattr(display, flag, True)
+	display.on_failed = failed
+	display.message('header')
 	display.lines(['a'])
 	display.message('footer')
-	assert calls == ['closed']
+	display.flush()
+	assert calls == [errno.EIO]
+	assert stdout.writes == 1
 
 
-def test_on_closed_may_raise_in_the_writing_thread(monkeypatch):
-	# the main thread's answer ( _stdout_closed ): the write is the one that raises, with the lock let go
+def test_flush_meets_the_same_hook(monkeypatch):
+	# what argparse left in the buffer: main()'s final flush goes through the display
+	class FlushFails:
+		def write(self, text):
+			pass
+
+		def flush(self):
+			raise OSError(errno.ENOSPC, 'No space left on device')
+	monkeypatch.setattr(sys, 'stdout', FlushFails())
+	display = multiCMD._Display()
+	calls = []
+	display.on_failed = lambda error: calls.append(error.errno)
+	display.flush()
+	assert calls == [errno.ENOSPC]
+	assert display.lock.acquire(False)
+
+
+def test_on_failed_may_raise_in_the_writing_thread(monkeypatch):
+	# the main thread's answer to a reader that quit ( _stdout_failed ): the write is the one that raises, with the lock let go
 	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
 	display = multiCMD._Display()
-	def stop():
+	def stop(error):
+		display.closed = True
 		raise multiCMD._StdoutClosed()
-	display.on_closed = stop
+	display.on_failed = stop
 	with pytest.raises(multiCMD._StdoutClosed):
 		display.message('header')
 	assert display.closed

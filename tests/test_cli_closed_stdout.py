@@ -302,17 +302,6 @@ def test_a_sigpipe_from_elsewhere_is_ignored():
 			proc.kill()
 
 
-@pytest.mark.skipif(not os.path.exists('/dev/full'), reason='needs /dev/full')
-def test_a_stdout_that_fails_for_another_reason_than_a_broken_pipe_adds_no_traceback():
-	# a full disk under stdout: Python's own flush at exit says so, with status 120, as it did before the CLI flushed on its own
-	with open('/dev/full', 'wb') as full:
-		proc = subprocess.run([sys.executable, str(MULTICMD_PY), 'echo hi'], stdin=subprocess.DEVNULL, stdout=full,
-			stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
-	assert proc.returncode == 120
-	assert 'Exception ignored' in proc.stderr
-	assert 'Traceback' not in proc.stderr
-
-
 # the waits of a run on the main thread, in this process: a stdout found closed by another thread ( a reader's write ) ends them
 
 
@@ -435,6 +424,9 @@ def test_main_ends_the_process_when_no_wait_saw_the_closed_stdout(monkeypatch):
 
 def test_main_ends_the_process_when_the_final_flush_finds_no_reader(monkeypatch):
 	class NoReader:
+		def write(self, text):
+			pass
+
 		def flush(self):
 			raise BrokenPipeError(32, 'Broken pipe')
 	ended = []
@@ -673,11 +665,18 @@ def test_the_library_does_not_poll_stdout(monkeypatch):
 
 
 # Windows reports a write to a pipe whose reader quit as OSError EINVAL, not BrokenPipeError ( seen on windows-latest with
-# Python 3.9, 3.12 and 3.14, 2026-11-11 )
+# Python 3.9, 3.12 and 3.14, 2026-11-11 ). Its C runtime gives EINVAL for other write errors too: on another stdout it is
+# not taken for a reader that quit.
 
 
 class EinvalStdout:
-	'''A stdout whose reader quit, as Windows reports it'''
+	'''A stdout on descriptor fd whose writes fail as Windows reports them'''
+	def __init__(self, fd):
+		self.fd = fd
+
+	def fileno(self):
+		return self.fd
+
 	def write(self, text):
 		raise OSError(errno.EINVAL, 'Invalid argument')
 
@@ -685,20 +684,37 @@ class EinvalStdout:
 		raise OSError(errno.EINVAL, 'Invalid argument')
 
 
+@pytest.fixture(params=['pipe', 'file'])
+def einval_stdout(request, tmp_path, monkeypatch):
+	'''Its kind, and what makes sys.stdout an EinvalStdout on it, a pipe or a file ( the test calls it: pytest puts its own
+	sys.stdout back after the fixtures )'''
+	if request.param == 'pipe':
+		read_end, fd = os.pipe()
+		os.close(read_end)
+	else:
+		fd = os.open(str(tmp_path / 'out'), os.O_WRONLY | os.O_CREAT)
+	yield request.param, lambda: monkeypatch.setattr(sys, 'stdout', EinvalStdout(fd))
+	monkeypatch.undo()
+	os.close(fd)
+
+
 @pytest.mark.parametrize('posix', [False, True], ids=['windows', 'posix'])
-def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_windows_only(monkeypatch, posix):
+def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_a_windows_pipe_only(monkeypatch, capfd, einval_stdout, posix):
+	kind, install = einval_stdout
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', posix)
-	monkeypatch.setattr(sys, 'stdout', EinvalStdout())
-	called = []
-	multiCMD._display.on_closed = lambda: called.append(True)
-	if posix:
-		with pytest.raises(OSError):
+	multiCMD._display.on_failed = multiCMD._stdout_failed
+	install()
+	if not posix and kind == 'pipe':
+		# the main thread: the write raises the stop ( a reader or worker thread only leaves the flag )
+		with pytest.raises(multiCMD._StdoutClosed):
 			multiCMD._display.message('x')
-		assert not multiCMD._display.closed
+		assert multiCMD._display.closed and not multiCMD._display.lost
+		assert capfd.readouterr().err == ''
 	else:
 		multiCMD._display.message('x')
-		assert multiCMD._display.closed
-		assert called == [True]
+		multiCMD._display.message('y')
+		assert multiCMD._display.lost and not multiCMD._display.closed
+		assert capfd.readouterr().err.count('mcmd: cannot write to stdout') == 1
 
 
 class Ended(BaseException):
@@ -710,16 +726,26 @@ def end_by_closed_stdout():
 
 
 @pytest.mark.parametrize('where', ['flush', 'run'])
-def test_main_ends_the_process_on_einval_from_stdout_on_windows(monkeypatch, where):
-	# the final flush, or argparse writing its help or usage to the closed pipe
+def test_main_ends_the_process_on_einval_from_a_stdout_pipe_on_windows(monkeypatch, einval_stdout, where):
+	# the final flush, or argparse writing its help or usage to the closed pipe; on a file it is not a reader that quit
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
 	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	monkeypatch.setattr(multiCMD, '_watch_stdout', lambda: None)
 	if where == 'flush':
 		monkeypatch.setattr(multiCMD, '_run_cli', lambda: 0)
-		monkeypatch.setattr(sys, 'stdout', EinvalStdout())
 	else:
 		def run():
 			raise OSError(errno.EINVAL, 'Invalid argument')
 		monkeypatch.setattr(multiCMD, '_run_cli', run)
-	with pytest.raises(Ended):
-		multiCMD.main()
+	kind, install = einval_stdout
+	install()
+	if kind == 'pipe':
+		with pytest.raises(Ended):
+			multiCMD.main()
+	elif where == 'flush':
+		assert multiCMD.main() == 0
+		assert multiCMD._display.lost
+	else:
+		# ( what _run_cli raises is not a display write: an error other than a reader quitting is raised as before )
+		with pytest.raises(OSError):
+			multiCMD.main()
