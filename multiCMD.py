@@ -3342,6 +3342,10 @@ def get_terminal_size():
 			_tsize = shutil.get_terminal_size(fallback=(240, 50))
 	return _tsize
 
+# the bar's blocks, and what a stdout whose encoding has no such characters gets for them ( see _writable )
+_BAR_BLOCKS = '▁▂▃▄▅▆▇█'
+_ASCII_BAR = str.maketrans(_BAR_BLOCKS, '.:-=+*%#')
+
 def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	'''
 	Generate a progress bar string
@@ -3379,7 +3383,7 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	if iteration == 0:
 		noBar = True
 	filled_length = int(length * iteration // total)
-	progress_chars = '▁▂▃▄▅▆▇█'
+	progress_chars = _BAR_BLOCKS
 	fractional_progress = (length * iteration / total) - filled_length
 	char_index = int(fractional_progress * (len(progress_chars) - 1))
 	bar_char = progress_chars[char_index]
@@ -3401,6 +3405,28 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		lineOut += suffix
 	return lineOut
 
+def _writable(text, stream):
+	'''
+	text as stream can write it ( internal ): unchanged if its encoding takes it ( with the stream's own errors handler ),
+	else with the bar's blocks in ASCII if the encoding has none ( Python 3.6 in a C locale has an ASCII stdout ) and '?' for
+	whatever else it cannot write ( a file name that is not valid UTF-8, on a UTF-8 stdout )
+	'''
+	encoding = getattr(stream, 'encoding', None)
+	if not encoding:
+		return text
+	try:
+		text.encode(encoding, getattr(stream, 'errors', None) or 'strict')
+		return text
+	except UnicodeEncodeError:
+		pass
+	except LookupError:
+		return text
+	try:
+		_BAR_BLOCKS.encode(encoding)
+	except UnicodeEncodeError:
+		text = text.translate(_ASCII_BAR)
+	return text.encode(encoding, 'replace').decode(encoding)
+
 def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
 	Call in a loop to create terminal progress bar
@@ -3417,13 +3443,13 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
 	try:
 		columns, _ = get_terminal_size()
-		sys.stdout.write(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}')
+		sys.stdout.write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
 		sys.stdout.flush()
 		if iteration == total and total > 0:
 			print(file=sys.stdout)
 	except Exception:
 		if iteration % 5 == 0:
-			print(_genrate_progress_bar(iteration, total, prefix, suffix))
+			print(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout))
 
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_format=".2f"):
 	if to_int or isinstance(size, str):
