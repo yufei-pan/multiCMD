@@ -518,15 +518,15 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   now stops when that pipe's reader quits, where 1.61 ran it to its end. Send its stdout to a file or `/dev/null`:
   `nohup mcmd -q "job" > log 2>&1 &`.
 - Fix: `mcmd` notices a reader that quit while its commands print nothing. When stdout is a pipe on Linux and macOS, the
-  waits for the commands ask it each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a
-  `-q` run and one under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. Only a
-  pipe is asked. With any other stdout (a file, `/dev/null`, a terminal, a socket) 1.62 asks nothing and, on Linux and
-  macOS, does what 1.61 did. Windows has no such poll: it acts on a failed write there too.
+  waits for the commands ask it each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, and
+  a `-q` run or one under `-t` whose reader quits, stop their commands at once and end 141, where 1.61 waited for the
+  commands to end. Only a pipe is asked. With any other stdout (a file, `/dev/null`, a terminal, a socket) 1.62 asks nothing
+  and, on Linux and macOS, does what 1.61 did. Windows has no such poll: it acts on a failed write there too.
 - Fix, Windows: a closed stdout (`mcmd ... | head`) ends `mcmd` with exit status 1 and an empty stderr, as planned in 1.61.
   Windows reports a write to a pipe whose reader quit as `OSError` EINVAL, not `BrokenPipeError`, so 1.61 printed a traceback
   from each reader and exited 120 (seen on GitHub's windows-latest with Python 3.9, 3.12 and 3.14, in Git Bash and cmd pipes;
   once 127 with "Fatal Python error" on 3.14). `mcmd` takes EINVAL from a write to any stdout, not only a pipe, as a reader
-  that quit. The library's functions still raise that `OSError`.
+  that quit. The library's functions treat that `OSError` as 1.61 did.
 - Fix: `print_progress_bar` no longer raises `UnicodeEncodeError` on a stdout that cannot write its bar (Python 3.6 in a
   C locale, whose stdout is ASCII: hpcp's progress line), or a file name in its prefix (one that is not valid UTF-8, on a
   UTF-8 stdout). The bar's blocks are then drawn in ASCII (`.:-=+*%#`) and what else cannot be written becomes `?`. The
@@ -540,8 +540,8 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   or one that ignores SIGPIPE, ran to its end or for ever, with `mcmd` waiting for it. Now `mcmd` stops the commands as a
   Ctrl-C does, and ends by SIGPIPE, as `yes | head` does: a shell reports 141, and stderr stays empty (exit status 1 on
   Windows, untested: a closed pipe may show there as an `OSError` that `mcmd` does not catch yet, planned for 1.62). It
-  covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions still raise
-  `BrokenPipeError` when `sys.stdout` fails. A thread that finds stdout closed only says so, and the main thread's
+  covers the commands' output, the summary, `--dry-run`, `-h` and `-V`. The library's functions treat a
+  `BrokenPipeError` from `sys.stdout` as 1.60 did. A thread that finds stdout closed only says so, and the main thread's
   waits stop the commands at their next step (at most 0.1 s later), while a command not started yet is skipped;
   `mcmd` leaves SIGPIPE ignored, as Python does, so no signal handler's raise can land inside `Popen` or where Python
   drops it. `mcmd` learns that stdout has no reader only when a write to it fails: a command that prints nothing after
