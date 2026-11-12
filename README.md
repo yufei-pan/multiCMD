@@ -93,7 +93,7 @@ exit status:
   N      several commands: how many failed, capped at 101
   2      usage error
   130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
-  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )
 ```
 
 ### Examples
@@ -167,7 +167,7 @@ mcmd --shell -m 4 "dmesg | tail -n 5" "journalctl -n 5 > /tmp/j.log"
 | Several commands | the number that failed, capped at `101` |
 | Usage error (bad option, unbalanced quote, no commands) | `2` |
 | Ctrl-C | `130` (`128+N` after SIGTERM / SIGHUP) |
-| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows (untested there) |
+| stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows |
 
 ### Input files and templates
 
@@ -419,9 +419,10 @@ and `AsyncExecutor.wait()` included, stops every command, skips the queued ones 
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
 commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
 has no reader (`mcmd ... | head`): it stops them as a Ctrl-C does, and ends by SIGPIPE, as `yes | head` does, with
-nothing on stderr. It learns that stdout has no reader only when a write to it fails, so a command that prints nothing
-more runs to its end first (`mcmd 'sleep 4' | head -2` takes 4 s, as `sleep 4 | head -2` does). A program that imports
-multiCMD still gets the `BrokenPipeError`. At interpreter exit
+nothing on stderr. On Linux and macOS it also asks stdout as it waits, so a command that prints nothing more is stopped
+as well (`mcmd 'sleep 4' | head -2` ends at once); on Windows it learns it only when a write fails, and a command that
+prints nothing more runs to its end first. A program that imports multiCMD still gets the write's error
+(`BrokenPipeError`; `OSError` EINVAL on Windows). At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -505,6 +506,22 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ```
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
+
+## Upgrading to 1.62 from 1.61
+
+- Nothing needs doing to upgrade.
+- Fix: `mcmd` notices a reader that quit while its commands print nothing. On Linux and macOS the waits for the commands
+  ask stdout each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a `-q` run and one
+  under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. A stdout that is a file,
+  `/dev/null` or a terminal is not affected. Windows has no such poll: there it is found by the next write, as in 1.61.
+- Fix, Windows: a closed stdout (`mcmd ... | head`) ends `mcmd` with exit status 1 and an empty stderr, as planned in 1.61.
+  Windows reports a write to a pipe whose reader quit as `OSError` EINVAL, not `BrokenPipeError`, so 1.61 printed a
+  traceback from each reader and exited 120 (seen on GitHub's windows-latest with Python 3.9, 3.12 and 3.14, in Git Bash
+  and cmd pipes; once 127 with "Fatal Python error" on 3.14). The library's functions still raise that `OSError`.
+- Fix: `print_progress_bar` no longer raises `UnicodeEncodeError` on a stdout that cannot write its bar (Python 3.6 in a
+  C locale, whose stdout is ASCII: hpcp's progress line), or a file name in its prefix (one that is not valid UTF-8, on a
+  UTF-8 stdout). The bar's blocks are then drawn in ASCII (`.:-=+*%#`) and what else cannot be written becomes `?`. The
+  same in 1.59 to 1.61.
 
 ## Upgrading to 1.61 from 1.60
 
