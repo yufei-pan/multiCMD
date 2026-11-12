@@ -40,6 +40,12 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   3.14, 8 copy workers, 400 small files) 3 commands in 200 stops ran so, with hpcp 9.86 and 9.87 alike, and each
   ended before hpcp did. 1.59 closed it before 3.11: the exec wrapper runs the command only once it is
   registered (66 and 33 such commands in 200 stops on 3.6 and 3.10 with 1.58, none with 1.59).
+  On every Python, a program that catches such a stop and goes on also keeps, until it exits, a zombie for each
+  stop that lands as the fork returns (3.6 to 3.10: the exec wrapper, exit 125), and one or two descriptors for
+  each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`: 150 zombies and 37 descriptors
+  on 3.6, 812 and 242 on 3.14 (1.62's measurement; the same in 1.59). Pools are not affected (no leftovers in
+  2,000 stops): their starts run off the main thread. Reaching 1,024 descriptors takes about 10,000 stops that
+  each land in a 50 to 300 µs window.
 - Why: from 3.11 Popen runs the command itself, with no wrapper to wait in, and the fork's own window cannot be
   closed from Python: blocking the stops in the calling thread does not hold them while another thread exists
   (Python runs the handler on the main thread whichever thread the kernel picks), and holding the handlers
@@ -49,6 +55,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Python code can raise.
 - Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+,
   Windows, frozen apps and an embedded Python with no `sys.executable` (the 2026-10-23 approval covered every Python; 1.59 closed it only where the exec wrapper runs).
+  Widened 2026-11-11 with the zombies and descriptors such stops leave on every Python: the user chose "Add the
+  sentence (Recommended)".
 
 ### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
