@@ -419,10 +419,12 @@ and `AsyncExecutor.wait()` included, stops every command, skips the queued ones 
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
 commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
 has no reader (`mcmd ... | head`): it stops them as a Ctrl-C does, and ends by SIGPIPE, as `yes | head` does, with
-nothing on stderr. On Linux and macOS it also asks stdout as it waits, so a command that prints nothing more is stopped
-as well (`mcmd 'sleep 4' | head -2` ends at once); on Windows it learns it only when a write fails, and a command that
-prints nothing more runs to its end first. A program that imports multiCMD still gets the write's error
-(`BrokenPipeError`; `OSError` EINVAL on Windows). At interpreter exit
+nothing on stderr. When stdout is a pipe on Linux and macOS it also asks the pipe as it waits, so a command that prints
+nothing more is stopped as well (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout, and on Windows, it
+learns it only when a write fails, and a command that prints nothing more runs to its end first. A run that must outlive
+whatever reads its stdout (under `nohup` or over `ssh`, where `nohup` leaves a stdout that is not a terminal alone) needs
+its stdout sent to a file or `/dev/null`: `nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD still gets the
+write's error (`BrokenPipeError`; `OSError` EINVAL on Windows). At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -509,11 +511,17 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 ## Upgrading to 1.62 from 1.61
 
-- Nothing needs doing to upgrade.
-- Fix: `mcmd` notices a reader that quit while its commands print nothing. On Linux and macOS the waits for the commands
-  ask stdout each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a `-q` run and one
-  under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. A stdout that is a file,
-  `/dev/null` or a terminal is not affected. Windows has no such poll: there it is found by the next write, as in 1.61.
+- Nothing needs doing to upgrade, except for a run that must outlive whatever reads its stdout, such as
+  `ssh host 'nohup mcmd -q "job" &'` (`nohup` redirects only a stdout that is a terminal, so the pipe to sshd stays): it
+  now stops when that pipe's reader quits, where 1.61 ran it to its end. Send its stdout to a file or `/dev/null`:
+  `nohup mcmd -q "job" > log 2>&1 &`.
+- Fix: `mcmd` notices a reader that quit while its commands print nothing. When stdout is a pipe on Linux and macOS, the
+  waits for the commands ask it each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a
+  `-q` run and one under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. Only a
+  pipe is asked: a file, `/dev/null`, a terminal and a socket are not affected, so a job left running on purpose
+  (`mcmd ... &`, then `exit`, `disown` or `setsid`, after which its terminal hangs up) runs on, and so does a server's
+  `mcmd` whose client half-closed its socket (macOS answers that like a reader that quit). For those, `mcmd` asks nothing
+  and acts on a write that fails, as in 1.61. Windows has no such poll: it acts on a failed write there too.
 - Fix, Windows: a closed stdout (`mcmd ... | head`) ends `mcmd` with exit status 1 and an empty stderr, as planned in 1.61.
   Windows reports a write to a pipe whose reader quit as `OSError` EINVAL, not `BrokenPipeError`, so 1.61 printed a
   traceback from each reader and exited 120 (seen on GitHub's windows-latest with Python 3.9, 3.12 and 3.14, in Git Bash

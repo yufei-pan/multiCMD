@@ -19,6 +19,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import string
 import subprocess
 import sys
@@ -537,19 +538,25 @@ def _no_reader(error):
 	'''
 	return isinstance(error, BrokenPipeError) or (not _IS_POSIX and error.errno == errno.EINVAL)
 
-# what poll() reports for a pipe whose reader closed it: POLLERR on Linux, POLLHUP on macOS. Not POLLNVAL, which macOS also
-# reports for a device ( /dev/null )
+# what poll() reports for a pipe whose reader closed it: POLLERR on Linux, POLLHUP on macOS ( not POLLNVAL, which poll answers
+# for a descriptor that is not open )
 _READER_QUIT = getattr(select, 'POLLERR', 0) | getattr(select, 'POLLHUP', 0)
 
 def _watch_stdout():
 	'''
-	A select.poll() that tells whether stdout's reader quit, for _Display.watch ( internal ); None without select.poll()
-	( Windows ) or without a stdout descriptor
+	A select.poll() that tells whether stdout's reader quit, for _Display.watch ( internal ); None unless stdout is a pipe
+	( `mcmd ... | head`; a named FIFO too ) and select.poll exists ( not on Windows )
+	Only a pipe is asked: POLLHUP is also what a terminal answers once it hung up, which a job left running on purpose
+	( `mcmd ... &` then `exit`, `disown`, `setsid` ) outlives, and what macOS answers for a socket whose peer only
+	half-closed ( shutdown( SHUT_WR ), as socat or an HTTP/1.0 client does ) while it is still reading. For those, a write
+	that fails still finds a reader that quit.
 	'''
 	if not hasattr(select, 'poll'):
 		return None
 	try:
 		fd = sys.stdout.fileno()
+		if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+			return None
 	except (AttributeError, OSError, ValueError):
 		return None
 	watch = select.poll()

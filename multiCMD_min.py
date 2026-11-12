@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
+import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
 version='1.62'
 __version__=version
@@ -137,7 +137,9 @@ def _no_reader(error):return isinstance(error,BrokenPipeError)or not _IS_POSIX a
 _READER_QUIT=getattr(select,'POLLERR',0)|getattr(select,'POLLHUP',0)
 def _watch_stdout():
 	if not hasattr(select,'poll'):return
-	try:fd=sys.stdout.fileno()
+	try:
+		fd=sys.stdout.fileno()
+		if not stat.S_ISFIFO(os.fstat(fd).st_mode):return
 	except(AttributeError,OSError,ValueError):return
 	watch=select.poll();watch.register(fd,_READER_QUIT);return watch
 def _raise_if_stdout_closed():
