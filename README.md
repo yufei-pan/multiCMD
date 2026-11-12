@@ -520,12 +520,13 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 - Fix: `mcmd` notices a reader that quit while its commands print nothing. When stdout is a pipe on Linux and macOS, the
   waits for the commands ask it each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a
   `-q` run and one under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. Only a
-  pipe is asked. With any other stdout (a file, `/dev/null`, a terminal, a socket) 1.62 asks nothing and does what 1.61
-  did. Windows has no such poll: it acts on a failed write there too.
+  pipe is asked. With any other stdout (a file, `/dev/null`, a terminal, a socket) 1.62 asks nothing and, on Linux and
+  macOS, does what 1.61 did. Windows has no such poll: it acts on a failed write there too.
 - Fix, Windows: a closed stdout (`mcmd ... | head`) ends `mcmd` with exit status 1 and an empty stderr, as planned in 1.61.
-  Windows reports a write to a pipe whose reader quit as `OSError` EINVAL, not `BrokenPipeError`, so 1.61 printed a
-  traceback from each reader and exited 120 (seen on GitHub's windows-latest with Python 3.9, 3.12 and 3.14, in Git Bash
-  and cmd pipes; once 127 with "Fatal Python error" on 3.14). The library's functions still raise that `OSError`.
+  Windows reports a write to a pipe whose reader quit as `OSError` EINVAL, not `BrokenPipeError`, so 1.61 printed a traceback
+  from each reader and exited 120 (seen on GitHub's windows-latest with Python 3.9, 3.12 and 3.14, in Git Bash and cmd pipes;
+  once 127 with "Fatal Python error" on 3.14). `mcmd` takes EINVAL from a write to any stdout, not only a pipe, as a reader
+  that quit. The library's functions still raise that `OSError`.
 - Fix: `print_progress_bar` no longer raises `UnicodeEncodeError` on a stdout that cannot write its bar (Python 3.6 in a
   C locale, whose stdout is ASCII: hpcp's progress line), or a file name in its prefix (one that is not valid UTF-8, on a
   UTF-8 stdout). The bar's blocks are then drawn in ASCII (`.:-=+*%#`) and what else cannot be written becomes `?`. The
