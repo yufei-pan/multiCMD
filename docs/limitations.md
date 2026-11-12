@@ -215,19 +215,36 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: `Popen` gains a way to set the child's signal mask.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)".
 
-### A terminal that hung up or a socket that was reset is not taken for a reader that quit
+### A stdout write that fails for another reason than a broken pipe is not designed
 - Kind: deferred
-- What the operator sees: output is raised, not dropped, when stdout fails for a reason other than a broken pipe, as in 1.61
-  (probed on 3.6 and 3.14 in Docker, 1.61 and 1.62 alike: the same status, the same traceback, the same commands left).
-  A run without `-q` whose terminal hung up while it ran (`mcmd ... &`, then `exit` or `disown`, and the window closed)
-  gets EIO on its next output line: a traceback and `mcmd: [Errno 5] Input/output error`, exit status 120 (`main` returns
-  2, then Python cannot flush the dead stdout), no further command of a serial queue started, and the running command
-  left to end on its own. A stdout that is a TCP socket whose peer reset the connection (it closed with unread data, or
-  died) gets ECONNRESET on its next write: a traceback, `mcmd` ends by SIGPIPE (status -13) and its commands die of
-  SIGPIPE at their next line. A `-q` run writes nothing and is not affected.
-- Why: 1.62's poll covers a reader that quit while the commands print nothing, and only for a pipe; EIO and ECONNRESET
-  come from a write, whose handler (`_no_reader`) takes `BrokenPipeError` alone on POSIX. Nothing got worse than 1.61.
-  The fix is a decision of its own: EIO means the terminal is gone, which a job left running on purpose outlives, so
-  its output is dropped and the run goes on; ECONNRESET is the same event as EPIPE for a socket, a reader that quit.
-- Revisit when: 1.63: output after a terminal hang-up is dropped, not raised, and the run goes on; ECONNRESET is taken
-  as a reader that quit.
+- What the operator sees: not designed, as in 1.61. A write to stdout that fails for another reason than a broken pipe (EIO
+  once its terminal hung up, ECONNRESET from a reset socket, a full disk) is raised where it happens, and nothing decides what
+  follows. Seen, not promised, with a hung-up terminal and a reset socket (Linux, Python 3.6 and 3.14 in Docker, 1.61 and
+  1.62 alike: the same status, traceback and commands left in every pair): a traceback on stderr (not always); the commands
+  still queued not started, serial or with `-m`; a running command that loses its output and usually dies at a later line,
+  though one that ignores its failed writes ran to its end; exit status 120 (Python cannot flush the dead stdout) or 141
+  (ended by SIGPIPE), depending on `-q`, `-m`, the summary, `--no-pty` and the command. A run that writes nothing to stdout
+  (`-q` with one command, or `-q --no-summary`) meets no failed write. Until 1.63, a run that must outlive its terminal
+  sends its stdout to a file or `/dev/null`, as the README says.
+- Why: 1.62 does not touch this path. `_Display._write` raises what `_no_reader` does not take (`BrokenPipeError`, and on
+  Windows EINVAL), in the thread that wrote, and the outcome then depends on that thread, the error, `-q`, `-m`, the summary,
+  the command's pty and what the command does when its own output dies. That is too many cases to describe right, so the
+  docs describe none; one rule replaces them. Nothing got worse than 1.61.
+- Revisit when: 1.63 (it starts as 1.62 ships), with one rule: a reader that quit (a pipe's poll answer, EPIPE, ECONNRESET,
+  Windows' EINVAL) stops the run, as now; any other failed stdout write drops the output from then on, keeps the readers
+  draining, runs every command (running and queued) and says so once on stderr. What a full disk under stdout does (the
+  queue runs on, or stops), and the exit status when output was lost, are questions for the 1.63 design.
+
+### Under ksh93 on Linux, a reader that quit is found by the next write
+- Kind: known limitation
+- What the operator sees: on Linux, ksh93 builds its pipelines from `socketpair()`, so in `mcmd ... | head` run from ksh93
+  `mcmd`'s stdout is a socket, which 1.62 does not ask (only a pipe is). A reader that quits while the commands print nothing
+  stops nothing until the next write, or until the commands end, as in 1.61: with ksh 93u+m on Debian 13,
+  `mcmd 'sleep 3' | head -1` ended by SIGPIPE after 3.04 s and `mcmd -q 'sleep 3' | sleep 0.3` ended 0 after 3.05 s (bash,
+  dash, zsh, mksh and busybox on Linux, and macOS's ksh, give a pipe: those end at once). A write that fails still ends the
+  run, as in 1.61. The README says so in one clause. EL7 and EL8 ship ksh-20120801, from the same AT&T code: whether it does
+  the same is not checked.
+- Why: asking a socket on Linux too would bring back a platform-by-kind branch in `_watch_stdout`, the kind that made the
+  first poll stop jobs it should not (a hung-up terminal, a half-closed socket on macOS), for one shell's pipes.
+- Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.
+- Approved: 2026-11-12, the user chose "Known limitation + README clause (Recommended)".

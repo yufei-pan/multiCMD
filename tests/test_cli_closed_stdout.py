@@ -532,12 +532,10 @@ def test_a_terminal_that_hung_up_is_not_taken_for_a_reader_that_quit(tmp_path):
 
 @posix_only
 @has_poll
-@pytest.mark.skipif(sys.platform != 'darwin', reason='only macOS answers POLLHUP for a half-closed socket, so on Linux this passes '
-	'whatever mcmd does; test_only_a_pipe_is_watched_for_a_reader_that_quit covers sockets everywhere')
 def test_a_socket_whose_peer_half_closed_is_not_taken_for_a_reader_that_quit():
 	# `socat - TCP:host:port` or an HTTP/1.0 client sends its request, calls shutdown(SHUT_WR) and reads the reply: macOS
-	# answers POLLHUP for the server side of it though the client is reading ( Linux sets POLLHUP on a socket only when both
-	# directions are shut )
+	# answers POLLHUP for the server side of it though the client is reading ( Linux sets POLLHUP on a connected socket only
+	# once both directions are shut, so there this checks only that the reply gets through )
 	client, served = socket.socketpair()
 	try:
 		client.shutdown(socket.SHUT_WR)
