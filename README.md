@@ -519,7 +519,7 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   waits for the commands ask it each step (`poll()`: POLLERR on Linux, POLLHUP on macOS), so `mcmd 'sleep 4' | head -2`, a
   `-q` run and one under `-t` stop their commands at once and end 141, where 1.61 waited for the commands to end. Only a
   pipe is asked: a file, `/dev/null`, a terminal and a socket are not affected, so a job left running on purpose
-  (`mcmd ... &`, then `exit`, `disown` or `setsid`, after which its terminal hangs up) runs on, and so does a server's
+  (`mcmd ... &`, then `exit` or `disown`, or `setsid mcmd ...`, and the terminal hangs up) runs on, and so does a server's
   `mcmd` whose client half-closed its socket (macOS answers that like a reader that quit). For those, `mcmd` asks nothing
   and acts on a write that fails, as in 1.61. Windows has no such poll: it acts on a failed write there too.
 - Fix, Windows: a closed stdout (`mcmd ... | head`) ends `mcmd` with exit status 1 and an empty stderr, as planned in 1.61.

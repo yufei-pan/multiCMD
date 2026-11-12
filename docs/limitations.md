@@ -30,7 +30,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-23, the user chose "Simple design (Recommended)" and "Drop _settle (Recommended)". The
   3.6 - 3.10 part added after the 1.56 review: 2026-10-23, the user chose "Accept both (Recommended)".
 
-### On Python 3.11+ a Ctrl-C inside Popen during a serial start can orphan the command
+### A Ctrl-C inside Popen during a serial start can orphan the command (3.11+) or leave a zombie (any Python)
 - Kind: known limitation
 - What the operator sees: on Python 3.11+, on Windows, in a frozen app (whose `sys.executable` is the app
   itself) and in an embedded Python whose `sys.executable` is empty (neither has a Python to run the exec
@@ -42,10 +42,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   registered (66 and 33 such commands in 200 stops on 3.6 and 3.10 with 1.58, none with 1.59).
   On every Python, a program that catches such a stop and goes on also keeps, until it exits, a zombie for each
   stop that lands as the fork returns (3.6 to 3.10: the exec wrapper, exit 125), and one or two descriptors for
-  each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`: 150 zombies and 37 descriptors
-  on 3.6, 812 and 242 on 3.14 (1.62's measurement; the same in 1.59). Pools are not affected (no leftovers in
-  2,000 stops): their starts run off the main thread. Reaching 1,024 descriptors takes about 10,000 stops that
-  each land in a 50 to 300 µs window.
+  each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`, each aimed at a random moment of the
+  call: 150 zombies and 37 descriptors on 3.6, 812 and 242 on 3.14 (measured on 1.61's module during the 1.62 work;
+  1.59's code for a start is the same on 3.11+, and on 3.6 it left 143 and 23). Pools are not affected (no
+  leftovers in 2,000 stops): their starts run off the main thread. At the measured rates, reaching the usual limit
+  of 1,024 descriptors takes about 21,000 such stops on 3.14 and 140,000 on 3.6.
 - Why: from 3.11 Popen runs the command itself, with no wrapper to wait in, and the fork's own window cannot be
   closed from Python: blocking the stops in the calling thread does not hold them while another thread exists
   (Python runs the handler on the main thread whichever thread the kernel picks), and holding the handlers
@@ -213,3 +214,20 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   only.
 - Revisit when: `Popen` gains a way to set the child's signal mask.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)".
+
+### A terminal that hung up or a socket that was reset is not taken for a reader that quit
+- Kind: deferred
+- What the operator sees: output is raised, not dropped, when stdout fails for a reason other than a broken pipe, as in 1.61
+  (probed on 3.6 and 3.14 in Docker, 1.61 and 1.62 alike: the same status, the same traceback, the same commands left).
+  A run without `-q` whose terminal hung up while it ran (`mcmd ... &`, then `exit` or `disown`, and the window closed)
+  gets EIO on its next output line: a traceback and `mcmd: [Errno 5] Input/output error`, exit status 120 (`main` returns
+  2, then Python cannot flush the dead stdout), no further command of a serial queue started, and the running command
+  left to end on its own. A stdout that is a TCP socket whose peer reset the connection (it closed with unread data, or
+  died) gets ECONNRESET on its next write: a traceback, `mcmd` ends by SIGPIPE (status -13) and its commands die of
+  SIGPIPE at their next line. A `-q` run writes nothing and is not affected.
+- Why: 1.62's poll covers a reader that quit while the commands print nothing, and only for a pipe; EIO and ECONNRESET
+  come from a write, whose handler (`_no_reader`) takes `BrokenPipeError` alone on POSIX. Nothing got worse than 1.61.
+  The fix is a decision of its own: EIO means the terminal is gone, which a job left running on purpose outlives, so
+  its output is dropped and the run goes on; ECONNRESET is the same event as EPIPE for a socket, a reader that quit.
+- Revisit when: 1.63: output after a terminal hang-up is dropped, not raised, and the run goes on; ECONNRESET is taken
+  as a reader that quit.

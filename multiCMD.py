@@ -547,7 +547,7 @@ def _watch_stdout():
 	A select.poll() that tells whether stdout's reader quit, for _Display.watch ( internal ); None unless stdout is a pipe
 	( `mcmd ... | head`; a named FIFO too ) and select.poll exists ( not on Windows )
 	Only a pipe is asked: POLLHUP is also what a terminal answers once it hung up, which a job left running on purpose
-	( `mcmd ... &` then `exit`, `disown`, `setsid` ) outlives, and what macOS answers for a socket whose peer only
+	( `mcmd ... &` then `exit` or `disown`, or `setsid mcmd ...` ) outlives, and what macOS answers for a socket whose peer only
 	half-closed ( shutdown( SHUT_WR ), as socat or an HTTP/1.0 client does ) while it is still reading. For those, a write
 	that fails still finds a reader that quit.
 	'''
