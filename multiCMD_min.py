@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.61'
+version='1.62'
 __version__=version
 COMMIT_DATE='2026-11-11'
 __running_threads=set()
@@ -112,12 +112,12 @@ def _check_started(threads):
 		if not isinstance(thread,_Thread)and thread.ident is None:raise RuntimeError('cannot join thread before it is started')
 class _StdoutClosed(BaseException):0
 class _Display:
-	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_closed=None;self.closed=False
+	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_closed=None;self.closed=False;self.watch=None
 	def _write(self,text):
 		if self.closed:return
 		try:sys.stdout.write(text);sys.stdout.flush()
-		except BrokenPipeError:
-			if self.on_closed is None:raise
+		except OSError as e:
+			if self.on_closed is None or not _no_reader(e):raise
 			self.closed=True;self.on_closed()
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
@@ -133,8 +133,19 @@ class _Display:
 	def settle(self):
 		with self.lock:self.redrawable=False
 _display=_Display()
+def _no_reader(error):return isinstance(error,BrokenPipeError)or not _IS_POSIX and error.errno==errno.EINVAL
+_READER_QUIT=getattr(select,'POLLERR',0)|getattr(select,'POLLHUP',0)
+def _watch_stdout():
+	if not hasattr(select,'poll'):return
+	try:fd=sys.stdout.fileno()
+	except(AttributeError,OSError,ValueError):return
+	watch=select.poll();watch.register(fd,_READER_QUIT);return watch
 def _raise_if_stdout_closed():
-	if _display.closed and _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
+	if _thread.get_ident()!=threading.main_thread().ident:return
+	if not _display.closed and _display.watch is not None:
+		for(_,events)in _display.watch.poll(0):
+			if events&_READER_QUIT:_display.closed=True
+	if _display.closed:raise _StdoutClosed()
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
 		self.max_threads=max_threads
@@ -845,7 +856,7 @@ def join_threads(threads=...,timeout=None):
 		for thread in threads:_join(thread,timeout)
 	except BaseException:ours=[thread for thread in threads if isinstance(thread,_Thread)and thread.task is not None];_stop_tasks([thread.task for thread in ours]);_join_all(ours,5);raise
 	__reap_finished_threads()
-_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )\n  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )'
+_EXIT_STATUS_HELP='exit status:\n  0      every command succeeded, or --dry-run\n  N      one command: its own exit code ( killed by signal S: 128+S )\n  N      several commands: how many failed, capped at 101\n  2      usage error\n  130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )\n  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )'
 def _exit_status(tasks):
 	if len(tasks)==1:
 		returncode=tasks[0].returncode
@@ -916,16 +927,19 @@ def _cli_commands(args):
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
-	_display.on_closed=_stdout_closed
+	_display.on_closed=_stdout_closed;_display.watch=_watch_stdout()
 	try:
 		try:status=_run_cli()
 		finally:
 			if sys.stdout is not None:
 				try:sys.stdout.flush()
-				except BrokenPipeError:raise
-				except OSError:pass
+				except OSError as e:
+					if _no_reader(e):raise
 		if _display.closed:raise _StdoutClosed()
-	except(BrokenPipeError,_StdoutClosed):_end_by_closed_stdout()
+	except _StdoutClosed:_end_by_closed_stdout()
+	except OSError as e:
+		if not _no_reader(e):raise
+		_end_by_closed_stdout()
 	return status
 def _run_cli():
 	parser=argparse.ArgumentParser(description='Run multiple commands in parallel',epilog=_EXIT_STATUS_HELP,formatter_class=argparse.RawDescriptionHelpFormatter);parser.add_argument('commands',metavar='command',type=str,nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='SECONDS',type=float,default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of commands to run at once ( 0 = all )');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode: hide command output ( the summary still shows )');parser.add_argument('-n','--dry-run',action='store_true',help='print each command, quoted, instead of running it');parser.add_argument('--shell',action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )');parser.add_argument('-e','--env',metavar='NAME=VALUE',action='append',help='set NAME to VALUE in the environment of every command ( repeatable ); NAME alone removes it');parser.add_argument('-f','--file',metavar='FILE',action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )');parser.add_argument('-a','--arg-file',metavar='FILE',action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )');summary=parser.add_mutually_exclusive_group();summary.add_argument('--summary',dest='summary',action='store_const',const='all',help='list every command in the end-of-run summary ( default: only failed ones )');summary.add_argument('--no-summary',dest='summary',action='store_const',const='none',help='do not print the end-of-run summary');parser.add_argument('--no-prefix',action='store_true',help='do not prefix output lines with [#] when commands run at once');parser.add_argument('--no-color',action='store_true',help='do not color output lines per command');pty_mode=parser.add_mutually_exclusive_group();pty_mode.add_argument('--pty',dest='pty',action='store_true',help='give commands a pseudo-terminal so they print live ( default when stdout is a terminal )');pty_mode.add_argument('--no-pty',dest='pty',action='store_false',help='give commands plain pipes');parser.set_defaults(summary='failed',pty=None);parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args()
@@ -1052,6 +1066,8 @@ def get_terminal_size():
 		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));rows,columns=struct.unpack('HHHH',packed)[:2];_tsize=columns,rows
 		except Exception:import shutil;_tsize=shutil.get_terminal_size(fallback=(240,50))
 	return _tsize
+_BAR_BLOCKS='▁▂▃▄▅▆▇█'
+_ASCII_BAR=str.maketrans(_BAR_BLOCKS,'.:-=+*%#')
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	noPrefix=False;noSuffix=False;noPercent=False;noBar=False
 	if total==0:return f"{prefix} iteration:{iteration} {suffix}".ljust(columns)
@@ -1067,7 +1083,7 @@ total:
 | {suffix}
 """
 	if iteration==0:noBar=True
-	filled_length=int(length*iteration//total);progress_chars='▁▂▃▄▅▆▇█';fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
+	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
 	if filled_length==length:bar=progress_chars[-1]*length
 	else:bar=progress_chars[-1]*filled_length+bar_char+'_'*(length-filled_length)
 	lineOut=''
@@ -1078,13 +1094,22 @@ total:
 	elif length>=16:lineOut+=' Calculating... '
 	if not noSuffix:lineOut+=suffix
 	return lineOut
+def _writable(text,stream):
+	encoding=getattr(stream,'encoding',None)
+	if not encoding:return text
+	try:text.encode(encoding,getattr(stream,'errors',None)or'strict');return text
+	except UnicodeEncodeError:pass
+	except LookupError:return text
+	try:_BAR_BLOCKS.encode(encoding)
+	except UnicodeEncodeError:text=text.translate(_ASCII_BAR)
+	return text.encode(encoding,'replace').decode(encoding)
 def print_progress_bar(iteration,total,prefix='',suffix=''):
 	prefix+=' |'if not prefix.endswith(' |')else'';suffix=f"| {suffix}"if not suffix.startswith('| ')else suffix
 	try:
-		columns,_=get_terminal_size();sys.stdout.write(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}");sys.stdout.flush()
+		columns,_=get_terminal_size();sys.stdout.write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout));sys.stdout.flush()
 		if iteration==total and total>0:print(file=sys.stdout)
 	except Exception:
-		if iteration%5==0:print(_genrate_progress_bar(iteration,total,prefix,suffix))
+		if iteration%5==0:print(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout))
 def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
 	if to_int or isinstance(size,str):
 		if isinstance(size,int):return size
