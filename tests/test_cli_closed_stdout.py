@@ -3,9 +3,12 @@
 ( by SIGPIPE, the shell's 141 ), after the commands it started were stopped. Python's own answer to a stdout it cannot
 flush is a traceback, "Exception ignored" and exit status 120.
 '''
+import errno
 import os
+import select
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -17,6 +20,7 @@ from conftest import MULTICMD_PY, pid_gone
 import multiCMD
 
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='SIGPIPE: POSIX only')
+has_poll = pytest.mark.skipif(not hasattr(select, 'poll'), reason='needs select.poll')
 
 
 def start_cli(args, driver=None, **fields):
@@ -447,3 +451,275 @@ def test_main_leaves_a_working_stdout_alone(monkeypatch):
 	monkeypatch.setattr(multiCMD, '_run_cli', lambda: 5)
 	assert multiCMD.main() == 5
 	assert ended == []
+
+
+# stdout polled: a reader that quits ends the run though nothing is written ( 1.61 found out only from a write, and the
+# commands ran to their end first )
+
+
+@posix_only
+@has_poll
+@pytest.mark.parametrize('options, count', [
+	pytest.param([], 1, id='serial'),
+	pytest.param(['-q'], 1, id='quiet'),
+	pytest.param(['-t', '30'], 1, id='timeout'),
+	pytest.param(['-q', '-m', '2'], 2, id='pool'),
+])
+def test_a_reader_that_quits_while_the_commands_print_nothing_ends_the_cli_at_once(tmp_path, options, count):
+	# ( `mcmd 'sleep 4' | head -2`: 1.61 waited the 4 s, 12 here )
+	commands = [f'sh -c {shlex.quote(f"echo $$ > {tmp_path}/pid{i}; exec sleep 12")}' for i in range(1, count + 1)]
+	proc = start_cli(options + commands)
+	try:
+		wait_for_pidfiles(tmp_path, count)
+		closed = time.monotonic()
+		proc.reader.close()
+		status, err = finish(proc)
+		took = time.monotonic() - closed
+		assert status == -signal.SIGPIPE
+		assert err == ''
+		# ( the stop itself takes about 10 ms: SIGINT ends sleep )
+		assert took < 6
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		proc.reader.close()
+		kill_leftovers(pids_in(tmp_path))
+
+
+def run_cli_quiet(stdout, command):
+	'''The CLI, quiet, with the given stdout ( a file ), run to its end'''
+	return subprocess.run([sys.executable, str(MULTICMD_PY), '-q', command], stdin=subprocess.DEVNULL, stdout=stdout,
+		stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+
+
+@posix_only
+@pytest.mark.parametrize('target', ['devnull', 'file'])
+def test_a_stdout_that_is_not_a_pipe_is_not_taken_for_one_whose_reader_quit(tmp_path, target):
+	path = os.devnull if target == 'devnull' else str(tmp_path / 'out')
+	with open(path, 'wb') as out:
+		proc = run_cli_quiet(out, 'sleep 0.3')
+	assert proc.returncode == 0
+	assert proc.stderr == ''
+
+
+@posix_only
+@has_poll
+def test_a_terminal_that_hung_up_is_not_taken_for_a_reader_that_quit(tmp_path):
+	# `mcmd 'long job' &` then `exit` or `disown`, or `setsid mcmd 'long job'`: the terminal goes, poll() answers POLLHUP for its slave, and
+	# the shell and the kernel send the job no signal. 1.62 first stopped it ( 141 ); a job left running on purpose runs on
+	import pty
+	master, slave = pty.openpty()
+	command = 'sh -c ' + shlex.quote(f'echo $$ > {tmp_path}/pid1; sleep 0.6; touch {tmp_path}/done')
+	try:
+		proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), '-q', command], stdin=subprocess.DEVNULL, stdout=slave,
+			stderr=subprocess.PIPE, start_new_session=True)
+		os.close(slave)
+		slave = -1
+		try:
+			wait_for_pidfiles(tmp_path, 1)
+			os.close(master)
+			master = -1
+			status, err = finish(proc)
+		finally:
+			proc.kill()
+			kill_leftovers(pids_in(tmp_path))
+	finally:
+		for fd in (master, slave):
+			if fd >= 0:
+				os.close(fd)
+	assert (status, err) == (0, '')
+	assert (tmp_path / 'done').exists()
+
+
+@posix_only
+@has_poll
+def test_a_socket_whose_peer_half_closed_is_not_taken_for_a_reader_that_quit():
+	# `socat - TCP:host:port` or an HTTP/1.0 client sends its request, calls shutdown(SHUT_WR) and reads the reply: macOS
+	# answers POLLHUP for the server side of it though the client is reading ( Linux sets POLLHUP on a connected socket only
+	# once both directions are shut, so there this checks only that the reply gets through )
+	client, served = socket.socketpair()
+	try:
+		client.shutdown(socket.SHUT_WR)
+		client.settimeout(30)
+		proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), "sh -c 'sleep 0.5; echo RESULT'"], stdin=subprocess.DEVNULL,
+			stdout=served.fileno(), stderr=subprocess.PIPE, universal_newlines=True)
+		served.close()
+		reply = b''
+		try:
+			while True:
+				data = client.recv(65536)
+				if not data:
+					break
+				reply += data
+		finally:
+			err = proc.communicate(timeout=30)[1]
+	finally:
+		client.close()
+		served.close()
+	assert proc.returncode == 0
+	assert err == ''
+	assert b'RESULT' in reply
+
+
+@posix_only
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='macOS does not tell a named FIFO that its reader quit')
+def test_a_named_fifo_whose_reader_quits_ends_the_cli_at_once(tmp_path):
+	# `mcmd -q ... > fifo`: a FIFO is a pipe to poll, named or not
+	fifo = str(tmp_path / 'fifo')
+	os.mkfifo(fifo)
+	command = 'sh -c ' + shlex.quote(f'echo $$ > {tmp_path}/pid1; exec sleep 12')
+	reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+	try:
+		writer = os.open(fifo, os.O_WRONLY)
+		try:
+			proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), '-q', command], stdin=subprocess.DEVNULL, stdout=writer,
+				stderr=subprocess.PIPE)
+		finally:
+			os.close(writer)
+		wait_for_pidfiles(tmp_path, 1)
+		closed = time.monotonic()
+		os.close(reader)
+		reader = -1
+		status, err = finish(proc)
+		assert (status, err) == (-signal.SIGPIPE, '')
+		assert time.monotonic() - closed < 6
+		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
+	finally:
+		if reader >= 0:
+			os.close(reader)
+		kill_leftovers(pids_in(tmp_path))
+
+
+class StdoutOn:
+	'''A stdout that is a descriptor'''
+	def __init__(self, fd):
+		self.fd = fd
+
+	def fileno(self):
+		return self.fd
+
+
+@posix_only
+@has_poll
+def test_only_a_pipe_is_watched_for_a_reader_that_quit(tmp_path, monkeypatch):
+	# what poll() says about a terminal ( POLLHUP once it hung up ), a socket ( macOS: POLLHUP once the peer half-closed ) or a
+	# device ( macOS: POLLNVAL ) is not a reader that quit; _watch_stdout asks a pipe only
+	import pty
+	pipe = os.pipe()
+	master, slave = pty.openpty()
+	sock, peer = socket.socketpair()
+	named_fifo = str(tmp_path / 'fifo')
+	os.mkfifo(named_fifo)
+	opened = [pipe[0], pipe[1], master, slave, os.open(os.devnull, os.O_WRONLY), os.open(str(tmp_path / 'f'), os.O_WRONLY | os.O_CREAT),
+		os.open(named_fifo, os.O_RDWR)]
+	_, _, _, _, devnull, file, fifo = opened
+	try:
+		wrong = []
+		for name, fd in [('pipe', pipe[1]), ('named FIFO', fifo), ('file', file), ('/dev/null', devnull), ('terminal', slave),
+				('socket', sock.fileno())]:
+			monkeypatch.setattr(sys, 'stdout', StdoutOn(fd))
+			if (multiCMD._watch_stdout() is not None) != (name in ('pipe', 'named FIFO')):
+				wrong.append(name)
+		assert wrong == []
+	finally:
+		for fd in opened:
+			os.close(fd)
+		sock.close()
+		peer.close()
+
+
+@posix_only
+@has_poll
+def test_a_stdout_that_cannot_be_asked_is_not_watched(monkeypatch):
+	read_end, write_end = os.pipe()
+	os.close(read_end)
+	os.close(write_end)
+	monkeypatch.setattr(sys, 'stdout', StdoutOn(write_end))
+	assert multiCMD._watch_stdout() is None
+	monkeypatch.setattr(sys, 'stdout', object())
+	assert multiCMD._watch_stdout() is None
+
+
+@has_poll
+def test_a_stdout_descriptor_that_is_not_open_is_not_taken_for_a_reader_that_quit():
+	# poll answers POLLNVAL for it whatever was asked: only POLLERR ( Linux ) and POLLHUP ( macOS ) say the reader quit
+	read_end, write_end = os.pipe()
+	watch = select.poll()
+	watch.register(write_end, select.POLLERR | select.POLLHUP)
+	os.close(read_end)
+	os.close(write_end)
+	multiCMD._display.watch = watch
+	multiCMD._raise_if_stdout_closed()
+	assert not multiCMD._display.closed
+
+
+@has_poll
+def test_the_library_does_not_poll_stdout(monkeypatch):
+	# only the CLI is a filter that ends when its reader quits: a program that imports multiCMD, with a pipe for stdout
+	# whose reader quit, gets no _StdoutClosed from a quiet run, which writes nothing
+	read_end, write_end = os.pipe()
+	os.close(read_end)
+	pipe = os.fdopen(write_end, 'w')
+	monkeypatch.setattr(sys, 'stdout', pipe)
+	try:
+		status = multiCMD.run_command([sys.executable, '-c', 'import time; time.sleep(0.2)'], quiet=True, return_code_only=True)
+		assert status == 0
+		assert multiCMD._display.watch is None
+	finally:
+		monkeypatch.undo()
+		try:
+			pipe.close()
+		except OSError:
+			pass
+
+
+# Windows reports a write to a pipe whose reader quit as OSError EINVAL, not BrokenPipeError ( seen on windows-latest with
+# Python 3.9, 3.12 and 3.14, 2026-11-11 )
+
+
+class EinvalStdout:
+	'''A stdout whose reader quit, as Windows reports it'''
+	def write(self, text):
+		raise OSError(errno.EINVAL, 'Invalid argument')
+
+	def flush(self):
+		raise OSError(errno.EINVAL, 'Invalid argument')
+
+
+@pytest.mark.parametrize('posix', [False, True], ids=['windows', 'posix'])
+def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_windows_only(monkeypatch, posix):
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', posix)
+	monkeypatch.setattr(sys, 'stdout', EinvalStdout())
+	called = []
+	multiCMD._display.on_closed = lambda: called.append(True)
+	if posix:
+		with pytest.raises(OSError):
+			multiCMD._display.message('x')
+		assert not multiCMD._display.closed
+	else:
+		multiCMD._display.message('x')
+		assert multiCMD._display.closed
+		assert called == [True]
+
+
+class Ended(BaseException):
+	'''_end_by_closed_stdout, which never returns, was called'''
+
+
+def end_by_closed_stdout():
+	raise Ended()
+
+
+@pytest.mark.parametrize('where', ['flush', 'run'])
+def test_main_ends_the_process_on_einval_from_stdout_on_windows(monkeypatch, where):
+	# the final flush, or argparse writing its help or usage to the closed pipe
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
+	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	if where == 'flush':
+		monkeypatch.setattr(multiCMD, '_run_cli', lambda: 0)
+		monkeypatch.setattr(sys, 'stdout', EinvalStdout())
+	else:
+		def run():
+			raise OSError(errno.EINVAL, 'Invalid argument')
+		monkeypatch.setattr(multiCMD, '_run_cli', run)
+	with pytest.raises(Ended):
+		multiCMD.main()

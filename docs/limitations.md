@@ -30,7 +30,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Approved: 2026-10-23, the user chose "Simple design (Recommended)" and "Drop _settle (Recommended)". The
   3.6 - 3.10 part added after the 1.56 review: 2026-10-23, the user chose "Accept both (Recommended)".
 
-### On Python 3.11+ a Ctrl-C inside Popen during a serial start can orphan the command
+### A Ctrl-C inside Popen during a serial start can orphan the command (3.11+) or leave a zombie (any Python)
 - Kind: known limitation
 - What the operator sees: on Python 3.11+, on Windows, in a frozen app (whose `sys.executable` is the app
   itself) and in an embedded Python whose `sys.executable` is empty (neither has a Python to run the exec
@@ -40,6 +40,13 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   3.14, 8 copy workers, 400 small files) 3 commands in 200 stops ran so, with hpcp 9.86 and 9.87 alike, and each
   ended before hpcp did. 1.59 closed it before 3.11: the exec wrapper runs the command only once it is
   registered (66 and 33 such commands in 200 stops on 3.6 and 3.10 with 1.58, none with 1.59).
+  On every Python, a program that catches such a stop and goes on also keeps, until it exits, a zombie for each
+  stop that lands as the fork returns (3.6 to 3.10: the exec wrapper, exit 125), and one or two descriptors for
+  each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`, each aimed at a random moment of the
+  call: 150 zombies and 37 descriptors on 3.6, 812 and 242 on 3.14 (measured on 1.61's module during the 1.62 work;
+  1.59's code for a start is the same on 3.11+, and on 3.6 it left 143 and 23). Pools are not affected (no
+  leftovers in 2,000 stops): their starts run off the main thread. At the measured rates, reaching the usual limit
+  of 1,024 descriptors takes about 21,000 such stops on 3.14 and 140,000 on 3.6.
 - Why: from 3.11 Popen runs the command itself, with no wrapper to wait in, and the fork's own window cannot be
   closed from Python: blocking the stops in the calling thread does not hold them while another thread exists
   (Python runs the handler on the main thread whichever thread the kernel picks), and holding the handlers
@@ -49,6 +56,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Python code can raise.
 - Approved: 2026-10-23, the user chose "Drop _Popen (Recommended)". Narrowed 2026-11-10 by 1.59 to Python 3.11+,
   Windows, frozen apps and an embedded Python with no `sys.executable` (the 2026-10-23 approval covered every Python; 1.59 closed it only where the exec wrapper runs).
+  Widened 2026-11-11 with the zombies and descriptors such stops leave on every Python: the user chose "Add the
+  sentence (Recommended)".
 
 ### A jammed Popen lock slows the stop by about 2 s
 - Kind: known limitation
@@ -206,24 +215,38 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: `Popen` gains a way to set the child's signal mask.
 - Approved: 2026-11-11, the user chose "Approve as KL (Recommended)".
 
-### Check a closed stdout on Windows (EINVAL)
+### A stdout write that fails for another reason than a broken pipe is not designed
 - Kind: deferred
-- What the operator sees: on Windows, `mcmd ... | head` may not end as on POSIX. A write to a pipe whose reader quit may be
-  reported there as `OSError` with `errno` EINVAL, not as `BrokenPipeError`, and the display catches only the latter, so
-  it would behave as 1.60 did: a traceback from each reader and exit status 120. 1.61's `--help` and README say the
-  closed-stdout status on Windows (1) is untested.
-- Why: there is no Windows host to try it on, and 1.61 does not make it worse.
-- Revisit when: 1.62. Check on Windows and, if confirmed, treat that `OSError` as a closed stdout.
+- What the operator sees: not designed, as in 1.61. A write to stdout that fails for another reason than a broken pipe (EIO
+  once its terminal hung up, ECONNRESET from a reset socket, a full disk) is raised where it happens, and nothing decides
+  what follows. Seen, not promised, with a hung-up terminal and a reset socket (Linux, Python 3.6 and 3.14 in Docker, 1.61
+  and 1.62 alike: the same status, traceback and commands left in every pair): a traceback on stderr (not always); the
+  commands still queued not started, serial or with `-m`; a running command that loses its output and usually dies at a later
+  line, though one that ignores its failed writes ran to its end; exit status 120 (Python cannot flush the dead stdout) or
+  141 (ended by SIGPIPE), depending on the error, `-q`, `-m`, the summary, `--no-pty` and the command. A run that writes
+  nothing to stdout (`-q` with one command, or `-q --no-summary`) meets no failed write. Until 1.63, a run that must outlive
+  its terminal sends its stdout to a file or `/dev/null`, as the README says.
+- Why: on Linux and macOS 1.62 does not touch this path (on Windows it now takes EINVAL from a write to any stdout as a
+  broken pipe). `_Display._write` raises every write error that `_no_reader` does not take (it takes `BrokenPipeError`, and
+  on Windows EINVAL), in the thread that wrote, and the outcome then depends on that thread, the error, `-q`, `-m`, the
+  summary, the command's pty and what the command does when its own output dies. That is too many cases to describe right, so
+  the docs describe none; one rule replaces them. Nothing got worse than 1.61.
+- Revisit when: 1.63 (it starts as 1.62 ships), with one rule: a reader that quit stops the run (a pipe's poll answer, EPIPE
+  and Windows' EINVAL, as now, and ECONNRESET, which 1.62 still raises); any other failed stdout write drops the output from
+  then on, keeps the readers draining, runs every command (running and queued) and says so once on stderr. What a full disk
+  under stdout does (the queue runs on, or stops), and the exit status when output was lost, are questions for the 1.63
+  design.
 
-### Poll stdout for a reader that quit, so mcmd does not wait for a write to find out
-- Kind: deferred
-- What the operator sees: `mcmd` learns that stdout has no reader only when a write to it fails. A command that prints
-  nothing after the reader quit runs to its end first: `mcmd 'sleep 4' | head -2` takes 4 s, and so do a `-q` run and one
-  under `-t`, then `mcmd` ends 141. It is the same as 1.60 and as any filter (`sleep 4 | head -2`); 1.61 stops the
-  commands of a run whose output keeps coming (`mcmd "sh -c 'sleep 0.3; echo a; sleep 4'" | head -1` ends in 0.4 s, 4.4 s
-  with 1.60).
-- Why: 1.61 stops a run from the write that fails. The 1.61 final review's probe shows `select.poll()` on the write end
-  of a pipe reports POLLERR as soon as the reader closes (Linux; macOS and Windows are not checked).
-- Revisit when: 1.62. Have the main thread's waits (`_watch`, `_drain`, the pool's join loop) poll stdout for POLLERR where
-  `select.poll` exists, and treat it as a closed stdout.
-
+### Under ksh93 on Linux, a reader that quit is found by the next write
+- Kind: known limitation
+- What the operator sees: on Linux, ksh93 builds its pipelines from `socketpair()`, so in `mcmd ... | head` run from ksh93
+  `mcmd`'s stdout is a socket, which 1.62 does not ask (only a pipe is). A reader that quits while the commands print nothing
+  stops nothing until the next write, or until the commands end, as in 1.61: with ksh 93u+m on Debian 13,
+  `mcmd 'sleep 3' | head -1` ended by SIGPIPE after 3.04 s and `mcmd -q 'sleep 3' | sleep 0.3` ended 0 after 3.05 s (bash,
+  dash, zsh, mksh and busybox on Linux, and macOS's ksh, give a pipe: those end at once). A write that fails still ends the
+  run, as in 1.61. The README says so in one clause. EL7 and EL8 ship ksh-20120801, from the same AT&T code: whether it does
+  the same is not checked.
+- Why: asking a socket on Linux too would bring back a platform-by-kind branch in `_watch_stdout`, the kind that made the
+  first poll stop jobs it should not (a hung-up terminal, a half-closed socket on macOS), for one shell's pipes.
+- Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.
+- Approved: 2026-11-12, the user chose "Known limitation + README clause (Recommended)".

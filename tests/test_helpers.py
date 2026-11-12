@@ -1,4 +1,5 @@
 import builtins
+import io
 import os
 import select
 import subprocess
@@ -83,6 +84,45 @@ def test_progress_bar_helpers(capsys, monkeypatch):
 	assert captured.out == (
 		"\rProgress: |████████████████████████▄_________________________|50.0% | Complete"
 	)
+
+
+def ascii_stdout(monkeypatch, encoding='ascii', errors='surrogateescape'):
+	# Python 3.6 in a C locale ( hpcp's library calls ): an ASCII stdout that takes undecodable file names
+	out = io.TextIOWrapper(io.BytesIO(), encoding=encoding, errors=errors)
+	monkeypatch.setattr(sys, 'stdout', out)
+	monkeypatch.setattr("multiCMD.get_terminal_size", lambda: (80, 24))
+	return out
+
+
+def test_progress_bar_on_a_stdout_that_cannot_write_its_blocks(monkeypatch):
+	# 1.61 raised UnicodeEncodeError out of the call, from its fallback, which printed the same bar again
+	out = ascii_stdout(monkeypatch)
+	print_progress_bar(5, 10, prefix="Progress:", suffix="Complete")
+	print_progress_bar(10, 10, prefix="Progress:", suffix="Complete")
+	out.flush()
+	assert out.buffer.getvalue().decode('ascii') == (
+		"\rProgress: |" + "#" * 24 + "=" + "_" * 25 + "|50.0% | Complete"
+		"\rProgress: |" + "#" * 48 + "|100.0% | Complete\n"
+	)
+
+
+def test_progress_bar_with_a_name_its_stdout_cannot_write(monkeypatch):
+	# a file name with a byte that is not UTF-8 ( decoded with surrogateescape ) on a UTF-8 stdout, which is strict
+	out = ascii_stdout(monkeypatch, 'utf-8', 'strict')
+	print_progress_bar(3, 0, prefix='dir/caf\udce9', suffix='s')
+	out.flush()
+	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(80)
+
+
+def test_progress_bar_in_a_c_locale_python():
+	# the real stdout of a Python whose locale has no encoding for the bar ( on 3.7+ only PYTHONIOENCODING makes it ASCII )
+	code = ('import sys; sys.path.insert(0, %r); import multiCMD; multiCMD.print_progress_bar(5, 10, "p", "s")'
+		% str(Path(multiCMD.__file__).parent))
+	env = dict(os.environ, LC_ALL='C', LANG='C', PYTHONIOENCODING='ascii')
+	proc = subprocess.run([sys.executable, '-c', code], stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=30)
+	assert proc.returncode == 0, proc.stderr
+	assert proc.stderr == b''
+	assert b'#' in proc.stdout and b'|50.0% | s' in proc.stdout
 
 
 def test_get_terminal_size_tuple():

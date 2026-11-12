@@ -19,6 +19,7 @@ import select
 import shlex
 import shutil
 import signal
+import stat
 import string
 import subprocess
 import sys
@@ -28,7 +29,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.61'
+version = '1.62'
 __version__ = version
 COMMIT_DATE = '2026-11-11'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -453,12 +454,14 @@ class _Display:
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
 
-	A write that finds stdout without a reader ( BrokenPipeError ) raises it, as any write does, unless on_closed is set,
+	A write that finds stdout without a reader ( see _no_reader ) raises, as any write does, unless on_closed is set,
 	as the CLI does ( main() ): then it is closed for good, on_closed is called once, in the thread that found it, and
 	every later write is dropped.
 	@attributes:
 		on_closed: Called, without arguments, by the thread whose write found stdout closed ( None: the write raises )
-		closed: Whether a write found stdout closed with on_closed set
+		closed: Whether a write found stdout closed with on_closed set, or watch saw its reader quit
+		watch: A select.poll() with stdout's descriptor in it, that the main thread's waits ask whether the reader quit
+			( see _raise_if_stdout_closed; the CLI's, from _watch_stdout ). None: only a write finds out
 	'''
 	def __init__(self):
 		self.lock = threading.Lock()
@@ -466,6 +469,7 @@ class _Display:
 		self.at_line_start = True
 		self.on_closed = None
 		self.closed = False
+		self.watch = None
 
 	def _write(self, text):
 		'''
@@ -476,8 +480,8 @@ class _Display:
 		try:
 			sys.stdout.write(text)
 			sys.stdout.flush()
-		except BrokenPipeError:
-			if self.on_closed is None:
+		except OSError as e:
+			if self.on_closed is None or not _no_reader(e):
 				raise
 			self.closed = True
 			self.on_closed()
@@ -527,15 +531,54 @@ class _Display:
 
 _display = _Display()
 
+def _no_reader(error):
+	'''
+	Whether an OSError from a write to stdout says its reader quit ( internal ): BrokenPipeError, or on Windows EINVAL, which
+	Windows reports for a write to a pipe whose reader closed it ( seen with Python 3.9, 3.12 and 3.14 )
+	'''
+	return isinstance(error, BrokenPipeError) or (not _IS_POSIX and error.errno == errno.EINVAL)
+
+# what poll() reports for a pipe whose reader closed it: POLLERR on Linux, POLLHUP on macOS ( not POLLNVAL, which poll answers
+# for a descriptor that is not open )
+_READER_QUIT = getattr(select, 'POLLERR', 0) | getattr(select, 'POLLHUP', 0)
+
+def _watch_stdout():
+	'''
+	A select.poll() that tells whether stdout's reader quit, for _Display.watch ( internal ); None unless stdout is a pipe
+	( `mcmd ... | head`; a named FIFO too ) and select.poll exists ( not on Windows )
+	Only a pipe is asked: POLLHUP is also what a terminal answers once it hung up, which a job left running on purpose
+	( `mcmd ... &` then `exit` or `disown`, or `setsid mcmd ...` ) outlives, and what macOS answers for a socket whose peer only
+	half-closed ( shutdown( SHUT_WR ), as socat or an HTTP/1.0 client does ) while it is still reading. For those, a write
+	that fails still finds a reader that quit.
+	'''
+	if not hasattr(select, 'poll'):
+		return None
+	try:
+		fd = sys.stdout.fileno()
+		if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+			return None
+	except (AttributeError, OSError, ValueError):
+		return None
+	watch = select.poll()
+	watch.register(fd, _READER_QUIT)
+	return watch
+
 def _raise_if_stdout_closed():
 	'''
-	Raise _StdoutClosed in the main thread if a write found stdout closed, as the CLI's waits for its commands do ( internal )
-	A reader or pool worker that finds it only sets _display.closed ( see _stdout_closed ); the main thread, which is the one
-	that stops the commands, looks at each step of its waits ( _watch, _drain, the pool's join loop ). The waits of a stop do
-	not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command: before
-	its header and again after it, as that write raises nothing on a worker thread ).
+	Raise _StdoutClosed in the main thread if stdout has no reader any more, as the CLI's waits for its commands do ( internal )
+	A reader or pool worker whose write finds it only sets _display.closed ( see _stdout_closed ); the main thread, which is the
+	one that stops the commands, looks at each step of its waits ( _watch, _drain, the pool's join loop ), and asks
+	_display.watch too, if set, so a reader that quits while the commands print nothing ends the run as well. The waits of a
+	stop do not look: it is raised once, before the stop begins. A command not started yet is skipped meanwhile ( __run_command:
+	before its header and again after it, as that write raises nothing on a worker thread ).
 	'''
-	if _display.closed and _thread.get_ident() == threading.main_thread().ident:
+	if _thread.get_ident() != threading.main_thread().ident:
+		return
+	if not _display.closed and _display.watch is not None:
+		for _, events in _display.watch.poll(0):
+			if events & _READER_QUIT:
+				_display.closed = True
+	if _display.closed:
 		raise _StdoutClosed()
 
 class AsyncExecutor:
@@ -2819,7 +2862,7 @@ _EXIT_STATUS_HELP = '''exit status:
   N      several commands: how many failed, capped at 101
   2      usage error
   130    interrupted with Ctrl-C ( 128+S after SIGTERM / SIGHUP )
-  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows, untested there )'''
+  141    stdout closed ( `mcmd ... | head` ): commands stopped, ended by SIGPIPE ( 1 on Windows )'''
 
 def _exit_status(tasks):
 	'''
@@ -3008,11 +3051,12 @@ def main():
 	'''
 	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) is taken as an interrupt: every
 	command is stopped, as a Ctrl-C stops them, and the process ends by SIGPIPE with nothing on stderr
-	( _end_by_closed_stdout ). The library's functions keep raising BrokenPipeError as they did.
+	( _end_by_closed_stdout ). The library's functions keep raising what the write raised ( BrokenPipeError ), as they did.
 	@returns:
 		int: The exit status
 	'''
 	_display.on_closed = _stdout_closed
+	_display.watch = _watch_stdout()
 	try:
 		try:
 			status = _run_cli()
@@ -3021,15 +3065,18 @@ def main():
 			if sys.stdout is not None:
 				try:
 					sys.stdout.flush()
-				except BrokenPipeError:
-					raise
-				except OSError:
+				except OSError as e:
+					if _no_reader(e):
+						raise
 					# a full disk, an I/O error: Python's own flush at exit says so, as it did before the CLI flushed itself
-					pass
 		if _display.closed:
 			# a reader found it closed as the run ended, and no wait looked again
 			raise _StdoutClosed()
-	except (BrokenPipeError, _StdoutClosed):
+	except _StdoutClosed:
+		_end_by_closed_stdout()
+	except OSError as e:
+		if not _no_reader(e):
+			raise
 		_end_by_closed_stdout()
 	return status
 
@@ -3342,6 +3389,10 @@ def get_terminal_size():
 			_tsize = shutil.get_terminal_size(fallback=(240, 50))
 	return _tsize
 
+# the bar's blocks, and what a stdout whose encoding has no such characters gets for them ( see _writable )
+_BAR_BLOCKS = '▁▂▃▄▅▆▇█'
+_ASCII_BAR = str.maketrans(_BAR_BLOCKS, '.:-=+*%#')
+
 def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	'''
 	Generate a progress bar string
@@ -3379,7 +3430,7 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	if iteration == 0:
 		noBar = True
 	filled_length = int(length * iteration // total)
-	progress_chars = '▁▂▃▄▅▆▇█'
+	progress_chars = _BAR_BLOCKS
 	fractional_progress = (length * iteration / total) - filled_length
 	char_index = int(fractional_progress * (len(progress_chars) - 1))
 	bar_char = progress_chars[char_index]
@@ -3401,6 +3452,28 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		lineOut += suffix
 	return lineOut
 
+def _writable(text, stream):
+	'''
+	text as stream can write it ( internal ): unchanged if its encoding takes it ( with the stream's own errors handler ),
+	else with the bar's blocks in ASCII if the encoding has none ( Python 3.6 in a C locale has an ASCII stdout ) and '?' for
+	whatever else it cannot write ( a file name that is not valid UTF-8, on a UTF-8 stdout )
+	'''
+	encoding = getattr(stream, 'encoding', None)
+	if not encoding:
+		return text
+	try:
+		text.encode(encoding, getattr(stream, 'errors', None) or 'strict')
+		return text
+	except UnicodeEncodeError:
+		pass
+	except LookupError:
+		return text
+	try:
+		_BAR_BLOCKS.encode(encoding)
+	except UnicodeEncodeError:
+		text = text.translate(_ASCII_BAR)
+	return text.encode(encoding, 'replace').decode(encoding)
+
 def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
 	Call in a loop to create terminal progress bar
@@ -3417,13 +3490,13 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
 	try:
 		columns, _ = get_terminal_size()
-		sys.stdout.write(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}')
+		sys.stdout.write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
 		sys.stdout.flush()
 		if iteration == total and total > 0:
 			print(file=sys.stdout)
 	except Exception:
 		if iteration % 5 == 0:
-			print(_genrate_progress_bar(iteration, total, prefix, suffix))
+			print(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout))
 
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_format=".2f"):
 	if to_int or isinstance(size, str):
