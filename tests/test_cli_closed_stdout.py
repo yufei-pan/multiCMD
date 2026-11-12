@@ -504,7 +504,7 @@ def test_a_stdout_that_is_not_a_pipe_is_not_taken_for_one_whose_reader_quit(tmp_
 @posix_only
 @has_poll
 def test_a_terminal_that_hung_up_is_not_taken_for_a_reader_that_quit(tmp_path):
-	# `mcmd 'long job' &` then `exit`, or `disown`, `setsid`: the terminal goes, poll() answers POLLHUP for its slave, and
+	# `mcmd 'long job' &` then `exit` or `disown`, or `setsid mcmd 'long job'`: the terminal goes, poll() answers POLLHUP for its slave, and
 	# the shell and the kernel send the job no signal. 1.62 first stopped it ( 141 ); a job left running on purpose runs on
 	import pty
 	master, slave = pty.openpty()
@@ -532,9 +532,12 @@ def test_a_terminal_that_hung_up_is_not_taken_for_a_reader_that_quit(tmp_path):
 
 @posix_only
 @has_poll
+@pytest.mark.skipif(sys.platform != 'darwin', reason='only macOS answers POLLHUP for a half-closed socket, so on Linux this passes '
+	'whatever mcmd does; test_only_a_pipe_is_watched_for_a_reader_that_quit covers sockets everywhere')
 def test_a_socket_whose_peer_half_closed_is_not_taken_for_a_reader_that_quit():
 	# `socat - TCP:host:port` or an HTTP/1.0 client sends its request, calls shutdown(SHUT_WR) and reads the reply: macOS
-	# answers POLLHUP for the server side of it though the client is reading
+	# answers POLLHUP for the server side of it though the client is reading ( Linux sets POLLHUP on a socket only when both
+	# directions are shut )
 	client, served = socket.socketpair()
 	try:
 		client.shutdown(socket.SHUT_WR)
