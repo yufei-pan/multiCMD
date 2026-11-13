@@ -3157,8 +3157,15 @@ def _flush_stderr():
 	except OSError:
 		_point_at_devnull(sys.stderr)
 
+class _Parser(argparse.ArgumentParser):
+	'''mcmd's argument parser: a usage error ends 2, as argparse's does, also with a stderr that cannot be written ( internal )'''
+	def error(self, message):
+		# argparse before 3.11 lets the OSError of its usage write through ( exit 1 ); _write_error drops what it cannot write
+		_write_error(self.format_usage() + f'{self.prog}: error: {message}')
+		sys.exit(2)
+
 def _run_cli():
-	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
+	parser = _Parser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
 		formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('commands', metavar='command', type=str, nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )')
 	parser.add_argument('-p','--parse', action='store_true',help='Parse ranged input and expand them into multiple commands')

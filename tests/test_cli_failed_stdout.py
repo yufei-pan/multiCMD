@@ -209,6 +209,11 @@ def test_a_full_disk_under_stdout_and_stderr_ends_0_for_help_and_version(args):
 @pytest.mark.parametrize('args, status', [
 	pytest.param(['no-such-command-xyz'], 127, id='not-found'),
 	pytest.param(['-f', os.devnull], 2, id='no-commands'),
+	# the three usage errors: one parse_args() finds, two found after it ( 1.63 ended 1 on Python 3.9 and 3.10: argparse let
+	# the OSError of its usage write through )
+	pytest.param(['--bogus'], 2, id='usage-unknown-option'),
+	pytest.param([], 2, id='usage-no-command'),
+	pytest.param(['-e', '=x', 'true'], 2, id='usage-bad-env'),
 ])
 def test_a_stderr_that_cannot_be_written_changes_no_exit_status(dead, args, status):
 	# the message that cannot be written is dropped ( 1.62 and 1.63's first build: 120, from Python's flush at exit; or a traceback and 1 for
@@ -483,3 +488,19 @@ def test_the_bar_and_the_failure_report_lose_the_output_when_stdout_fails(tmp_pa
 		os.close(fd)
 	err = capfd.readouterr().err
 	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1
+
+
+@pytest.mark.parametrize('args, error', [
+	(['--bogus'], 'unrecognized arguments: --bogus'),
+	([], 'no commands given'),
+	(['-e', '=x', 'true'], "-e/--env: invalid assignment '=x'"),
+], ids=['unknown-option', 'no-command', 'bad-env'])
+def test_a_usage_error_goes_through_the_stderr_door_and_ends_2(monkeypatch, args, error):
+	# argparse wrote it to sys.stderr itself, and before Python 3.11 let a failed write end the run 1
+	said = []
+	monkeypatch.setattr(multiCMD, '_write_error', said.append)
+	monkeypatch.setattr(sys, 'argv', ['mcmd'] + args)
+	with pytest.raises(SystemExit) as ended:
+		multiCMD._run_cli()
+	assert ended.value.code == 2
+	assert len(said) == 1 and said[0].startswith('usage: mcmd ') and said[0].endswith('\nmcmd: error: ' + error)

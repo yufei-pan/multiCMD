@@ -277,8 +277,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   that stdout from then on, a program that imports multiCMD also never learns that its reader quit later: a shown command
   that never ends (`tail -f`) runs on after `prog | head` has quit, until it ends or the program is stopped. 1.62 raised
   `BlockingIOError` from the call that met the EAGAIN (its command did not finish); a program that caught that and went on
-  had a later follower stopped, with `BrokenPipeError`, when the reader quit. `mcmd` is not affected on Linux and macOS: it
-  asks the pipe, and ended by SIGPIPE at once (Docker, Python 3.14 and 3.6).
+  had a later follower stopped, with `BrokenPipeError`, when the reader quit. `mcmd` is not affected when its stdout is a pipe
+  on Linux or macOS: it asks the pipe, and ended by SIGPIPE at once (Docker, Python 3.14 and 3.6). With stdout on a socket
+  (ksh93 on Linux, see that entry) it is: a command that never ends ran on after the reader quit, where 1.62 ended at the
+  first EAGAIN (120 on 3.6, SIGABRT on 3.14, tracebacks) without starting the queued commands (Docker, a `socketpair()`
+  stdout left `O_NONBLOCK`).
 - Why: a correct retry needs mcmd's own write loop on the descriptor (with a wait for POLLOUT). Retrying through Python's
   stdout lost bytes once a single write passed its 8 KB buffer: 78,560 of 1,000,000 bytes with 20 KB writes, 336,448 with 100
   KB, none with 100-byte writes (Docker, Python 3.14 and 3.6, the 1.63 second review's `pi.py`). The `O_NONBLOCK` is another
