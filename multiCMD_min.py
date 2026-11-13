@@ -296,6 +296,7 @@ def _expand_ranges_fast(inStr,variables=None):
 		pos=match.end()
 	segments.append([inStr[pos:]]);return[''.join(parts)for parts in itertools.product(*segments)]
 _expand_ranges=_expand_ranges_fast
+_LAST_WORDS=.2
 def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 	def emit(lines,replace_first,ends_with_cr):
 		if task._finalized:return
@@ -305,7 +306,7 @@ def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 		if not quiet:_display.lines(texts,decor,replace_first,ends_with_cr)
 	def settle():
 		if not quiet and not task._finalized:_display.settle()
-	unshown=False;current=bytearray();committed=True
+	lost_at=None;current=bytearray();committed=True
 	try:
 		while True:
 			try:chunk=stream.read1(65536)
@@ -315,8 +316,8 @@ def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 			if not chunk:break
 			task._last_output=time.monotonic()
 			if not quiet and _display.closed and not task._finalized:
-				if unshown and not task._unread:task._unread.append(True)
-				unshown=True
+				if lost_at is None:lost_at=task._last_output
+				elif task._last_output-lost_at>_LAST_WORDS and not task._unread:task._unread.append(True)
 			if b'\r'not in chunk:
 				parts=chunk.split(b'\n')
 				if len(parts)==1:current+=chunk;continue
