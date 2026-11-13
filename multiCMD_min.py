@@ -296,7 +296,7 @@ def _expand_ranges_fast(inStr,variables=None):
 		pos=match.end()
 	segments.append([inStr[pos:]]);return[''.join(parts)for parts in itertools.product(*segments)]
 _expand_ranges=_expand_ranges_fast
-_LAST_WORDS=.2
+_LAST_WORDS=1.
 def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 	def emit(lines,replace_first,ends_with_cr):
 		if task._finalized:return
