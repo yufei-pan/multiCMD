@@ -527,3 +527,97 @@ def test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit(tm
 	err = done.stderr.decode()
 	assert 'CODES [0]' in err and err.count('multiCMD: cannot write to stdout') == 1
 	assert done.returncode == 120
+
+
+# --- 1.64: no bare print left. Every write of multiCMD's own goes through the display's door ( stdout ) or _write_error ( stderr )
+
+def test_no_bare_print_is_left_in_multicmd():
+	# 1.63 had four: format_bytes()'s two lines and the countdown prompt's two frames
+	import ast
+	tree = ast.parse(MULTICMD_PY.read_text(encoding='utf-8'))
+	bare = []
+	def visit(node, function):
+		if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+			function = node.name
+		if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'print' and function != '_write_error':
+			bare.append((node.lineno, function))
+		for child in ast.iter_child_nodes(node):
+			visit(child, function)
+	visit(tree, None)
+	assert bare == []
+
+
+@pytest.mark.parametrize('kwargs, codes', [({}, [0]), ({'max_threads': 2}, [0, 0, 0, 0])], ids=['serial', 'pool'])
+def test_a_sys_stdout_the_program_closed_loses_the_output_and_every_command_runs(tmp_path, monkeypatch, capfd, kwargs, codes):
+	# 1.63 raised ValueError from a serial call without running its command, and a pool recorded -1 with a traceback
+	closed = open(tmp_path / 'out', 'w')
+	closed.close()
+	commands = [['touch', str(tmp_path / ('ran%d' % i))] for i in range(len(codes))]
+	with monkeypatch.context() as patch:
+		patch.setattr(sys, 'stdout', closed)
+		got = multiCMD.run_commands(commands, return_code_only=True, **kwargs)
+		for i in range(1, 11):
+			multiCMD.print_progress_bar(i, 10)
+	assert got == codes
+	assert all((tmp_path / ('ran%d' % i)).exists() for i in range(len(codes)))
+	err = capfd.readouterr().err
+	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1
+
+
+def test_format_bytes_says_what_it_cannot_read_on_stderr(capsys):
+	# 1.63 printed it to stdout, mixed into the data
+	assert multiCMD.format_bytes('one gig', to_int=True) == 0
+	out, err = capsys.readouterr()
+	assert out == ''
+	assert "Invalid size format" in err and 'Got: one gig' in err
+
+
+@posix_only
+def test_format_bytes_message_does_not_end_a_program_whose_reader_quit_with_120(tmp_path):
+	# `prog | true`: 1.63's bare print waited in Python's buffer, and its flush at exit failed ( "Exception ignored", 120 )
+	program = tmp_path / 'prog.py'
+	program.write_text('import multiCMD\nmultiCMD.format_bytes("one gig", to_int=True)\n')
+	read_end, write_end = os.pipe()
+	os.close(read_end)
+	try:
+		done = subprocess.run([sys.executable, str(program)], stdout=write_end, stderr=subprocess.PIPE,
+			env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)), timeout=20)
+	finally:
+		os.close(write_end)
+	assert done.returncode == 0
+	assert b'Got: one gig' in done.stderr
+
+
+@posix_only
+@pytest.mark.parametrize('reader', ['quit', 'stays'])
+def test_the_countdown_prompt_is_on_stderr_and_a_dead_stdout_raises_nothing(tmp_path, reader):
+	# the person at the terminal answers it, not stdout's reader. 1.63 printed it to stdout: a dead one raised BrokenPipeError,
+	# and `prog > log` hid the question and filled the log with its frames
+	program = tmp_path / 'prog.py'
+	program.write_text(
+		'import os, sys, multiCMD\n'
+		'print("Go on?")\n'
+		'got = multiCMD.input_with_timeout_and_countdown(1, "Answer")\n'
+		'sys.stderr.write("GOT %r\\n" % (got,))\n'
+		'sys.stderr.flush()\n'
+		'os._exit(0)\n')
+	read_end, write_end = os.pipe()
+	if reader == 'quit':
+		os.close(read_end)
+	# stdin: a pipe that stays open with nothing in it ( nobody answers )
+	proc = subprocess.Popen([sys.executable, str(program)], stdin=subprocess.PIPE, stdout=write_end, stderr=subprocess.PIPE,
+		env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)))
+	os.close(write_end)
+	try:
+		err = proc.stderr.read().decode()
+		proc.wait(20)
+	finally:
+		proc.stdin.close()
+		if proc.poll() is None:
+			proc.kill()
+			proc.wait()
+	assert 'GOT None\n' in err
+	assert 'Answer [1s]: ' in err
+	if reader == 'stays':
+		with os.fdopen(read_end) as out:
+			assert out.read() == 'Go on?\n'

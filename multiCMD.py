@@ -493,8 +493,9 @@ class _Display:
 				encoding = getattr(stdout, 'encoding', None) or 'ascii'
 				stdout.write(text.encode(encoding, 'backslashreplace').decode(encoding))
 			stdout.flush()
-		except OSError as e:
-			if _no_reader(e):
+		except (OSError, ValueError) as e:
+			# ( ValueError: a sys.stdout the program closed, which loses the output as any other failed write )
+			if isinstance(e, OSError) and _no_reader(e):
 				self.closed = True
 			else:
 				self.lose(e)
@@ -2338,7 +2339,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		else:
 			return task.stdout
 
-def _write_error(text):
+def _write_error(text, end='\n'):
 	'''
 	Write a failure message or a warning to stderr ( internal ): one that cannot be written ( stderr closed, a broken pipe, a
 	full disk ) is dropped, as the failure it is about is already recorded on the task and a dead stderr changes no exit status
@@ -2347,7 +2348,7 @@ def _write_error(text):
 	if sys.stderr is None:
 		return
 	try:
-		print(text, file=sys.stderr, flush=True)
+		print(text, file=sys.stderr, end=end, flush=True)
 	except Exception:
 		pass
 
@@ -2969,8 +2970,8 @@ def _point_at_devnull(stream):
 			os.dup2(devnull, stream.fileno())
 		finally:
 			os.close(devnull)
-	except OSError:
-		# ( no descriptor to point elsewhere: the writes are dropped all the same )
+	except (OSError, ValueError):
+		# ( no descriptor to point elsewhere, or a closed file: the writes are dropped all the same )
 		pass
 
 def _end_by_closed_stdout():
@@ -3236,7 +3237,8 @@ def _run_cli():
 #%% misc functions
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""
-	Read an input from the user with a timeout and a countdown.
+	Read an input from the user with a timeout and a countdown. The prompt and its countdown go to stderr, after what is
+	waiting in stdout's buffer ( the caller's question ); one that cannot be written is dropped, and the timeout still applies.
 
 	@params:
 		timeout: The timeout in seconds
@@ -3246,8 +3248,10 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		str: The input from the user or None if no input was received
 
 	"""
-	# Print the initial prompt with the countdown
-	print(f"{prompt} [{timeout}s]: ", end='', flush=True)
+	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
+	# stdout's reader: they go to stderr, as read -p's and rm -i's do, and one that cannot be written is dropped
+	_display.flush()
+	_write_error(f"{prompt} [{timeout}s]: ", end='')
 	# select() cannot watch stdin on Windows; msvcrt can tell whether a key is waiting
 	try:
 		import msvcrt
@@ -3262,7 +3266,7 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
 			return input().strip()
 		# Print the remaining time
-		print(f"\r{prompt} [{remaining}s]: ", end='', flush=True)
+		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second
 		time.sleep(1)
 	# If there is no input, return None
@@ -3598,11 +3602,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			if not match:
 				if to_str:
 					return size
-				print(
-					"Invalid size format. Expected format: 'number [unit]', "
-					"e.g., '1.5 GiB' or '1.5GiB'"
-				)
-				print(f"Got: {size}")
+				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
 				return 0
 			number, _, unit = match.groups()
 			number = float(number)

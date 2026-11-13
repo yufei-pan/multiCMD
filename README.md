@@ -464,13 +464,13 @@ test_a_shown_command_that_prints_nothing_runs_whoever_met_the_reader_quitting_fi
 test_commands_nobody_waits_for_are_stopped_and_their_tasks_say_so, test_a_quiet_call_never_looks_at_stdout ).
 mcmd, other failed write: test_cli_failed_stdout.py ( test_a_terminal_that_hung_up_loses_the_output_and_every_command_runs, test_a_full_disk_under_stdout_loses_the_output_and_every_command_runs ).
 Library, other failed write: test_reader_quit.py ( test_any_other_failed_write_still_loses_only_the_output ), test_cli_failed_stdout.py ( test_the_library_runs_every_command_when_stdout_fails,
-test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit ).
+test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit, test_a_sys_stdout_the_program_closed_loses_the_output_and_every_command_runs ).
 Closed at start: test_cli_failed_stdout.py ( test_a_stdout_closed_at_start_drops_the_output_and_every_command_runs, test_the_library_runs_every_command_with_stdout_closed_at_start ). -->
 
 | What happened to stdout | `mcmd` | A program that imports multiCMD |
 |---|---|---|
 | Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command that goes on printing is stopped; its call skips what it has not started and, if it waits, raises `BrokenPipeError`. A command that prints nothing more, or only its last lines, runs to its end. A quiet call never looks at stdout |
-| Any other failed write (a terminal that hung up, a full disk) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised. The program's own writes, and Python's flush at exit (status 120), still meet the error: a library does not redirect its caller's stdout |
+| Any other failed write (a terminal that hung up, a full disk; in a program, a `sys.stdout` it closed) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised. The program's own writes, and Python's flush at exit (status 120), still meet the error: a library does not redirect its caller's stdout |
 | Closed at start (`>&-`) | The output is dropped silently; every command runs | The same (`sys.stdout` is `None`) |
 
 On Linux and macOS, with stdout on a pipe, `mcmd` asks the pipe as it waits, so a command that prints nothing more is
@@ -509,8 +509,8 @@ class AsyncExecutor: # run_command(s), wait, join, stop, cleanup, get_results, g
 
 The module also bundles a few terminal/formatting helpers used internally and
 reusable on their own: `pretty_format_table`, `parseTable`, `print_progress_bar`,
-`format_bytes`, `get_terminal_size`, `input_with_timeout_and_countdown`, and
-`slugify`.
+`format_bytes`, `get_terminal_size`, `input_with_timeout_and_countdown` (its prompt and countdown go to
+stderr), and `slugify`.
 
 ## Platform support
 
