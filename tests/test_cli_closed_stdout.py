@@ -344,6 +344,7 @@ def test_a_closed_stdout_ends_the_wait_for_the_commands(tmp_path, kwargs, count)
 	commands = [f'sh -c {shlex.quote(f"echo $$ > {tmp_path}/pid{i}; exec sleep 12")}' for i in range(1, count + 1)]
 	closer = CloseOnceStarted(tmp_path, count)
 	try:
+		multiCMD._display.cli = True
 		multiCMD._display.watch = Watched()
 		with pytest.raises(BrokenPipeError):
 			multiCMD.run_commands(commands, quiet=True, **kwargs)
@@ -358,6 +359,7 @@ def test_a_closed_stdout_ends_the_wait_for_output_that_a_command_left_open(tmp_p
 	# the command has exited; what it started holds its output open, and the run reads it to its end
 	closer = CloseOnceStarted(tmp_path, 1)
 	try:
+		multiCMD._display.cli = True
 		multiCMD._display.watch = Watched()
 		with pytest.raises(BrokenPipeError):
 			multiCMD.run_command('sh -c ' + shlex.quote(f'sleep 12 & echo $! > {tmp_path}/pid1'), quiet=True)
@@ -373,6 +375,7 @@ def test_the_stop_that_a_closed_stdout_starts_is_not_cut_short(tmp_path):
 	script = f'trap "" INT TERM; echo $$ > {tmp_path}/pid1; i=0; while [ $i -lt 240 ]; do sleep 0.05; i=$((i+1)); done'
 	closer = CloseOnceStarted(tmp_path, 1)
 	try:
+		multiCMD._display.cli = True
 		multiCMD._display.watch = Watched()
 		with pytest.raises(BrokenPipeError):
 			multiCMD.run_command('sh -c ' + shlex.quote(script), quiet=True)
@@ -410,6 +413,7 @@ def test_no_command_is_started_after_stdout_was_found_closed(monkeypatch, kwargs
 	# ( the commands in flight when it was found go on to their stop; the others never begin )
 	begun = count_executions_closing_after_each(monkeypatch)
 	commands = ['sleep 0.3'] * 6
+	multiCMD._display.cli = True
 	multiCMD._display.watch = Watched()
 	with pytest.raises(BrokenPipeError):
 		multiCMD.run_commands(commands, quiet=True, **kwargs)
@@ -648,6 +652,7 @@ def test_a_stdout_descriptor_that_is_not_open_is_not_taken_for_a_reader_that_qui
 	watch.register(write_end, select.POLLERR | select.POLLHUP)
 	os.close(read_end)
 	os.close(write_end)
+	multiCMD._display.cli = True
 	multiCMD._display.watch = watch
 	assert not multiCMD._reader_quit()
 	assert not multiCMD._display.closed
@@ -711,7 +716,7 @@ def einval_stdout(request, tmp_path, monkeypatch):
 def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_a_windows_pipe_only(monkeypatch, capfd, einval_stdout, posix):
 	kind, install = einval_stdout
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', posix)
-	multiCMD._display.name = 'mcmd'
+	multiCMD._display.cli = True
 	install()
 	if not posix and kind == 'pipe':
 		# the write raises nothing, in whatever thread: it leaves the flag, which every wait and every start asks
@@ -735,10 +740,10 @@ def test_windows_einval_from_a_pipe_reaches_the_library_caller_as_broken_pipe_er
 	command = [sys.executable, '-c', 'import sys; sys.exit(3)']
 	if kind == 'pipe':
 		with pytest.raises(BrokenPipeError) as raised:
-			multiCMD.run_command(command)
+			multiCMD.run_command([sys.executable, '-u', '-c', 'import time; print("a line"); time.sleep(1.5); print("another"); time.sleep(30)'])
 		assert raised.value.errno == errno.EPIPE
 		assert multiCMD._display.closed and not multiCMD._display.lost
-		# the commands that run unseen after it raise nothing
+		# a command that prints nothing runs once the reader was found gone, and nothing is raised
 		assert multiCMD.run_command(command, return_code_only=True) == 3
 		assert capfd.readouterr().err == ''
 	else:
@@ -778,3 +783,27 @@ def test_main_on_windows_ends_the_process_for_einval_from_a_stdout_pipe_only(mon
 		# ( what _run_cli raises is not a display write: an error other than a reader quitting is raised as before )
 		with pytest.raises(OSError):
 			multiCMD.main()
+
+
+def test_main_called_in_a_program_leaves_no_watch_behind(monkeypatch):
+	# 1.63 left the watch and the name set: a later quiet call of the program asked the pipe
+	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	monkeypatch.setattr(multiCMD, '_watch_stdout', Watched)
+	# ( main() installs the CLI's signal handlers, which would stay in the test process )
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', lambda: None)
+	monkeypatch.setattr(sys, 'argv', ['mcmd', '-n', 'true'])
+	assert multiCMD.main() == 0
+	assert multiCMD._display.watch is None and not multiCMD._display.cli
+
+
+def test_main_called_in_a_program_that_closed_sys_stderr_returns_and_leaves_no_watch_behind(tmp_path, monkeypatch):
+	# _flush_stderr let the ValueError of a closed sys.stderr out of main(), which then left the CLI's state set
+	closed = open(tmp_path / 'err', 'w')
+	closed.close()
+	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	monkeypatch.setattr(multiCMD, '_watch_stdout', Watched)
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', lambda: None)
+	monkeypatch.setattr(sys, 'argv', ['mcmd', '-n', 'true'])
+	monkeypatch.setattr(sys, 'stderr', closed)
+	assert multiCMD.main() == 0
+	assert multiCMD._display.watch is None and not multiCMD._display.cli

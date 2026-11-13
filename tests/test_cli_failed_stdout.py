@@ -7,6 +7,7 @@ started, exit status 120.
 '''
 import errno
 import os
+import re
 import select
 import shlex
 import signal
@@ -209,6 +210,11 @@ def test_a_full_disk_under_stdout_and_stderr_ends_0_for_help_and_version(args):
 @pytest.mark.parametrize('args, status', [
 	pytest.param(['no-such-command-xyz'], 127, id='not-found'),
 	pytest.param(['-f', os.devnull], 2, id='no-commands'),
+	# the three usage errors: one parse_args() finds, two found after it ( 1.63 ended 1 on Python 3.9 and 3.10: argparse let
+	# the OSError of its usage write through )
+	pytest.param(['--bogus'], 2, id='usage-unknown-option'),
+	pytest.param([], 2, id='usage-no-command'),
+	pytest.param(['-e', '=x', 'true'], 2, id='usage-bad-env'),
 ])
 def test_a_stderr_that_cannot_be_written_changes_no_exit_status(dead, args, status):
 	# the message that cannot be written is dropped ( 1.62 and 1.63's first build: 120, from Python's flush at exit; or a traceback and 1 for
@@ -483,3 +489,150 @@ def test_the_bar_and_the_failure_report_lose_the_output_when_stdout_fails(tmp_pa
 		os.close(fd)
 	err = capfd.readouterr().err
 	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1
+
+
+@pytest.mark.parametrize('args, error', [
+	(['--bogus'], 'unrecognized arguments: --bogus'),
+	([], 'no commands given'),
+	(['-e', '=x', 'true'], "-e/--env: invalid assignment '=x'"),
+], ids=['unknown-option', 'no-command', 'bad-env'])
+def test_a_usage_error_goes_through_the_stderr_door_and_ends_2(monkeypatch, args, error):
+	# argparse wrote it to sys.stderr itself, and before Python 3.11 let a failed write end the run 1
+	said = []
+	monkeypatch.setattr(multiCMD, '_write_error', said.append)
+	monkeypatch.setattr(sys, 'argv', ['mcmd'] + args)
+	with pytest.raises(SystemExit) as ended:
+		multiCMD._run_cli()
+	assert ended.value.code == 2
+	assert len(said) == 1
+	# ( Python 3.14 colours the usage under FORCE_COLOR or PYTHON_COLORS=1 )
+	text = re.sub(r'\x1b\[[0-9;]*m', '', said[0])
+	assert text.startswith('usage: mcmd ')
+	assert text.endswith('\nmcmd: error: ' + error)
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'max_threads': 2}], ids=['serial', 'pool'])
+def test_the_library_runs_every_command_with_stdout_closed_at_start(monkeypatch, capfd, kwargs):
+	# `prog >&-`: sys.stdout is None; the output is dropped silently
+	with monkeypatch.context() as patch:
+		patch.setattr(sys, 'stdout', None)
+		codes = multiCMD.run_commands([[sys.executable, '-c', 'print(%d)' % i] for i in range(3)], return_code_only=True, **kwargs)
+	assert codes == [0, 0, 0]
+	assert capfd.readouterr().err == ''
+
+
+@has_dev_full
+def test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit(tmp_path):
+	# a library does not redirect its caller's stdout: what the failed write left in Python's buffer fails again at exit
+	program = tmp_path / 'prog.py'
+	program.write_text('import sys, multiCMD\nsys.stderr.write("CODES %s\\n" % multiCMD.run_commands([["true"]], return_code_only=True))\n')
+	with open('/dev/full', 'w') as full:
+		done = subprocess.run([sys.executable, str(program)], stdout=full, stderr=subprocess.PIPE,
+			env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)), timeout=20)
+	err = done.stderr.decode()
+	assert 'CODES [0]' in err and err.count('multiCMD: cannot write to stdout') == 1
+	assert done.returncode == 120
+
+
+# --- 1.64: no write of its own bypasses the two doors. Every write of multiCMD's own goes through the display's door ( stdout )
+# or _write_error ( stderr )
+
+def test_no_write_of_its_own_bypasses_the_two_doors():
+	# 1.63 had four bare prints: format_bytes()'s two lines and the countdown prompt's two frames; 1.62 had 23, and
+	# sys.stdout.write calls
+	import ast
+	tree = ast.parse(MULTICMD_PY.read_text(encoding='utf-8'))
+	bare = []
+	def visit(node, function):
+		if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+			function = node.name
+		if function != '_write_error':
+			# print in any use: a call, or passed on as a value ( partial(print, ... ) )
+			if isinstance(node, ast.Name) and node.id == 'print':
+				bare.append((node.lineno, function, 'print'))
+			# a write of its own to sys.stdout or sys.stderr ( the display writes through a local, in _Display._write )
+			if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ('write', 'writelines') \
+				and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in ('stdout', 'stderr', '__stdout__', '__stderr__') \
+				and isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == 'sys':
+				bare.append((node.lineno, function, 'sys.%s.write' % node.func.value.attr))
+		for child in ast.iter_child_nodes(node):
+			visit(child, function)
+	visit(tree, None)
+	assert bare == []
+
+
+@pytest.mark.parametrize('kwargs, codes', [({}, [0]), ({'max_threads': 2}, [0, 0, 0, 0])], ids=['serial', 'pool'])
+def test_a_sys_stdout_the_program_closed_loses_the_output_and_every_command_runs(tmp_path, monkeypatch, capfd, kwargs, codes):
+	# 1.63 raised ValueError from a serial call without running its command, and a pool recorded -1 with a traceback
+	closed = open(tmp_path / 'out', 'w')
+	closed.close()
+	commands = [['touch', str(tmp_path / ('ran%d' % i))] for i in range(len(codes))]
+	with monkeypatch.context() as patch:
+		patch.setattr(sys, 'stdout', closed)
+		got = multiCMD.run_commands(commands, return_code_only=True, **kwargs)
+		for i in range(1, 11):
+			multiCMD.print_progress_bar(i, 10)
+	assert got == codes
+	assert all((tmp_path / ('ran%d' % i)).exists() for i in range(len(codes)))
+	err = capfd.readouterr().err
+	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1
+
+
+def test_format_bytes_says_what_it_cannot_read_on_stderr(capsys):
+	# 1.63 printed it to stdout, mixed into the data
+	assert multiCMD.format_bytes('one gig', to_int=True) == 0
+	out, err = capsys.readouterr()
+	assert out == ''
+	assert "Invalid size format" in err and 'Got: one gig' in err
+
+
+@posix_only
+def test_format_bytes_message_does_not_end_a_program_whose_reader_quit_with_120(tmp_path):
+	# `prog | true`: 1.63's bare print waited in Python's buffer, and its flush at exit failed ( "Exception ignored", 120 )
+	program = tmp_path / 'prog.py'
+	program.write_text('import multiCMD\nmultiCMD.format_bytes("one gig", to_int=True)\n')
+	read_end, write_end = os.pipe()
+	os.close(read_end)
+	try:
+		done = subprocess.run([sys.executable, str(program)], stdout=write_end, stderr=subprocess.PIPE,
+			env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)), timeout=20)
+	finally:
+		os.close(write_end)
+	assert done.returncode == 0
+	assert b'Got: one gig' in done.stderr
+
+
+@posix_only
+@pytest.mark.parametrize('reader', ['quit', 'stays'])
+def test_the_countdown_prompt_is_on_stderr_and_a_dead_stdout_raises_nothing(tmp_path, reader):
+	# the person at the terminal answers it, not stdout's reader. 1.63 printed it to stdout: a dead one raised BrokenPipeError,
+	# and `prog > log` hid the question and filled the log with its frames
+	program = tmp_path / 'prog.py'
+	program.write_text(
+		'import os, sys, multiCMD\n'
+		'print("Go on?")\n'
+		'got = multiCMD.input_with_timeout_and_countdown(1, "Answer")\n'
+		'sys.stderr.write("GOT %r\\n" % (got,))\n'
+		'sys.stderr.flush()\n'
+		'os._exit(0)\n')
+	read_end, write_end = os.pipe()
+	if reader == 'quit':
+		os.close(read_end)
+	# stdin: a pipe that stays open with nothing in it ( nobody answers )
+	proc = subprocess.Popen([sys.executable, str(program)], stdin=subprocess.PIPE, stdout=write_end, stderr=subprocess.PIPE,
+		env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)))
+	os.close(write_end)
+	try:
+		# ( its stderr is a few dozen bytes: it fits the pipe, and is read once the program has ended; a hang ends at the kill )
+		proc.wait(20)
+		err = proc.stderr.read().decode()
+	finally:
+		proc.stdin.close()
+		if proc.poll() is None:
+			proc.kill()
+			proc.wait()
+	assert 'GOT None\n' in err
+	assert 'Answer [1s]: ' in err
+	if reader == 'stays':
+		with os.fdopen(read_end) as out:
+			assert out.read() == 'Go on?\n'

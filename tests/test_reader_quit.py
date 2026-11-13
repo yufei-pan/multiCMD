@@ -1,8 +1,9 @@
 '''
 A program that imports multiCMD and shows its commands ( not quiet ), when the reader of its stdout quits ( `prog | head` ):
-the calls that show commands stop them, skip the queued ones and raise BrokenPipeError, as mcmd stops its run. A call made
-after that runs its commands without showing them; a quiet call never looks. 1.63's first builds lost the output and ran
-on: a command that never ends ( `tail -f` ) kept the program running for ever.
+a shown command whose output keeps coming stops its call, which skips its queued commands and raises BrokenPipeError, whenever
+the call began; a command that prints nothing more, or only its last words ( output within 1 s ), runs to its end;
+a quiet call never looks.
+1.63's first builds lost the output and ran on: a command that never ends ( `tail -f` ) kept the program running for ever.
 '''
 import errno
 import os
@@ -15,6 +16,7 @@ import time
 
 import pytest
 
+import multiCMD
 from conftest import PACKAGE_ROOT
 
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX only')
@@ -272,3 +274,341 @@ def test_any_other_failed_write_still_loses_only_the_output(tmp_path):
 	err = done.stderr.decode()
 	assert 'CODES [0, 0]' in err and err.count('multiCMD: cannot write to stdout') == 1
 	assert (tmp_path / 'a').exists() and (tmp_path / 'b').exists()
+
+
+# --- 1.64: one rule. A shown command is stopped when its output keeps coming after the reader quit, whenever its call began
+
+@posix_only
+def test_shown_calls_fanned_out_over_the_programs_threads_all_end(tmp_path):
+	# 1.63: a call that began once multiCMD had found the reader gone ran unseen to its end: 5 of 8 followers ran for ever
+	status, err, took = run_program(tmp_path, """
+		import concurrent.futures
+		def one(_):
+			try:
+				multiCMD.run_command(FOLLOW)
+				return 'returned'
+			except BrokenPipeError:
+				return 'raised'
+		pool = concurrent.futures.ThreadPoolExecutor(4)
+		futures = [pool.submit(one, i) for i in range(8)]
+		done, pending = concurrent.futures.wait(futures, timeout=8)
+		sys.stderr.write('DONE %s PENDING %d\\n' % (sorted(future.result() for future in done), len(pending)))
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""", timeout=15)
+	assert "DONE %s PENDING 0\n" % (['raised'] * 8) in err
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_shown_command_that_starts_after_the_reader_quit_is_stopped_once_its_output_keeps_coming(tmp_path):
+	# a loop that catches the error per item: 1.63 ran the second follower unseen, for ever. The queued command of each call
+	# is skipped, as the first call's is
+	status, err, took = run_program(tmp_path, f"""
+		os.chdir({str(tmp_path)!r})
+		for attempt in (1, 2):
+			try:
+				multiCMD.run_commands([FOLLOW, ['touch', 'queued-%d' % attempt]])
+			except BrokenPipeError:
+				sys.stderr.write('RAISED %d\\n' % attempt)
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		""")
+	assert 'RAISED 1\n' in err and 'RAISED 2\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+	assert len((tmp_path / 'pids').read_text().split()) == 2
+	assert not list(tmp_path.glob('queued-*'))
+
+
+@posix_only
+@pytest.mark.parametrize('first', ['the call itself', "the program's own write"])
+def test_a_shown_command_that_prints_nothing_runs_whoever_met_the_reader_quitting_first(tmp_path, first):
+	# an unmount in a finally. 1.63 skipped it, and raised, when this call was the first of multiCMD's to meet the closed pipe
+	# ( its header failed ), also after the program's own write had failed
+	own = "print('own line')\ntry:\n\tsys.stdout.flush()\nexcept BrokenPipeError:\n\tsys.stderr.write('OWN WRITE FAILED\\\\n')" if first != 'the call itself' else ''
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		exec({own!r})
+		codes = multiCMD.run_commands([['touch', {str(tmp_path / 'cleaned')!r}], ['false']], return_code_only=True)
+		sys.stderr.write('CLEANUP %s\\n' % codes)
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'CLEANUP [0, 1]' in err
+	assert (tmp_path / 'cleaned').exists()
+	if first != 'the call itself':
+		assert 'OWN WRITE FAILED' in err
+
+
+@posix_only
+def test_a_call_made_after_the_reader_quit_still_says_on_stderr_what_it_could_not_run(tmp_path):
+	# 1.63 made such a call quiet, which dropped multiCMD's own stderr lines for it too
+	status, err, took = run_program(tmp_path, """
+		try:
+			multiCMD.run_commands([FOLLOW])
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		code = multiCMD.run_command(['no-such-command-xyz'], return_code_only=True)
+		sys.stderr.write('CODE %s\\n' % code)
+		""")
+	assert 'RAISED\n' in err and 'CODE 127\n' in err
+	assert 'Command path not found: no-such-command-xyz' in err
+
+
+@posix_only
+def test_the_last_words_of_a_command_that_then_ends_are_only_lost(tmp_path):
+	# `losetup --find --show`: it attaches a device and prints its name. 1.63 raised BrokenPipeError when that line found the
+	# reader gone, so the program never learned which device to detach
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		task = multiCMD.run_commands([['sh', '-c', 'touch {tmp_path}/attached; echo /dev/loop0']], return_object=True)[0]
+		sys.stderr.write('GOT %s %s\\n' % (task.returncode, task.stdout))
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert "GOT 0 ['/dev/loop0']" in err
+	assert (tmp_path / 'attached').exists()
+
+
+# the number the window is sized for ( multiCMD._LAST_WORDS ): at least 0.5 s, the longest a process starved of CPU waited
+# between two writes of its last words ( 18 processes sharing a quarter CPU ); at most 2 s, the longest the follower tests
+# above ( took < 5 ) allow for a stop. These two tests pin the window's edges: a second piece of output at half the window
+# after the first lost one is last words, and one at 1.5 times the window means the command goes on printing
+def second_piece_after(tmp_path, fraction, then):
+	window = multiCMD._LAST_WORDS
+	assert 0.5 <= window <= 2
+	gap = fraction * window
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			codes = multiCMD.run_commands([['sh', '-c', 'echo $$ >> {tmp_path}/pids; echo first; sleep {gap}; echo second; {then}'], ['touch', {str(tmp_path / 'queued-ran')!r}]], return_code_only=True)
+			sys.stderr.write('RETURNED %s\\n' % codes)
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	return err
+
+
+@posix_only
+def test_a_second_piece_of_output_at_half_the_window_is_still_last_words(tmp_path):
+	# the reader quit before the call, as under hpcp's cleanup: the first line is the first lost read
+	err = second_piece_after(tmp_path, 0.5, 'true')
+	assert 'RETURNED [0, 0]\n' in err
+	assert (tmp_path / 'queued-ran').exists()
+
+
+@posix_only
+def test_a_second_piece_of_output_at_one_and_a_half_times_the_window_stops_the_call(tmp_path):
+	# the command is still running ( sleep 30 ): the stop kills it
+	err = second_piece_after(tmp_path, 1.5, 'sleep 30')
+	assert 'RAISED\n' in err
+	assert not (tmp_path / 'queued-ran').exists()
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_later_batch_of_an_executor_runs_its_silent_command_and_stops_its_follower(tmp_path):
+	# the commands of one run_commands() share the stop, a batch of its own does not. 1.63 ran every batch after the reader
+	# quit unseen: the second follower ran for ever
+	status, err, took = run_program(tmp_path, f"""
+		executor = multiCMD.AsyncExecutor(max_threads=1, quiet=False)
+		executor.run_commands([FOLLOW])
+		executor.wait(10)
+		tasks = executor.run_commands([['touch', {str(tmp_path / 'silent-ran')!r}], FOLLOW])
+		left = executor.wait(5)
+		sys.stderr.write('LEFT %d CODES %s\\n' % (len(left), [task.returncode for task in tasks]))
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()  # ( Python 3.6 - 3.8 block-buffer a redirected stderr )
+		os._exit(0)
+		""")
+	assert 'LEFT 0' in err
+	assert re.search(r'CODES \[0, -\d+\]', err)
+	assert (tmp_path / 'silent-ran').exists()
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+	assert len((tmp_path / 'pids').read_text().split()) == 2
+
+
+@posix_only
+def test_a_pool_whose_one_command_prints_again_stops_its_silent_one_too(tmp_path):
+	# a call stops as one: its silent command is stopped with the one that printed. The follower prints only once the silent
+	# one has said it runs ( on a loaded runner the pool could start the follower first, and the stop find no silent pid to see )
+	silent = f"['sh', '-c', 'echo $$ >> {tmp_path}/pids; echo $$ > {tmp_path}/silent; exec sleep 30']"
+	follow = f"['sh', '-c', 'while [ ! -s {tmp_path}/silent ]; do sleep 0.01; done; echo $$ >> {tmp_path}/pids; while :; do echo tick; sleep 0.05; done']"
+	status, err, took = run_program(tmp_path, f"""
+		try:
+			multiCMD.run_commands([{silent}, {follow}], max_threads=2)
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		""")
+	assert 'RAISED\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+	assert len((tmp_path / 'pids').read_text().split()) == 2
+
+
+@posix_only
+@pytest.mark.parametrize('command', [
+	"['sh', '-c', 'echo /dev/loop0; echo warning >&2']",
+	"['printf', '/dev/loop0\\\\nno final newline']",
+	"['printf', 'step 1\\\\r/dev/loop0\\\\n']",
+	"['sh', '-c', 'printf \\\"umount: \\\" >&2; sleep 0.05; printf \\\"/mnt: target is busy.\\\\\\\\n\\\" >&2']",
+	"[sys.executable, '-c', 'import sys; sys.stdout.write(\"x\" * 99999 + \"\\\\n\")']",
+], ids=['stdout-and-stderr', 'no-final-newline', 'carriage-return', 'two-writes', 'one-write-over-64-kib'])
+def test_last_words_that_arrive_at_once_are_only_lost(tmp_path, command):
+	# `losetup --find --show` that also warns, or ends without a newline: its call returns its result. The first 1.64 build
+	# counted each line it showed, per command: one line on each stream, or an unfinished last line, made the call raise
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		got = []
+		for i in range(5):
+			try:
+				got.append(multiCMD.run_commands([{command}], return_code_only=True)[0])
+			except BrokenPipeError:
+				got.append('raised')
+		sys.stderr.write('GOT %s\\n' % got)
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'GOT [0, 0, 0, 0, 0]\n' in err
+
+
+@posix_only
+def test_output_without_line_ends_that_keeps_coming_stops_its_call(tmp_path):
+	# a progress of dots: the first 1.64 build counted shown lines, and a command that never ends a line ran for ever
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			multiCMD.run_commands([['sh', '-c', 'echo $$ >> {tmp_path}/pids; while :; do printf .; sleep 0.01; done']])
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_command_that_exits_and_leaves_a_follower_holding_its_output_stops_its_call(tmp_path):
+	# the drain: the command exits at once, what it started prints for ever on its output
+	status, err, took = run_program(tmp_path, f"""
+		try:
+			multiCMD.run_commands([['sh', '-c', '(echo $$ >> {tmp_path}/pids; while :; do echo tick; sleep 0.05; done) & exit 0']])
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_shown_dry_run_whose_reader_quit_raises(tmp_path):
+	# its lines are its output: it raises, whenever it began
+	status, err, took = run_program(tmp_path, """
+		try:
+			multiCMD.run_commands([['echo', str(i)] for i in range(20000)], dry_run=True)
+			sys.stderr.write('RETURNED\\n')
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
+
+
+@posix_only
+@pytest.mark.parametrize('kwargs', ['', ', max_threads=4'], ids=['serial', 'pool'])
+def test_a_call_of_commands_that_each_print_once_runs_them_all_and_returns(tmp_path, kwargs):
+	# `ssh host hostname` for 20 hosts under `prog | head`: the user's pick, 2026-11-13: the queued commands still start. A call
+	# stops only when a command's output keeps coming ( 1.62 and 1.63 raised at once, and ran none )
+	commands = ', '.join(f"['sh', '-c', 'echo host-{i}; touch {tmp_path}/ran-{i}']" for i in range(20))
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			codes = multiCMD.run_commands([{commands}], return_code_only=True{kwargs})
+		except BrokenPipeError:
+			codes = 'raised'
+		sys.stderr.write('CODES %s\\n' % (codes,))
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'CODES %s\n' % ([0] * 20) in err
+	assert len(list(tmp_path.glob('ran-*'))) == 20
+
+
+@posix_only
+def test_output_shown_before_the_quit_does_not_count_against_the_last_words(tmp_path):
+	# a command that printed while the reader read, and says its last words once another command found the reader gone: its
+	# call returns. The reader reads the four headers and a blank line, then quits; `other` finds it gone; `last` comes 1.5
+	# windows later, so a window counted from `before` ( any read, not the first after the quit ) would stop the call
+	status, err, took = run_program(tmp_path, f"""
+		try:
+			codes = multiCMD.run_commands([
+				['sh', '-c', 'echo before; while [ ! -e {tmp_path}/reader-closed ]; do sleep 0.01; done; sleep {1.5 * multiCMD._LAST_WORDS}; echo last'],
+				['sh', '-c', 'while [ ! -e {tmp_path}/reader-closed ]; do sleep 0.01; done; echo other'],
+			], max_threads=2, return_code_only=True)
+		except BrokenPipeError:
+			codes = 'raised'
+		sys.stderr.write('CODES %s\\n' % (codes,))
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'CODES [0, 0]\n' in err
+
+
+@posix_only
+def test_a_shown_dry_run_made_after_the_reader_quit_raises(tmp_path):
+	# whenever it began: 1.63 returned for a dry run made once multiCMD had found the reader gone
+	status, err, took = run_program(tmp_path, """
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		# its header finds the reader gone; it prints nothing, so it runs and returns
+		multiCMD.run_commands([['true']])
+		try:
+			multiCMD.run_commands([['echo', 'x']], dry_run=True)
+			sys.stderr.write('RETURNED\\n')
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
