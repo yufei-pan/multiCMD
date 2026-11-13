@@ -504,3 +504,26 @@ def test_a_usage_error_goes_through_the_stderr_door_and_ends_2(monkeypatch, args
 		multiCMD._run_cli()
 	assert ended.value.code == 2
 	assert len(said) == 1 and said[0].startswith('usage: mcmd ') and said[0].endswith('\nmcmd: error: ' + error)
+
+
+@pytest.mark.parametrize('kwargs', [{}, {'max_threads': 2}], ids=['serial', 'pool'])
+def test_the_library_runs_every_command_with_stdout_closed_at_start(monkeypatch, capfd, kwargs):
+	# `prog >&-`: sys.stdout is None; the output is dropped silently
+	with monkeypatch.context() as patch:
+		patch.setattr(sys, 'stdout', None)
+		codes = multiCMD.run_commands([[sys.executable, '-c', 'print(%d)' % i] for i in range(3)], return_code_only=True, **kwargs)
+	assert codes == [0, 0, 0]
+	assert capfd.readouterr().err == ''
+
+
+@has_dev_full
+def test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit(tmp_path):
+	# a library does not redirect its caller's stdout: what the failed write left in Python's buffer fails again at exit
+	program = tmp_path / 'prog.py'
+	program.write_text('import sys, multiCMD\nsys.stderr.write("CODES %s\\n" % multiCMD.run_commands([["true"]], return_code_only=True))\n')
+	with open('/dev/full', 'w') as full:
+		done = subprocess.run([sys.executable, str(program)], stdout=full, stderr=subprocess.PIPE,
+			env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)), timeout=20)
+	err = done.stderr.decode()
+	assert 'CODES [0]' in err and err.count('multiCMD: cannot write to stdout') == 1
+	assert done.returncode == 120

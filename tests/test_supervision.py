@@ -265,8 +265,8 @@ def test_a_command_that_exits_just_past_the_inactivity_timeout_keeps_its_exit_co
 	# it exits after the threshold but before _watch() looks again: its output ends a moment later
 	real_watch, real_read, real_join = multiCMD._watch, multiCMD._read_stream, multiCMD._join
 	go = threading.Event()
-	def watch(task, proc, timeout, quiet=False):
-		reason = real_watch(task, proc, 0, quiet)
+	def watch(task, proc, timeout):
+		reason = real_watch(task, proc, 0)
 		task._last_output -= timeout + 1
 		return reason
 	def held_read(stream, target, task, *args):

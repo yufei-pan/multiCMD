@@ -180,6 +180,11 @@ class Task:
 		self._pass_fds = ()
 		# whether the main thread asked for it once the exit hook had begun ( an atexit handler's call: see _cut_by_exit )
 		self._at_exit = False
+		# not empty once a shown command of its call printed again after its lines found stdout's reader gone: its waits and
+		# starts ask it as they ask stop, so the call stops as one ( _build_tasks gives the tasks of a call one list )
+		self._unread = []
+		# whether a batch of this command's lines found the reader gone already ( _read_stream )
+		self._unshown = False
 
 	def __iter__(self):
 		yield from (
@@ -446,17 +451,18 @@ class _Display:
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
 
-	A write that fails never raises, in the thread that wrote ( the CLI's and a program's that imports multiCMD alike ): it
-	classifies the failure here, once ( _no_reader ). A reader that quit sets closed, which every wait for a command and every
-	start asks ( _reader_quit ): the commands the calls that show them run ( under mcmd's watch, every call's ) are stopped, as a Ctrl-C stops them, and a waiting
-	run_commands raises BrokenPipeError. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses
-	the output ( lose ): every later write is dropped, one line on stderr says so, and the commands run on, as their readers
-	keep reading. Either way the failed write's bytes stay in sys.stdout's buffer, which Python's flush at exit finds again
-	( "Exception ignored" and exit status 120 ): the CLI ends by SIGPIPE ( closed ) or points the descriptor at os.devnull
-	( lost ) at its exit ( main ), a library does not redirect its caller's. A stdout that is None ( closed at start ) drops the output silently, as print() does.
+	When stdout fails ( the README's table ): a write that fails never raises, in the thread that wrote; it is classified here,
+	once ( _no_reader ). A reader that quit sets closed, and every later write is dropped. Under mcmd every wait and every start
+	then stops ( _reader_quit ). In a program that imports multiCMD a shown command whose lines find the reader gone a second
+	time stops its call, as SIGPIPE stops a command that writes to a closed pipe: its commands are stopped as a Ctrl-C stops
+	them, the queued ones skipped, and a waiting run_commands raises BrokenPipeError ( _read_stream, Task._unread ); its last
+	words are only lost. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses the output
+	( lose ): every later write is dropped, one line on stderr says so, and the commands run on. Either way the failed write's
+	bytes stay in sys.stdout's buffer, which Python's flush at exit finds again: mcmd ends by SIGPIPE or points the descriptor
+	at os.devnull ( main ), a library does not redirect its caller's. A stdout that is None drops the output silently.
 	@attributes:
-		name: Who says the output was lost on stderr ( 'mcmd' for the CLI, set by main() )
-		closed: Whether stdout's reader quit, as a write or the watch found it; writes dropped, and see _reader_quit
+		cli: Whether this is mcmd's run ( set by main() for its run ): its rule is _reader_quit's, and it names itself on stderr
+		closed: Whether stdout's reader quit, as a write or the watch found it; writes dropped
 		lost: Whether a write failed for another reason; writes dropped
 		watch: A select.poll() with stdout's descriptor in it, that the main thread's waits ask whether the reader quit
 			( see _reader_quit; the CLI's, from _watch_stdout ). None: only a write finds out
@@ -465,7 +471,7 @@ class _Display:
 		self.lock = threading.Lock()
 		self.redrawable = False
 		self.at_line_start = True
-		self.name = 'multiCMD'
+		self.cli = False
 		self.closed = False
 		self.lost = False
 		self.watch = None
@@ -495,13 +501,13 @@ class _Display:
 
 	def lose(self, error):
 		'''
-		Drop every later write, and say once on stderr that error lost the output, as self.name ( internal )
+		Drop every later write, and say once on stderr that error lost the output ( internal )
 		'''
 		if self.lost:
 			# another thread met the failure first ( a bar frame racing a live line ) and said so
 			return
 		self.lost = True
-		_write_error(f'{self.name}: cannot write to stdout ({error}): its output is dropped from here on')
+		_write_error(f'{"mcmd" if self.cli else "multiCMD"}: cannot write to stdout ({error}): its output is dropped from here on')
 
 	def flush(self):
 		'''
@@ -597,33 +603,24 @@ def _watch_stdout():
 	watch.register(sys.stdout.fileno(), _READER_QUIT)
 	return watch
 
-def _reader_quit(quiet=False):
+def _reader_quit():
 	'''
-	Whether stdout's reader quit, for a call that shows its commands ( not quiet ), or for any call once stdout is watched
-	( mcmd: its whole run ends with its reader ) ( internal )
-	Every wait for a command asks it as it asks task.stop, in whatever thread waits ( _watch, _drain, the pool's join loop ),
-	and so does every start ( __run_command ): a flag, so nothing is raised through a wait, which a signal handler's raise
-	would be, landing wherever the main thread is, in a __del__ among them, where Python drops it and the stop is lost.
-	Only the main thread asks the watch ( a poll object is one thread's ); the others see what it found, or a write did.
-	A call made after multiCMD has found the reader gone is made quiet by run_commands and AsyncExecutor.run_commands, so without a watch it
-	asks nothing; under a watch ( mcmd ) a quiet call asks too, and answers for the reader whatever quiet says.
+	Whether mcmd's reader quit ( internal ): its whole run ends with its reader, so every wait and every start asks, quiet or
+	not. A write found it ( _Display.closed ) or, with stdout on a pipe, the poll the main thread asks here ( a poll object is
+	one thread's ). A flag, not a raise: a raise through a wait can land in a __del__, where Python drops it. Always False in
+	a program that imports multiCMD ( see _Display ).
 	'''
-	if _display.watch is None:
-		return _display.closed and not quiet
-	if not _display.closed and _thread.get_ident() == threading.main_thread().ident:
+	if not _display.cli:
+		return False
+	if not _display.closed and _display.watch is not None and _thread.get_ident() == threading.main_thread().ident:
 		for _, events in _display.watch.poll(0):
 			if events & _READER_QUIT:
 				_display.closed = True
 	return _display.closed
 
-def _raise_if_reader_quit(quiet=False):
-	'''
-	Raise BrokenPipeError at the end of a waiting run_commands once the reader of its output quit: a failed write, in whichever
-	form the platform gave it ( EPIPE, ECONNRESET, Windows' EINVAL ), or under mcmd the pipe poll. The commands were stopped or skipped, or had already finished
-	( or, for a dry run, were only shown ) ( internal )
-	'''
-	if _reader_quit(quiet):
-		raise BrokenPipeError(errno.EPIPE, 'the reader of stdout quit')
+def _stops(task):
+	'''Whether task's command is to stop, or not start: asked for ( stop ), its call stops ( _unread ), or mcmd's reader quit ( internal )'''
+	return task.stop or task._unread or _reader_quit()
 
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
@@ -830,8 +827,6 @@ class AsyncExecutor:
 			extra_env = self.extra_env
 		if pass_fds is ...:
 			pass_fds = self.pass_fds
-		# stdout's reader quit before this call: it has nobody to show its commands to, and runs them as a quiet call does
-		quiet = quiet or _display.closed
 		taskObjects, use_sudo = _build_tasks(commands, parse=parse, shell=shell, env=env, extra_env=extra_env, pass_fds=pass_fds)
 		if not sem:
 			sem = threading.Semaphore(max_threads if max_threads >= 1 else max(len(taskObjects), 1))
@@ -1123,6 +1118,11 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 		target.extend(texts)
 		if not quiet:
 			_display.lines(texts, decor, replace_first, ends_with_cr)
+			if _display.closed:
+				# nobody reads what it says: its last words are only lost, and one that goes on printing stops its call
+				if task._unshown and not task._unread:
+					task._unread.append(True)
+				task._unshown = True
 	def settle():
 		# a '\n' right after '\r' ( a CRLF ending ): the redrawn line is complete, nothing may overwrite it now
 		if not quiet and not task._finalized:
@@ -1840,7 +1840,7 @@ def _open_pty(reserved=0):
 		pass
 	return master, slave
 
-def _watch(task, proc, timeout, quiet=False):
+def _watch(task, proc, timeout):
 	'''
 	Wait for a command to exit ( internal )
 	@params:
@@ -1848,11 +1848,11 @@ def _watch(task, proc, timeout, quiet=False):
 		proc: The command's process
 		timeout: Inactivity timeout in seconds ( 0: none )
 	@returns:
-		None | str: None when it exited, 'stop' when task.stop was set or the reader quit ( _reader_quit ), 'timeout' after timeout seconds without output
+		None | str: None when it exited, 'stop' when it is to stop ( _stops ), 'timeout' after timeout seconds without output
 	'''
 	sleep_time = 1.0e-7 # 100 nanoseconds
 	while proc.poll() is None:  # while the process is still running
-		if task.stop or _reader_quit(quiet):
+		if _stops(task):
 			return 'stop'
 		if timeout > 0 and time.monotonic() - task._last_output > timeout:
 			return 'timeout'
@@ -1884,7 +1884,7 @@ def _join(thread, timeout=None):
 		if step <= 0:
 			return False
 
-def _drain(task, readers, timeout, quiet=False):
+def _drain(task, readers, timeout):
 	'''
 	Read a command's output to its end after its own process exited ( internal )
 	@params:
@@ -1892,10 +1892,10 @@ def _drain(task, readers, timeout, quiet=False):
 		readers: The reader threads
 		timeout: Inactivity timeout in seconds ( 0: none )
 	@returns:
-		None | str: None once all output ended, 'stop' when task.stop was set or the reader quit ( _reader_quit ), 'timeout' after timeout seconds without output
+		None | str: None once all output ended, 'stop' when it is to stop ( _stops ), 'timeout' after timeout seconds without output
 	'''
 	while _any_alive(readers):
-		if task.stop or _reader_quit(quiet):
+		if _stops(task):
 			return 'stop'
 		for reader in readers:
 			_join(reader, 0.05)
@@ -2178,7 +2178,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 		for reader in readers:
 			reader.start()
 		waiting = True
-		reason = _watch(task, proc, timeout, quiet)
+		reason = _watch(task, proc, timeout)
 	except BaseException as e:
 		# registered first, with no call before the store ( from Python 3.11 Python raises a second Ctrl-C only as a call
 		# begins or returns, or on a loop's way back; 3.6 - 3.10 can raise one before it, see docs/limitations.md )
@@ -2229,7 +2229,7 @@ def _execute(task, timeout, quiet, decor, use_pty=False):
 			# the command exited, but something it started may still hold its output open: keep reading,
 			# while a stop, the inactivity timeout, Ctrl-C or kill_all() can still end it
 			try:
-				reason = _drain(task, readers, timeout, quiet)
+				reason = _drain(task, readers, timeout)
 			except BaseException as e:
 				# _drain only waits ( joins, no I/O of its own ): whatever is raised into it is an interrupt, a SIGTERM
 				# handler's SystemExit or another signal handler's exception, and the background group is stopped before
@@ -2289,9 +2289,9 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 		list[str]: The output of the command
 	'''
 	with sem:
-		if task.stop or _reader_quit(quiet):
-			# stopped before it started, or the reader of what this call shows quit ( see _reader_quit ): it stays unfinished
-			# ( return code None, task.stop as it was: that is the caller's request ), like a skipped queued command
+		if _stops(task):
+			# stopped before it started, or its call stops ( see _stops ): it stays unfinished ( return code None, task.stop
+			# as it was: that is the caller's request ), like a skipped queued command
 			task._env = task._extra_env = None
 			return task.stdout + task.stderr if with_stdErr else task.stdout
 		try:
@@ -2307,9 +2307,10 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if not quiet:
 				_display.message('Running command: ' + _quote_command(task.command), decor)
 				_display.message('-' * 100, decor)
-			if _reader_quit(quiet):
-				# one of those writes found the reader gone ( it raises nothing, in any thread ): skipped as at the top,
-				# unfinished ( the finally below marks it finalized, which nothing reads for a task skipped so )
+			if _reader_quit():
+				# mcmd: one of those writes found the reader gone ( it raises nothing, in any thread ): skipped as at the top,
+				# unfinished ( the finally below marks it finalized, which nothing reads for a task skipped so ). In a program
+				# that imports multiCMD a header that fails stops nothing: the command runs, and stops if it prints again
 				return task.stdout + task.stderr if with_stdErr else task.stdout
 			_execute(task, timeout, quiet, decor, use_pty)
 		except Exception as e:
@@ -2516,11 +2517,14 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 	tasks = [Task(command) for command in formatedCommands]
 	# a call the main thread makes once the exit hook has begun ( from an atexit handler: see _cut_by_exit )
 	at_exit = _exiting and threading.current_thread() is threading.main_thread()
+	# the call stops as one once a shown command of it printed again into a stdout nobody reads ( see _Display )
+	unread = []
 	for task in tasks:
 		task._env = env
 		task._extra_env = extra_env
 		task._pass_fds = pass_fds
 		task._at_exit = at_exit
+		task._unread = unread
 	return tasks, bool(use_sudo)
 
 def _validate_sudo():
@@ -2635,8 +2639,8 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 	output readers each ) exist at any time, however many tasks there are. A worker that cannot start leaves its
 	share to the others ( said on stderr unless quiet ); without any, every task fails.
 	On a Ctrl-C ( or anything raised meanwhile ) every task is stopped: running commands are killed, the rest never
-	start, and the workers get up to 5 s to finish ( a second Ctrl-C ends that wait ). A reader of the output that quit
-	stops them the same way, with nothing raised here ( see _reader_quit; run_commands raises once the workers are done ).
+	start, and the workers get up to 5 s to finish ( a second Ctrl-C ends that wait ). A stdout nobody reads stops them the
+	same way, with nothing raised here ( see _Display; run_commands raises once the workers are done ).
 	'''
 	if not tasks:
 		return
@@ -2685,9 +2689,9 @@ def _run_pool(tasks, decors, sem, timeout, quiet, dry_run, max_threads, use_pty=
 			_write_error(f'multiCMD: started {len(running)} of {wanted} threads: {error}')
 		for thread in running:
 			while not _join(thread, 0.1):
-				# the main thread asks the pipe poll here ( mcmd: a reader that quit while the commands print nothing ); each
-				# worker stops its own command and skips its starts on the flag the poll or a write sets ( _reader_quit )
-				_reader_quit(quiet)
+				# mcmd: the main thread asks the pipe poll here ( a reader that quit while the commands print nothing ); each
+				# worker stops its own command and skips its starts on what the poll or a write found ( _stops )
+				_reader_quit()
 	except BaseException:
 		# a Ctrl-C ( or anything else ) while the workers start or run: the commands not started yet never will
 		_stop_tasks(tasks)
@@ -2759,11 +2763,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	On Python 3.11+ a Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running
 	unregistered ( see run_command ).
 
-	A call that shows its commands ( not quiet ) while the reader of sys.stdout quits ( a write of multiCMD's own output fails
-	with EPIPE, ECONNRESET, or on Windows EINVAL from a pipe ) stops them as a Ctrl-C does, skips the queued ones ( return code
-	None ) and raises BrokenPipeError once they are dead ( when it waits: not with wait_for_return=False ). Calls made after
-	multiCMD has found the reader gone run their commands without showing them. A quiet call never looks at stdout ( under mcmd,
-	which watches stdout for its whole run, every call does ). Any other failed write only loses the output.
+	A shown command ( not quiet ) that goes on printing once the reader of sys.stdout is gone stops its call: its commands are
+	stopped, the queued ones skipped, and the call raises BrokenPipeError when it waits. The rule and the rest: see _Display.
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )
@@ -2802,8 +2803,6 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	@returns:
 		list: The output of the commands ( list[None] | list[int] | list[list[str]] | list[Task] | None )
 	'''
-	# stdout's reader quit before this call: it has nobody to show its commands to, and runs them as a quiet call does
-	quiet = quiet or _display.closed
 	# initialize the tasks
 	tasks, use_sudo = _build_tasks(commands, parse=parse, use_sudo=use_sudo, shell=shell, env=env, extra_env=extra_env, pass_fds=pass_fds)
 	# run the tasks with max_threads. if max_threads is 0, use the number of commands
@@ -2822,8 +2821,11 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	if dry_run:
 		# nothing runs: show each command once, quoted so it can be pasted into a shell
 		for task in tasks:
-			if not quiet and not _display.closed:
+			if not quiet and not task._unread:
 				_display.message(_dry_run_line(task))
+				if _display.closed:
+					# its lines are the call's output: nobody reads them, so it shows no more and raises below
+					task._unread.append(True)
 			# nothing runs: the returned tasks do not keep their environments
 			task._env = task._extra_env = None
 	elif not wait_for_return:
@@ -2864,9 +2866,9 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			# an interrupt ( a Ctrl-C, a signal handler's exception ): the commands after it never start
 			_stop_tasks(tasks)
 			raise
-	if wait_for_return:
-		# the reader of what this call shows quit meanwhile: its commands were stopped or skipped, or had already finished
-		_raise_if_reader_quit(quiet)
+	if wait_for_return and ((tasks and tasks[0]._unread) or _reader_quit()):
+		# its commands were stopped or skipped, or had finished ( see _Display )
+		raise BrokenPipeError(errno.EPIPE, 'the reader of stdout quit')
 	# return the only the output for the tasks
 	if raise_error:
 		# dry-run and still-running commands have no return code yet: they did not fail
@@ -3113,15 +3115,12 @@ def _cli_commands(args):
 
 def main():
 	'''
-	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) stops the run: every command is
-	stopped, as a Ctrl-C stops them ( _Display sets closed, _reader_quit is asked by every wait, and main() polls the pipe too,
-	_watch_stdout ), and the process ends by SIGPIPE with nothing on stderr ( _end_by_closed_stdout ). A write to stdout that
-	fails for any other reason ( a terminal that hung up, a full disk ) only loses the output ( _Display.lose ): every command
-	runs, one line on stderr says so, and the exit status is theirs; at exit stdout's descriptor is pointed at os.devnull, so
-	that what the failed write left in Python's buffer cannot fail again ( status 120 ). A stderr that cannot be written
-	changes no exit status either: its messages are dropped ( _write_error ), and at exit its descriptor is pointed at
-	os.devnull for the same reason. The library's functions share the rule and the code ( _Display._write ); what only the
-	process's owner may do stays here: the pipe poll, the two redirects and the end by SIGPIPE.
+	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) stops the whole run
+	( _reader_quit, with the pipe poll of _watch_stdout ), and the process ends by SIGPIPE with nothing on stderr
+	( _end_by_closed_stdout ). Any other failed write only loses the output ( _Display ); at exit stdout's descriptor is then
+	pointed at os.devnull, so that what the failed write left in Python's buffer cannot fail again ( status 120 ), and so is
+	a stderr that cannot be written ( its messages are dropped: _write_error ). What only the process's owner may do stays
+	here: the pipe poll, the two redirects and the end by SIGPIPE; as it returns, the library's rule is back.
 	A stderr closed at start ( `2>&-` ) is replaced by os.devnull, so that nothing of ours, and no argparse usage error, goes to
 	stdout instead ( print( file=None ) and argparse write there ).
 	@returns:
@@ -3129,7 +3128,7 @@ def main():
 	'''
 	if sys.stderr is None:
 		sys.stderr = open(os.devnull, 'w')
-	_display.name = 'mcmd'
+	_display.cli = True
 	_display.watch = _watch_stdout()
 	try:
 		status = _run_cli()
@@ -3145,6 +3144,9 @@ def main():
 			_point_at_devnull(sys.stdout)
 		# what stderr could not take ( the line that says the output was lost, a message of a command that could not run )
 		_flush_stderr()
+		# a program that called main() itself: its later calls are a library's again
+		_display.cli = False
+		_display.watch = None
 	return status
 
 def _flush_stderr():
@@ -3576,8 +3578,7 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	prefix += ' |' if not prefix.endswith(' |') else ''
 	suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
 	# Through the display's _write, so a stdout that fails ( a terminal that hung up ) loses the bar, as any output, and raises
-	# nothing in the caller; a reader that quit sets the flag that stops the calls showing commands ( _reader_quit ), the bar
-	# has no command to stop. Without its lock: the bar is drawn from the caller's main thread in a loop, where a Ctrl-C that left
+	# nothing in the caller; a reader that quit is recorded ( see _Display ), and the bar has no command to stop. Without its lock: the bar is drawn from the caller's main thread in a loop, where a Ctrl-C that left
 	# the lock held ( docs/limitations.md ) would hang every later frame; it never took the lock before.
 	try:
 		columns, _ = get_terminal_size()

@@ -419,53 +419,7 @@ Ctrl-C (or a SIGTERM handler's `sys.exit()`) in a call waiting on the main threa
 and `AsyncExecutor.wait()` included, stops every command, skips the queued ones and
 re-raises, giving them up to 5 s to exit; a second Ctrl-C ends that wait at once. `mcmd` stops its
 commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`), and when its stdout
-has no reader (`mcmd ... | head`, or a socket its peer closed or reset): it stops them as a Ctrl-C does, and ends by
-SIGPIPE, as `yes | head` does, with nothing on stderr. When stdout is a pipe on Linux and macOS it also asks the pipe as it waits, so a command that prints
-nothing more is stopped as well (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout, and on Windows, it
-learns it only when a write fails, and a command that prints nothing more runs to its end first (on Windows that is a known
-limitation, docs/limitations.md). ksh93 on Linux builds its
-pipelines from sockets, so under it `mcmd ... | head` is the same: a write finds the reader gone, as in 1.61 (bash, dash, zsh,
-mksh, busybox and macOS's ksh give a pipe). A write to stdout that fails for any other reason (EIO from a terminal that
-hung up, ENOSPC from a full disk; on Windows, EINVAL from anything but a pipe) loses only the output: `mcmd` drops it from
-then on, runs every command, running and queued, says so in one line on stderr (`mcmd: cannot write to stdout ([Errno 5]
-Input/output error): its output is dropped from here on`), if stderr can still take it, and exits with the commands' own
-status, also with stdout and stderr on the same file. If stderr is that same dead target (`> log 2>&1` on a full disk), the
-line is lost with the rest and the log just stops (it is written at exit if the target can take it by then). A stdout that
-another program left non-blocking (`O_NONBLOCK`) fails with EAGAIN whenever its pipe or terminal is momentarily full, and
-that counts as a failed write too: the output is dropped from then on. A program that imports multiCMD then never learns that
-its reader quit: a shown `tail -f` runs on after `prog | head` has quit (`mcmd` asks the pipe, as above, and stops; see
-docs/limitations.md). A terminal that hangs up also sends SIGHUP to the job in its foreground (a closed terminal window, or `ssh -t` whose connection drops), and bash and
-zsh pass it on to every job they started, in the background too (dash does not): that stops the commands as before, and
-`mcmd` ends `129`. A job nobody signals runs to its end: one that was `disown`ed, started with `setsid` or `nohup`, or, in
-bash and dash, left in the background by `exit` (zsh signals its jobs on `exit` too). Over `ssh` without a pty, stdout is a
-pipe to sshd, and a dropped connection closes it: a reader that quit. So a run that must outlive its terminal or its
-connection, whatever starts it, runs under `nohup` (against the hang-up's SIGHUP) with its stdout in a file (which no
-hang-up or dropped connection can close): `nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD follows the same
-rule for the writes of multiCMD's own output (its live output, `print_progress_bar()`, the report of `AsyncExecutor.join()`),
-and none of those writes raises an `OSError` in the thread that wrote (a `sys.stdout` the program closed itself still gives
-`ValueError`, as in 1.62: deferred to 1.64, docs/limitations.md). A reader that quit (`BrokenPipeError`, `ConnectionResetError`, or on
-Windows `OSError` EINVAL from a pipe) stops the calls that are showing their commands (not quiet): their commands are
-stopped as a Ctrl-C stops them, the queued ones are skipped (return code `None`), and a call that waits raises
-`BrokenPipeError` once its commands are dead, whichever of those forms the platform gave the write (`except OSError` catches
-it too). A pool stops all its commands, and a call on a thread of the program's own raises in that thread. Shown commands
-nobody waits for (an `AsyncExecutor` made with `quiet=False`, `run_commands(wait_for_return=False)`; an `AsyncExecutor` is
-quiet by default, and a quiet one is never stopped) are stopped without an error: `wait()`, `join()` and `join_threads()`
-return, and the tasks tell (a stopped one has the kill's return code, a queued one `None`). Every call made after multiCMD
-has found the reader gone, for the rest of the process, runs its commands unseen, and multiCMD's own stderr lines for it
-(`Command path not found`, `Error running command`) are not printed either. So a cleanup in a `finally` (an unmount) runs
-once an earlier shown call has raised. A call whose own first lines meet the reader quitting, or that follows only the
-program's own write to that closed pipe, is a shown call like any other: its commands are skipped, and a call that waits raises. A cleanup that must run
-whatever stdout does passes `quiet=True`. A quiet call never looks at stdout. One edge of the rule for calls made after the reader quit (deferred to 1.64,
-docs/limitations.md): a shown call that starts after multiCMD has found the reader gone runs its commands unseen to their end,
-on any thread, so a program that fans shown calls out over its own threads (a thread pool) under `prog | head` keeps running
-as long as a remaining call's command runs (for ever, with `tail -f`); run such a fan-out as one call with `max_threads`, which stops as one. The library learns that its reader quit only from a failed write, and does not poll the pipe as `mcmd` does, so a
-shown command that prints nothing more (`tail -f` of a log that went idle, under `prog | head -1`) runs until its next line
-(see docs/limitations.md). Any other failed write (EIO from a terminal that hung up, ENOSPC from a full disk) loses only the
-output: multiCMD's output is dropped from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and
-every command runs. The program's own writes to that stdout meet the error themselves, and so does Python's flush at exit,
-which still finds what the failed write left in `sys.stdout`'s buffer: unless the program handles that, it ends with
-"Exception ignored" and status 120, as after a failed print of its own (a library does not redirect its caller's stdout).
-At interpreter exit
+has no reader (see [When stdout fails](#when-stdout-fails)). At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -500,6 +454,32 @@ Ctrl-C that arrives as a command starts waits for the exec wrapper's `Popen`, no
 exec of the Python binary itself hangs (a venv on an NFS mount that stopped answering), it does nothing until the mount
 answers.
 These and the other known limits are in [docs/limitations.md](docs/limitations.md).
+
+## When stdout fails
+
+<!-- Each cell's tests ( tests/ ): mcmd, reader quit: test_cli_closed_stdout.py ( test_a_reader_that_quits_ends_the_cli_by_sigpipe_and_stops_its_commands,
+test_a_reader_that_quits_while_the_commands_print_nothing_ends_the_cli_at_once ), test_cli_failed_stdout.py ( test_a_socket_its_peer_reset_ends_the_cli_by_sigpipe_and_stops_its_commands ).
+Library, reader quit: test_reader_quit.py ( test_a_program_whose_reader_quit_stops_its_command_and_gets_broken_pipe_error, test_shown_calls_fanned_out_over_the_programs_threads_all_end,
+test_a_shown_command_that_prints_nothing_runs_whoever_met_the_reader_quitting_first, test_the_last_words_of_a_command_that_then_ends_are_only_lost,
+test_commands_nobody_waits_for_are_stopped_and_their_tasks_say_so, test_a_quiet_call_never_looks_at_stdout ).
+mcmd, other failed write: test_cli_failed_stdout.py ( test_a_terminal_that_hung_up_loses_the_output_and_every_command_runs, test_a_full_disk_under_stdout_loses_the_output_and_every_command_runs ).
+Library, other failed write: test_reader_quit.py ( test_any_other_failed_write_still_loses_only_the_output ), test_cli_failed_stdout.py ( test_the_library_runs_every_command_when_stdout_fails,
+test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit ).
+Closed at start: test_cli_failed_stdout.py ( test_a_stdout_closed_at_start_drops_the_output_and_every_command_runs, test_the_library_runs_every_command_with_stdout_closed_at_start ). -->
+
+| What happened to stdout | `mcmd` | A program that imports multiCMD |
+|---|---|---|
+| Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command that goes on printing is stopped; its call skips what it has not started and, if it waits, raises `BrokenPipeError`. A command that prints nothing more, or only its last lines, runs to its end. A quiet call never looks at stdout |
+| Any other failed write (a terminal that hung up, a full disk) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised. The program's own writes, and Python's flush at exit (status 120), still meet the error: a library does not redirect its caller's stdout |
+| Closed at start (`>&-`) | The output is dropped silently; every command runs | The same (`sys.stdout` is `None`) |
+
+On Linux and macOS, with stdout on a pipe, `mcmd` asks the pipe as it waits, so a command that prints nothing more is
+stopped too (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout (a socket, as ksh93 on Linux builds its
+pipelines) and on Windows it learns that its reader quit from its next failed write. A run that must outlive its terminal or
+its connection runs as `nohup mcmd -q ... > log 2>&1 &`: a terminal that hangs up sends SIGHUP to its foreground job (bash and
+zsh to every job they started), which stops the commands (`mcmd` ends 129), and over `ssh` without a pty a dropped connection
+is a reader that quit; in a program, a cleanup that must run whatever stdout does passes `quiet=True`. The exceptions, with
+their evidence, are in [docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
 
