@@ -151,16 +151,26 @@ def test_a_call_made_after_the_reader_quit_runs_its_commands_without_showing_the
 
 @posix_only
 def test_a_quiet_call_never_looks_at_stdout(tmp_path):
-	# on another thread while the shown call loses its reader, and after it. The quiet command is still running when the
-	# reader quits and while the shown call is stopped: it ends only once the program has caught BrokenPipeError
+	# on another thread while the shown call loses its reader, and after it. The quiet command is running when the reader
+	# quits ( the program starts the shown call only once the quiet command has said it started ) and while the shown call is
+	# stopped: it ends only once the program has caught BrokenPipeError
 	go = tmp_path / 'go'
+	started = tmp_path / 'started'
+	# the quiet command lists its pid with the followers' ( run_program's cleanup kills it after a failed run ) and says it started
+	quiet_command = f'echo $$ >> {tmp_path}/pids; touch {started}; i=0; while [ ! -e {go} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo done'
 	status, err, took = run_program(tmp_path, f'''
 		got = []
 		def quiet():
 			# ( at most 20 s: a program that never gets there ends at run_program's deadline )
-			got.append(multiCMD.run_command(['sh', '-c', 'i=0; while [ ! -e {go} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo done'], quiet=True))
+			got.append(multiCMD.run_command(['sh', '-c', {quiet_command!r}], quiet=True))
 		thread = threading.Thread(target=quiet)
 		thread.start()
+		# ( 5 s: the command starts within milliseconds, in 10 ms through the exec wrapper of Python 3.6 - 3.10; a loaded
+		# runner is slower, but not 500 times )
+		deadline = time.monotonic() + 5
+		while not os.path.exists({str(started)!r}) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		sys.stderr.write('STARTED %s\\n' % os.path.exists({str(started)!r}))
 		try:
 			multiCMD.run_commands([FOLLOW])
 		except BrokenPipeError:
@@ -170,6 +180,8 @@ def test_a_quiet_call_never_looks_at_stdout(tmp_path):
 		got.append(multiCMD.run_command(['echo', 'later'], quiet=True))
 		sys.stderr.write('QUIET %s\\n' % got)
 		''')
+	# the quiet command was running before the shown call began, so before its reader quit
+	assert 'STARTED True\n' in err
 	assert 'RAISED\n' in err
 	assert "QUIET [['done'], ['later']]" in err
 

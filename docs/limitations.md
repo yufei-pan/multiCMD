@@ -233,8 +233,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: known limitation
 - What the operator sees: on Windows `mcmd 'long-quiet-command' | head -1` runs until the command prints again or ends. A
   command that keeps printing is stopped at its next line (`mcmd` ends 1, with an empty stderr). On Linux and macOS `mcmd`
-  asks the pipe as it waits and stops at once. This is 1.62's behaviour, which the README says (the signals paragraph and
-  "Upgrading to 1.62").
+  asks the pipe as it waits and stops at once (not under ksh93 on Linux, whose pipelines are sockets: see the entry above).
+  This is 1.62's behaviour, which the README says (the signals paragraph and "Upgrading to 1.62").
 - Why: Windows has no cheap way to ask a pipe whether its reader is still there (`PeekNamedPipe` through `ctypes` would be
   the route, testable only on GitHub's Windows runner). cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
@@ -271,28 +271,37 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A stdout that another program left non-blocking counts as a failed write at the first EAGAIN
 - Kind: known limitation
 - What the operator sees: when another program leaves stdout `O_NONBLOCK` (a shared terminal, a pipe), a momentarily full
-  pipe or terminal makes a write fail with EAGAIN (`[Errno 11] Resource temporarily unavailable`). 1.63 drops the output from
-  then on, says so once on stderr, and runs every command; the status is the commands' own. 1.62 printed tracebacks and did
-  not start the queued commands.
+  pipe or terminal makes a write fail with EAGAIN (`[Errno 11] write could not complete without blocking`, as the stderr line
+  quotes it; ran on 3.6 and 3.14). 1.63 drops the output from then on, says so once on stderr, and runs every command; the
+  status is the commands' own. 1.62 printed tracebacks and did not start the queued commands. Since nothing is written to
+  that stdout from then on, a program that imports multiCMD also never learns that its reader quit later: a shown command
+  that never ends (`tail -f`) runs on after `prog | head` has quit, until it ends or the program is stopped. 1.62 raised
+  `BlockingIOError` from the call that met the EAGAIN (its command did not finish); a program that caught that and went on
+  had a later follower stopped, with `BrokenPipeError`, when the reader quit. `mcmd` is not affected on Linux and macOS: it
+  asks the pipe, and ended by SIGPIPE at once (Docker, Python 3.14 and 3.6).
 - Why: a correct retry needs mcmd's own write loop on the descriptor (with a wait for POLLOUT). Retrying through Python's
   stdout lost bytes once a single write passed its 8 KB buffer: 78,560 of 1,000,000 bytes with 20 KB writes, 336,448 with 100
   KB, none with 100-byte writes (Docker, Python 3.14 and 3.6, the 1.63 second review's `pi.py`). The `O_NONBLOCK` is another
   program's bug in the environment, and it breaks every other program that writes to that terminal.
 - Revisit when: someone hits it.
-- Approved: 2026-11-12, the user chose "Known limitation (Recommended)".
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)". Widened 2026-11-12 (a reader that quits after the
+  EAGAIN is not seen by the library): the user chose "Release, widen the KL (Recommended)"; the user did not ask for it, the
+  1.63 re-review's second opinion found it.
 
 ### format_bytes() and input_with_timeout_and_countdown() write to stdout with a bare print
 - Kind: deferred
 - What the operator sees: `format_bytes()` (hpcp parses its size limits through it at start) prints "Invalid size format ..."
-  and "Got: ..." with a bare `print()` (multiCMD.py:3590 and :3594), and `input_with_timeout_and_countdown()` prints its
-  prompt and its countdown the same way (multiCMD.py:3238 and :3253; hpcp calls it at six places, hpcp.py:8176, 11479,
-  13376, 13420, 13446 and 14339 at ae258b0). Both write to stdout, which is the data stream, and raise `OSError` if stdout is
-  dead. They are writes of multiCMD's own that the display rule does not cover. Older than 1.63; no caller is known to
-  reach either with a dead stdout.
+  and "Got: ..." with a bare `print()` (multiCMD.py:3593 and :3597), and `input_with_timeout_and_countdown()` prints its
+  prompt and its countdown the same way (multiCMD.py:3241 and :3256; hpcp calls it at six places, hpcp.py:8176, 11479,
+  13376, 13420, 13446 and 14339 at ae258b0). Both write to stdout, which is the data stream. The prompt and its countdown flush
+  at once, so they raise `OSError` if stdout is dead; `format_bytes()`'s two lines raise at once only on a terminal, and on a
+  pipe or a file they wait in Python's buffer and fail at its next flush (at exit: "Exception ignored", status 120). They are
+  writes of multiCMD's own that the display rule does not cover. Older than 1.63; no caller is known to reach either with a
+  dead stdout.
 - Why: `format_bytes()` was found in the 1.63 second review, after the build had gone through the display's door for every
   other write of its own; the prompt in the third review's second opinion.
-- Revisit when: multiCMD 1.64, which sends both through the display rule (the message through `_write_error`, the prompt
-  and its countdown through the display).
+- Revisit when: multiCMD 1.64, which sends both through the failed-write rule (the message through `_write_error`; where the
+  prompt and its countdown go, the display or stderr, is that version's design call).
 
 ### A shown call that starts after the reader quit runs its commands unseen to their end, on any thread
 - Kind: deferred
@@ -302,28 +311,52 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   never ends (`tail -f`): 3 of 8 calls raised and 5 were still pending at 12 s, where 1.62 raised `BrokenPipeError` in all 8
   within 0.1 s. Two shown calls started on two threads together do the same (5 to 8 of 10 runs hung, by run and Python). A call already in
   flight stops and raises, as the README says. No cas tool has the shape: hpcp's shown calls are serial, and statblk and
-  statbtrfs pass `quiet=True`. Workaround: run such a fan-out as one call with `max_threads`, which stops as one, or stop
-  submitting on `BrokenPipeError`. The README says so in the signals paragraph and in "Upgrading to 1.63".
-- Why: `run_commands` decides at its start, from one global flag, whether the call is a later call (multiCMD.py:2803, and
-  `AsyncExecutor.run_commands` at :832), and a later call is quiet, so no wait asks it to stop. Making every later shown
-  call raise instead would bring back hpcp's cleanup leaks (a cleanup's `umount` raised, so loop devices and mount-point
-  directories stayed behind in 30 of 30 rows of the 1.63 third review's VM runs). The user decided 2026-11-12: "Release,
-  fix in 1.64 (Recommended)".
+  statbtrfs pass `quiet=True`. Workaround: run such a fan-out as one call with `max_threads`, which stops as one. The README
+  says so in the signals paragraph and in "Upgrading to 1.63".
+- Why: `run_commands` decides at its start, from one global flag, whether the call is a later call (multiCMD.py:2806, and
+  `AsyncExecutor.run_commands` at :834), and a later call is quiet, so no wait asks it to stop. Making every later shown
+  call raise instead would bring back hpcp's cleanup leaks (1.62, whose later shown calls raise, left a mount, a loop device
+  or the mount-point directory behind in 30 of 30 rows of the 1.63 third review's VM runs; 1.63 in 8). The user decided
+  2026-11-12: "Release, fix in 1.64 (Recommended)".
 - Revisit when: multiCMD 1.64. A design check comes first, of Unix's SIGPIPE rule for later calls: a later call's command
   is stopped when it prints, so a silent cleanup such as `umount` still runs and a follower ends at its next line. Then
   build it.
 
-### A shown call whose own first lines meet the reader quitting is not a later call, so a cleanup after it can be skipped
+### A shown cleanup call that is the first to meet the reader quitting is skipped, and raises
 - Kind: deferred
-- What the operator sees: when the reader of stdout quits before multiCMD has found it gone (the program's own write met the
-  dead pipe first, or the quit lands in a call's own header or a later line), that call is a call in flight, not a later
-  call: its commands are skipped (or stop) and it raises `BrokenPipeError`. A cleanup after it that shows its commands
-  (`umount`) is then skipped too, and so is whatever the program's `finally` runs after the raise. hpcp 9.89 `-di img |
-  head -K` left a mount, a loop device or the mount-point directory behind in 8 of 30 rows (K = 10, 60, 75, 80 in VM 901; 1.62
-  left something in 30 of 30). A cleanup that must run whatever stdout does passes `quiet=True`; the README says so.
+- What the operator sees: when the reader of stdout quits before multiCMD has found it gone, the first shown call to meet it
+  is a call in flight, not a later call: its commands are skipped (or stopped) and it raises `BrokenPipeError`. That happens
+  when the program's own write met the dead pipe first (the next shown call's header then fails), or when the quit lands in a
+  call's own header or a later line. When that call is the cleanup (an `umount` in a `finally`), the unmount is skipped, and
+  so is whatever the `finally` runs after it; a cleanup call made after another shown call has raised still runs, unseen.
+  hpcp 9.89 `-di img | head -K` left a mount, a loop device or the mount-point directory behind in 8 of 30 rows (K = 10, 60, 75
+  and 80, in a Debian 12 VM; 1.62 left something in 30 of 30). A cleanup that must run whatever stdout does passes
+  `quiet=True`; the README says so.
 - Why: the later-call rule reads one flag that only a failed write of multiCMD's own sets. Flushing `sys.stdout` at the start
   of a shown call that is not yet a later call (`if not quiet and not _display.closed: _display.flush()`) makes what the
   program's own failed write left in Python's buffer fail there, so the call is recognised as a later call: a prototype took
   K = 60 from 5 of 5 runs leaving the mount and the loop device to 0 of 5. K = 10, 75 and 80 need hpcp's cleanup not to depend
   on stdout (its `umount` quiet, no step cut short by another's exception, the output it parses from `losetup` quiet).
 - Revisit when: multiCMD 1.64 (the flush), and hpcp's next version (its cleanup).
+
+### A program that closed sys.stdout gets ValueError from a shown call, as in 1.62
+- Kind: deferred
+- What the operator sees: after `sys.stdout.close()` in a program that imports multiCMD, a shown serial call raises
+  `ValueError: I/O operation on closed file.` and does not run its command; a pool returns -1 for each command with a
+  traceback on stderr and runs none; `print_progress_bar()` raises `ValueError`. 1.62 did the same (Docker, Python 3.14 and
+  3.6). A `None` `sys.stdout` (`>&-`) is not affected: it drops the output and runs the commands.
+- Why: the display's door catches `OSError`, and a closed file object raises `ValueError`. Found in the 1.63 design check; no
+  caller is known to close its stdout and then show commands.
+- Revisit when: multiCMD 1.64, which takes it at the same door as lost output (`except (OSError, ValueError)`, with
+  `_no_reader` reading `errno` only from an `OSError`).
+
+### A program that calls multiCMD.main() itself keeps the stdout watch afterwards
+- Kind: deferred
+- What the operator sees: a program that runs `multiCMD.main()` in its own process (not the `mcmd` command) and then makes
+  calls on its main thread: once `main()` has returned, those calls still ask the stdout pipe, so a quiet call is stopped and
+  raises `BrokenPipeError` when the pipe's reader quits, where a quiet call otherwise never looks at stdout. No caller is
+  known; 1.62's `main()` left its hook set too.
+- Why: `main()` sets `_display.watch` and does not clear it as it returns.
+- Revisit when: multiCMD 1.64: `main()` clears `_display.watch` as it returns; with it, the docstrings of `_reader_quit`,
+  `_raise_if_reader_quit`, `_Display` and `run_commands`, and the comment in `run_commands`, say what a quiet call does under
+  the watch.

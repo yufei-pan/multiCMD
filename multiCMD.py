@@ -448,7 +448,7 @@ class _Display:
 
 	A write that fails never raises, in the thread that wrote ( the CLI's and a program's that imports multiCMD alike ): it
 	classifies the failure here, once ( _no_reader ). A reader that quit sets closed, which every wait for a command and every
-	start asks ( _reader_quit ): the commands the calls that show them run are stopped, as a Ctrl-C stops them, and a waiting
+	start asks ( _reader_quit ): the commands the calls that show them run ( under mcmd's watch, every call's ) are stopped, as a Ctrl-C stops them, and a waiting
 	run_commands raises BrokenPipeError. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses
 	the output ( lose ): every later write is dropped, one line on stderr says so, and the commands run on, as their readers
 	keep reading. Either way the failed write's bytes stay in sys.stdout's buffer, which Python's flush at exit finds again
@@ -605,7 +605,7 @@ def _reader_quit(quiet=False):
 	and so does every start ( __run_command ): a flag, so nothing is raised through a wait, which a signal handler's raise
 	would be, landing wherever the main thread is, in a __del__ among them, where Python drops it and the stop is lost.
 	Only the main thread asks the watch ( a poll object is one thread's ); the others see what it found, or a write did.
-	A call made after the reader quit is made quiet by run_commands and AsyncExecutor.run_commands, so without a watch it
+	A call made after multiCMD has found the reader gone is made quiet by run_commands and AsyncExecutor.run_commands, so without a watch it
 	asks nothing; under a watch ( mcmd ) a quiet call asks too, and answers for the reader whatever quiet says.
 	'''
 	if _display.watch is None:
@@ -618,8 +618,8 @@ def _reader_quit(quiet=False):
 
 def _raise_if_reader_quit(quiet=False):
 	'''
-	Raise BrokenPipeError at the end of a waiting run_commands once the reader of its output quit, whichever form the platform
-	gave the failed write ( EPIPE, ECONNRESET, Windows' EINVAL ). The commands were stopped or skipped, or had already finished
+	Raise BrokenPipeError at the end of a waiting run_commands once the reader of its output quit: a failed write, in whichever
+	form the platform gave it ( EPIPE, ECONNRESET, Windows' EINVAL ), or under mcmd the pipe poll. The commands were stopped or skipped, or had already finished
 	( or, for a dry run, were only shown ) ( internal )
 	'''
 	if _reader_quit(quiet):
@@ -2762,7 +2762,8 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	A call that shows its commands ( not quiet ) while the reader of sys.stdout quits ( a write of multiCMD's own output fails
 	with EPIPE, ECONNRESET, or on Windows EINVAL from a pipe ) stops them as a Ctrl-C does, skips the queued ones ( return code
 	None ) and raises BrokenPipeError once they are dead ( when it waits: not with wait_for_return=False ). Calls made after
-	that run their commands without showing them. A quiet call never looks at stdout. Any other failed write only loses the output.
+	multiCMD has found the reader gone run their commands without showing them. A quiet call never looks at stdout ( under mcmd,
+	which watches stdout for its whole run, every call does ). Any other failed write only loses the output.
 
 	@params:
 		commands: A list of commands to run ( list[str] | list[list[str]] )
