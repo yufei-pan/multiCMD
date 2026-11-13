@@ -1,4 +1,5 @@
 import errno
+import io
 import sys
 
 import pytest
@@ -118,46 +119,91 @@ def test_quote_command():
 	assert multiCMD._quote_command('echo hi') == 'echo hi'
 
 
-class ClosedPipe:
-	'''A stdout nobody reads: every write fails as a pipe whose reader quit does'''
+class FailingStdout:
+	'''A stdout every write and flush of which fails with error'''
+	def __init__(self, error):
+		self.error = error
+		self.writes = 0
+
 	def write(self, text):
-		raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
+		self.writes += 1
+		raise self.error
 
 	def flush(self):
-		pass
+		raise self.error
 
 
-def test_a_closed_stdout_raises_for_the_library(monkeypatch):
-	# on_closed is the CLI's: a program that imports multiCMD gets the BrokenPipeError, as it always did
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
+@pytest.mark.parametrize('error, flag', [
+	(BrokenPipeError(errno.EPIPE, 'Broken pipe'), 'closed'),
+	(ConnectionResetError(errno.ECONNRESET, 'Connection reset by peer'), 'closed'),
+	(OSError(errno.EIO, 'Input/output error'), 'lost'),
+	(OSError(errno.ENOSPC, 'No space left on device'), 'lost'),
+], ids=['EPIPE', 'ECONNRESET', 'EIO', 'ENOSPC'])
+def test_a_failed_write_is_classified_once_where_it_is_written(monkeypatch, capfd, error, flag):
+	# for mcmd and for a program that imports multiCMD alike: a reader that quit closes the display ( the calls that show
+	# commands stop them ), anything else loses the output, said once on stderr; neither raises in the thread that wrote,
+	# and every later write is dropped. 1.62 raised it there: a command whose header failed did not run, a reader died
+	stdout = FailingStdout(error)
+	monkeypatch.setattr(sys, 'stdout', stdout)
 	display = multiCMD._Display()
-	with pytest.raises(BrokenPipeError):
-		display.message('header')
-	with pytest.raises(BrokenPipeError):
-		display.lines(['a'])
-	assert not display.closed
-
-
-def test_on_closed_is_called_once_and_every_later_write_is_dropped(monkeypatch):
-	calls = []
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
-	display = multiCMD._Display()
-	display.on_closed = lambda: calls.append('closed')
 	display.message('header')
-	assert display.closed
 	display.lines(['a'])
 	display.message('footer')
-	assert calls == ['closed']
-
-
-def test_on_closed_may_raise_in_the_writing_thread(monkeypatch):
-	# the main thread's answer ( _stdout_closed ): the write is the one that raises, with the lock let go
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
-	display = multiCMD._Display()
-	def stop():
-		raise multiCMD._StdoutClosed()
-	display.on_closed = stop
-	with pytest.raises(multiCMD._StdoutClosed):
-		display.message('header')
-	assert display.closed
+	display.flush()
+	assert (display.closed, display.lost) == (flag == 'closed', flag == 'lost')
+	assert stdout.writes == 1
 	assert display.lock.acquire(False)
+	err = capfd.readouterr().err
+	if flag == 'closed':
+		assert err == ''
+	else:
+		assert err.count('multiCMD: cannot write to stdout') == 1 and len(err.splitlines()) == 1
+
+
+def test_flush_meets_the_same_rule(monkeypatch):
+	# what argparse left in the buffer: main()'s final flush goes through the display
+	class FlushFails:
+		def write(self, text):
+			pass
+
+		def flush(self):
+			raise OSError(errno.ENOSPC, 'No space left on device')
+	monkeypatch.setattr(sys, 'stdout', FlushFails())
+	display = multiCMD._Display()
+	display.flush()
+	assert display.lost and not display.closed
+	assert display.lock.acquire(False)
+
+
+def test_text_the_stdout_encoding_cannot_take_is_written_with_backslash_escapes(monkeypatch):
+	# a command's output with an accent, on an ASCII stdout ( Python 3.6 in a C locale ): UnicodeEncodeError killed its reader
+	raw = io.BytesIO()
+	stdout = io.TextIOWrapper(raw, encoding='ascii', errors='strict', write_through=True)
+	monkeypatch.setattr(sys, 'stdout', stdout)
+	display = multiCMD._Display()
+	display.message('header')
+	display.lines(['caf\u00e9', 'plain'])
+	assert raw.getvalue() == b'header\n\ncaf\\xe9\nplain'
+	assert not display.lost
+
+
+def test_a_stdout_that_is_none_drops_the_output_silently(monkeypatch, capfd):
+	# `mcmd ... >&-` ( and pythonw ): print() ignores it, and so does the display, so every command runs
+	monkeypatch.setattr(sys, 'stdout', None)
+	display = multiCMD._Display()
+	display.message('header')
+	display.lines(['a'])
+	display.flush()
+	assert not display.lost and not display.closed
+	assert capfd.readouterr() == ('', '')
+
+
+def test_losing_the_output_twice_says_so_once(capfd):
+	# two writers that both met the failure ( a bar frame racing a live line, in a library program ): the second finds the
+	# output already lost, and says nothing
+	display = multiCMD._Display()
+	display.lose(OSError(errno.EIO, 'Input/output error'))
+	display.lose(OSError(errno.ENOSPC, 'No space left on device'))
+	err = capfd.readouterr().err
+	assert display.lost
+	assert err.count('multiCMD: cannot write to stdout') == 1 and '[Errno %d]' % errno.EIO in err and len(err.splitlines()) == 1

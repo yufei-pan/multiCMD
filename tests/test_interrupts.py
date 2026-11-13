@@ -632,6 +632,9 @@ for i in range(n):
 	threading._active_limbo_lock.release()
 	done[0] = i + 1
 assert multiCMD.run_command(['true'], quiet=True, return_code_only=True) == 0
+# ( Python 3.6 - 3.8 block-buffer a redirected stderr, where the stops that landed in a finalizer are told: a result line
+# printed while a flush at 8 KB had left half a line there would land on the end of it, so the line is told after a flush )
+sys.stderr.flush()
 print('%d calls, %d stopped, %d other errors' % (n, stops, others), flush=True)
 '''
 
@@ -648,7 +651,7 @@ def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
 	probe.write_text(STOP_PROBE)
 	run = subprocess.run([sys.executable, '-I', str(probe), str(PACKAGE_ROOT), '5000'], stdout=subprocess.PIPE,
 		stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
-	# ( Python 3.6 - 3.8 buffer stderr, where the stops that landed in a finalizer are told, until the exit )
+	# ( the probe flushes stderr before its result line: see there )
 	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors$', run.stdout, re.M), run.stdout[-4000:]
 
 

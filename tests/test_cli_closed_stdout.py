@@ -52,7 +52,7 @@ def finish(proc):
 		proc.kill()
 		proc.communicate()
 		pytest.fail('the CLI did not end 30 s after its reader quit')
-	return proc.returncode, err.decode(errors='replace')
+	return proc.returncode, (err or b'').decode(errors='replace')
 
 
 def pids_in(tmp_path):
@@ -302,18 +302,14 @@ def test_a_sigpipe_from_elsewhere_is_ignored():
 			proc.kill()
 
 
-@pytest.mark.skipif(not os.path.exists('/dev/full'), reason='needs /dev/full')
-def test_a_stdout_that_fails_for_another_reason_than_a_broken_pipe_adds_no_traceback():
-	# a full disk under stdout: Python's own flush at exit says so, with status 120, as it did before the CLI flushed on its own
-	with open('/dev/full', 'wb') as full:
-		proc = subprocess.run([sys.executable, str(MULTICMD_PY), 'echo hi'], stdin=subprocess.DEVNULL, stdout=full,
-			stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
-	assert proc.returncode == 120
-	assert 'Exception ignored' in proc.stderr
-	assert 'Traceback' not in proc.stderr
+# the waits of a run, in this process: a stdout found closed by another thread ( a reader's write ) ends them; the call
+# raises BrokenPipeError once its commands are stopped
 
 
-# the waits of a run on the main thread, in this process: a stdout found closed by another thread ( a reader's write ) ends them
+class Watched:
+	'''A watch that reports nothing: with one set, the display is mcmd's, whose quiet runs end with its reader too'''
+	def poll(self, timeout):
+		return []
 
 
 class CloseOnceStarted:
@@ -348,7 +344,8 @@ def test_a_closed_stdout_ends_the_wait_for_the_commands(tmp_path, kwargs, count)
 	commands = [f'sh -c {shlex.quote(f"echo $$ > {tmp_path}/pid{i}; exec sleep 12")}' for i in range(1, count + 1)]
 	closer = CloseOnceStarted(tmp_path, count)
 	try:
-		with pytest.raises(multiCMD._StdoutClosed):
+		multiCMD._display.watch = Watched()
+		with pytest.raises(BrokenPipeError):
 			multiCMD.run_commands(commands, quiet=True, **kwargs)
 		assert len(pids_in(tmp_path)) == count
 		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
@@ -361,7 +358,8 @@ def test_a_closed_stdout_ends_the_wait_for_output_that_a_command_left_open(tmp_p
 	# the command has exited; what it started holds its output open, and the run reads it to its end
 	closer = CloseOnceStarted(tmp_path, 1)
 	try:
-		with pytest.raises(multiCMD._StdoutClosed):
+		multiCMD._display.watch = Watched()
+		with pytest.raises(BrokenPipeError):
 			multiCMD.run_command('sh -c ' + shlex.quote(f'sleep 12 & echo $! > {tmp_path}/pid1'), quiet=True)
 		assert all(pid_gone(pid) for pid in pids_in(tmp_path))
 	finally:
@@ -370,12 +368,13 @@ def test_a_closed_stdout_ends_the_wait_for_output_that_a_command_left_open(tmp_p
 
 
 def test_the_stop_that_a_closed_stdout_starts_is_not_cut_short(tmp_path):
-	# raised once: the waits of the stop ( up to 2 s here: the command ignores SIGINT and SIGTERM, and only SIGKILL ends it )
-	# do not raise it again, so the command is dead when it reaches the caller
+	# the stop is not cut short: the waits of the stop ( up to 2 s here: the command ignores SIGINT and SIGTERM, and only
+	# SIGKILL ends it ) go on although the reader is gone, so the command is dead before the call raises
 	script = f'trap "" INT TERM; echo $$ > {tmp_path}/pid1; i=0; while [ $i -lt 240 ]; do sleep 0.05; i=$((i+1)); done'
 	closer = CloseOnceStarted(tmp_path, 1)
 	try:
-		with pytest.raises(multiCMD._StdoutClosed):
+		multiCMD._display.watch = Watched()
+		with pytest.raises(BrokenPipeError):
 			multiCMD.run_command('sh -c ' + shlex.quote(script), quiet=True)
 		assert multiCMD._live_procs == {}
 		assert all(pid_gone(pid, wait=0) for pid in pids_in(tmp_path))
@@ -411,10 +410,9 @@ def test_no_command_is_started_after_stdout_was_found_closed(monkeypatch, kwargs
 	# ( the commands in flight when it was found go on to their stop; the others never begin )
 	begun = count_executions_closing_after_each(monkeypatch)
 	commands = ['sleep 0.3'] * 6
-	try:
+	multiCMD._display.watch = Watched()
+	with pytest.raises(BrokenPipeError):
 		multiCMD.run_commands(commands, quiet=True, **kwargs)
-	except multiCMD._StdoutClosed:
-		pass
 	assert len(begun) == running
 
 
@@ -435,6 +433,9 @@ def test_main_ends_the_process_when_no_wait_saw_the_closed_stdout(monkeypatch):
 
 def test_main_ends_the_process_when_the_final_flush_finds_no_reader(monkeypatch):
 	class NoReader:
+		def write(self, text):
+			pass
+
 		def flush(self):
 			raise BrokenPipeError(32, 'Broken pipe')
 	ended = []
@@ -648,14 +649,14 @@ def test_a_stdout_descriptor_that_is_not_open_is_not_taken_for_a_reader_that_qui
 	os.close(read_end)
 	os.close(write_end)
 	multiCMD._display.watch = watch
-	multiCMD._raise_if_stdout_closed()
+	assert not multiCMD._reader_quit()
 	assert not multiCMD._display.closed
 
 
 @has_poll
 def test_the_library_does_not_poll_stdout(monkeypatch):
 	# only the CLI is a filter that ends when its reader quits: a program that imports multiCMD, with a pipe for stdout
-	# whose reader quit, gets no _StdoutClosed from a quiet run, which writes nothing
+	# whose reader quit, gets no BrokenPipeError from a quiet run, which writes nothing and asks nothing
 	read_end, write_end = os.pipe()
 	os.close(read_end)
 	pipe = os.fdopen(write_end, 'w')
@@ -673,11 +674,18 @@ def test_the_library_does_not_poll_stdout(monkeypatch):
 
 
 # Windows reports a write to a pipe whose reader quit as OSError EINVAL, not BrokenPipeError ( seen on windows-latest with
-# Python 3.9, 3.12 and 3.14, 2026-11-11 )
+# Python 3.9, 3.12 and 3.14, 2026-11-11 ). Its C runtime gives EINVAL for other write errors too: on another stdout it is
+# not taken for a reader that quit.
 
 
 class EinvalStdout:
-	'''A stdout whose reader quit, as Windows reports it'''
+	'''A stdout on descriptor fd whose writes fail as Windows reports them'''
+	def __init__(self, fd):
+		self.fd = fd
+
+	def fileno(self):
+		return self.fd
+
 	def write(self, text):
 		raise OSError(errno.EINVAL, 'Invalid argument')
 
@@ -685,20 +693,57 @@ class EinvalStdout:
 		raise OSError(errno.EINVAL, 'Invalid argument')
 
 
+@pytest.fixture(params=['pipe', 'file'])
+def einval_stdout(request, tmp_path, monkeypatch):
+	'''Its kind, and what makes sys.stdout an EinvalStdout on it, a pipe or a file ( the test calls it: pytest puts its own
+	sys.stdout back after the fixtures )'''
+	if request.param == 'pipe':
+		read_end, fd = os.pipe()
+		os.close(read_end)
+	else:
+		fd = os.open(str(tmp_path / 'out'), os.O_WRONLY | os.O_CREAT)
+	yield request.param, lambda: monkeypatch.setattr(sys, 'stdout', EinvalStdout(fd))
+	monkeypatch.undo()
+	os.close(fd)
+
+
 @pytest.mark.parametrize('posix', [False, True], ids=['windows', 'posix'])
-def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_windows_only(monkeypatch, posix):
+def test_einval_from_a_stdout_write_is_a_reader_that_quit_on_a_windows_pipe_only(monkeypatch, capfd, einval_stdout, posix):
+	kind, install = einval_stdout
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', posix)
-	monkeypatch.setattr(sys, 'stdout', EinvalStdout())
-	called = []
-	multiCMD._display.on_closed = lambda: called.append(True)
-	if posix:
-		with pytest.raises(OSError):
-			multiCMD._display.message('x')
-		assert not multiCMD._display.closed
+	multiCMD._display.name = 'mcmd'
+	install()
+	if not posix and kind == 'pipe':
+		# the write raises nothing, in whatever thread: it leaves the flag, which every wait and every start asks
+		multiCMD._display.message('x')
+		assert multiCMD._display.closed and not multiCMD._display.lost
+		assert capfd.readouterr().err == ''
 	else:
 		multiCMD._display.message('x')
-		assert multiCMD._display.closed
-		assert called == [True]
+		multiCMD._display.message('y')
+		assert multiCMD._display.lost and not multiCMD._display.closed
+		assert capfd.readouterr().err.count('mcmd: cannot write to stdout') == 1
+
+
+def test_windows_einval_from_a_pipe_reaches_the_library_caller_as_broken_pipe_error(monkeypatch, capfd, einval_stdout):
+	# one meaning, one error: a program that imports multiCMD gets BrokenPipeError ( errno EPIPE ) for a reader that quit,
+	# whichever form the platform gave the failed write. 1.62 documented "OSError EINVAL on Windows". On a file the same
+	# EINVAL is only a lost output: the command runs and nothing is raised
+	kind, install = einval_stdout
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
+	install()
+	command = [sys.executable, '-c', 'import sys; sys.exit(3)']
+	if kind == 'pipe':
+		with pytest.raises(BrokenPipeError) as raised:
+			multiCMD.run_command(command)
+		assert raised.value.errno == errno.EPIPE
+		assert multiCMD._display.closed and not multiCMD._display.lost
+		# the commands that run unseen after it raise nothing
+		assert multiCMD.run_command(command, return_code_only=True) == 3
+		assert capfd.readouterr().err == ''
+	else:
+		assert multiCMD.run_command(command, return_code_only=True) == 3
+		assert multiCMD._display.lost and not multiCMD._display.closed
 
 
 class Ended(BaseException):
@@ -710,16 +755,26 @@ def end_by_closed_stdout():
 
 
 @pytest.mark.parametrize('where', ['flush', 'run'])
-def test_main_ends_the_process_on_einval_from_stdout_on_windows(monkeypatch, where):
-	# the final flush, or argparse writing its help or usage to the closed pipe
+def test_main_on_windows_ends_the_process_for_einval_from_a_stdout_pipe_only(monkeypatch, einval_stdout, where):
+	# the final flush, or argparse writing its help or usage to the closed pipe; on a file it is not a reader that quit
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
 	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	monkeypatch.setattr(multiCMD, '_watch_stdout', lambda: None)
 	if where == 'flush':
 		monkeypatch.setattr(multiCMD, '_run_cli', lambda: 0)
-		monkeypatch.setattr(sys, 'stdout', EinvalStdout())
 	else:
 		def run():
 			raise OSError(errno.EINVAL, 'Invalid argument')
 		monkeypatch.setattr(multiCMD, '_run_cli', run)
-	with pytest.raises(Ended):
-		multiCMD.main()
+	kind, install = einval_stdout
+	install()
+	if kind == 'pipe':
+		with pytest.raises(Ended):
+			multiCMD.main()
+	elif where == 'flush':
+		assert multiCMD.main() == 0
+		assert multiCMD._display.lost
+	else:
+		# ( what _run_cli raises is not a display write: an error other than a reader quitting is raised as before )
+		with pytest.raises(OSError):
+			multiCMD.main()
