@@ -743,7 +743,7 @@ def test_windows_einval_from_a_pipe_reaches_the_library_caller_as_broken_pipe_er
 			multiCMD.run_command([sys.executable, '-u', '-c', 'import time; print("a line"); time.sleep(0.3); print("another"); time.sleep(30)'])
 		assert raised.value.errno == errno.EPIPE
 		assert multiCMD._display.closed and not multiCMD._display.lost
-		# a command that prints nothing runs, before the reader was found gone and after, and nothing is raised
+		# a command that prints nothing runs once the reader was found gone, and nothing is raised
 		assert multiCMD.run_command(command, return_code_only=True) == 3
 		assert capfd.readouterr().err == ''
 	else:
@@ -789,6 +789,8 @@ def test_main_called_in_a_program_leaves_no_watch_behind(monkeypatch):
 	# 1.63 left the watch and the name set: a later quiet call of the program asked the pipe
 	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
 	monkeypatch.setattr(multiCMD, '_watch_stdout', Watched)
+	# ( main() installs the CLI's signal handlers, which would stay in the test process )
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', lambda: None)
 	monkeypatch.setattr(sys, 'argv', ['mcmd', '-n', 'true'])
 	assert multiCMD.main() == 0
 	assert multiCMD._display.watch is None and not multiCMD._display.cli

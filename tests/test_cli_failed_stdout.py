@@ -7,6 +7,7 @@ started, exit status 120.
 '''
 import errno
 import os
+import re
 import select
 import shlex
 import signal
@@ -503,7 +504,11 @@ def test_a_usage_error_goes_through_the_stderr_door_and_ends_2(monkeypatch, args
 	with pytest.raises(SystemExit) as ended:
 		multiCMD._run_cli()
 	assert ended.value.code == 2
-	assert len(said) == 1 and said[0].startswith('usage: mcmd ') and said[0].endswith('\nmcmd: error: ' + error)
+	assert len(said) == 1
+	# ( Python 3.14 colours the usage under FORCE_COLOR or PYTHON_COLORS=1 )
+	text = re.sub(r'\x1b\[[0-9;]*m', '', said[0])
+	assert text.startswith('usage: mcmd ')
+	assert text.endswith('\nmcmd: error: ' + error)
 
 
 @pytest.mark.parametrize('kwargs', [{}, {'max_threads': 2}], ids=['serial', 'pool'])
@@ -529,18 +534,27 @@ def test_a_program_that_imports_multicmd_still_meets_the_failed_write_at_exit(tm
 	assert done.returncode == 120
 
 
-# --- 1.64: no bare print left. Every write of multiCMD's own goes through the display's door ( stdout ) or _write_error ( stderr )
+# --- 1.64: no write of its own bypasses the two doors. Every write of multiCMD's own goes through the display's door ( stdout )
+# or _write_error ( stderr )
 
-def test_no_bare_print_is_left_in_multicmd():
-	# 1.63 had four: format_bytes()'s two lines and the countdown prompt's two frames
+def test_no_write_of_its_own_bypasses_the_two_doors():
+	# 1.63 had four bare prints: format_bytes()'s two lines and the countdown prompt's two frames; 1.62 had 23, and
+	# sys.stdout.write calls
 	import ast
 	tree = ast.parse(MULTICMD_PY.read_text(encoding='utf-8'))
 	bare = []
 	def visit(node, function):
 		if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
 			function = node.name
-		if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'print' and function != '_write_error':
-			bare.append((node.lineno, function))
+		if function != '_write_error':
+			# print in any use: a call, or passed on as a value ( partial(print, ... ) )
+			if isinstance(node, ast.Name) and node.id == 'print':
+				bare.append((node.lineno, function, 'print'))
+			# a write of its own to sys.stdout or sys.stderr ( the display writes through a local, in _Display._write )
+			if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ('write', 'writelines') \
+				and isinstance(node.func.value, ast.Attribute) and node.func.value.attr in ('stdout', 'stderr', '__stdout__', '__stderr__') \
+				and isinstance(node.func.value.value, ast.Name) and node.func.value.value.id == 'sys':
+				bare.append((node.lineno, function, 'sys.%s.write' % node.func.value.attr))
 		for child in ast.iter_child_nodes(node):
 			visit(child, function)
 	visit(tree, None)
@@ -609,8 +623,9 @@ def test_the_countdown_prompt_is_on_stderr_and_a_dead_stdout_raises_nothing(tmp_
 		env=dict(os.environ, PYTHONPATH=str(MULTICMD_PY.parent)))
 	os.close(write_end)
 	try:
-		err = proc.stderr.read().decode()
+		# ( its stderr is a few dozen bytes: it fits the pipe, and is read once the program has ended; a hang ends at the kill )
 		proc.wait(20)
+		err = proc.stderr.read().decode()
 	finally:
 		proc.stdin.close()
 		if proc.poll() is None:
