@@ -114,14 +114,17 @@ class _StdoutClosed(BaseException):0
 class _Display:
 	def __init__(self):self.lock=threading.Lock();self.redrawable=False;self.at_line_start=True;self.on_failed=None;self.closed=False;self.lost=False;self.watch=None
 	def _write(self,text):
-		if self.closed or self.lost:return
-		try:sys.stdout.write(text);sys.stdout.flush()
+		stdout=sys.stdout
+		if self.closed or self.lost or stdout is None:return
+		try:
+			try:stdout.write(text)
+			except UnicodeEncodeError:encoding=getattr(stdout,'encoding',None)or'ascii';stdout.write(text.encode(encoding,'backslashreplace').decode(encoding))
+			stdout.flush()
 		except OSError as e:
 			if self.on_failed is None:self.lose(e,'multiCMD')
 			else:self.on_failed(e)
 	def lose(self,error,name):self.lost=True;_write_error(f"{name}: cannot write to stdout ({error}): its output is dropped from here on")
-	def flush(self):
-		with self.lock:self._write('')
+	def flush(self):self._write('')
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
 		with self.lock:
@@ -250,9 +253,9 @@ class AsyncExecutor:
 		if print_error:
 			for task in self.tasks:
 				if not task._finalized:
-					if task.stop and task.thread is None:print(f"Command: {task.command} skipped: stopped before it started")
-					else:print(f"Command: {task.command} still running")
-				elif task.returncode not in(0,None):print(f"Command: {task.command} failed with return code: {task.returncode}");print('Stdout:');print('\n  '.join(task.stdout));print('Stderr:');print('\n  '.join(task.stderr))
+					if task.stop and task.thread is None:_display.message(f"Command: {task.command} skipped: stopped before it started")
+					else:_display.message(f"Command: {task.command} still running")
+				elif task.returncode not in(0,None):_display.message(f"Command: {task.command} failed with return code: {task.returncode}\nStdout:\n"+'\n  '.join(task.stdout)+'\nStderr:\n'+'\n  '.join(task.stderr))
 		return self.tasks
 	def get_results(self,with_stdErr=False):
 		if with_stdErr:return[task.stdout+task.stderr for task in self.tasks]
@@ -355,7 +358,7 @@ def set_sudo(use_sudo):
 	if not use_sudo:USE_SUDO=False;return
 	if getattr(os,'geteuid',lambda:1)()==0:USE_SUDO=False
 	elif SUDO_PATH:USE_SUDO=True
-	else:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);USE_SUDO=False
+	else:_write_error('sudo not found in PATH, cannot use sudo. ignoring it...');USE_SUDO=False
 class _ExecRefused(OSError):0
 def _uses_wrapper():return _IS_POSIX and not _HAS_PROCESS_GROUP and bool(sys.executable)and not getattr(sys,'frozen',False)
 def _search_dirs(env):path=(os.environ if env is None else env).get('PATH');return(os.defpath if path is None else path).split(os.pathsep)
@@ -517,13 +520,13 @@ def _resolve_pty(pty):
 	global _PTY_WARNED
 	if not pty:return False
 	if _IS_POSIX:return True
-	if not _PTY_WARNED:_PTY_WARNED=True;print('multiCMD: pty mode needs a POSIX system, using pipes',file=sys.stderr)
+	if not _PTY_WARNED:_PTY_WARNED=True;_write_error('multiCMD: pty mode needs a POSIX system, using pipes')
 	return False
 def _open_pty(reserved=0):
 	global _PTY_WARNED
 	try:import pty as _pty_module;master,slave=_pty_module.openpty()
 	except(ImportError,OSError)as e:
-		if not _PTY_WARNED:_PTY_WARNED=True;print(f"multiCMD: cannot open a pty ({e}), using pipes",file=sys.stderr)
+		if not _PTY_WARNED:_PTY_WARNED=True;_write_error(f"multiCMD: cannot open a pty ({e}), using pipes")
 		return None,None
 	try:import fcntl,struct,termios;attrs=termios.tcgetattr(slave);attrs[1]&=~termios.OPOST;termios.tcsetattr(slave,termios.TCSANOW,attrs);columns,rows=get_terminal_size()[:2];fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',rows,max(columns-reserved,20),0,0))
 	except Exception:pass
@@ -747,7 +750,7 @@ def _shell_template(template):
 def _build_tasks(commands,parse=False,use_sudo=...,shell=False,env=None,extra_env=None,pass_fds=()):
 	global USE_SUDO;global SUDO_PATH
 	if use_sudo is...:use_sudo=USE_SUDO
-	if use_sudo and not SUDO_PATH:print('sudo not found in PATH, cannot use sudo. ignoring it...',file=sys.stderr);use_sudo=False
+	if use_sudo and not SUDO_PATH:_write_error('sudo not found in PATH, cannot use sudo. ignoring it...');use_sudo=False
 	variables={};formatedCommands=[]
 	for command in commands:formatedCommands.extend(__format_command(command,expand=parse,shell=shell,variables=variables))
 	if use_sudo:formatedCommands=[[SUDO_PATH]+command for command in formatedCommands]
@@ -756,7 +759,7 @@ def _build_tasks(commands,parse=False,use_sudo=...,shell=False,env=None,extra_en
 	return tasks,bool(use_sudo)
 def _validate_sudo():
 	try:subprocess.run([SUDO_PATH,'-v'])
-	except OSError as e:print(f"sudo validation failed: {e}",file=sys.stderr)
+	except OSError as e:_write_error(f"sudo validation failed: {e}")
 def __format_command(command,expand=False,shell=False,variables=None):
 	if variables is None:variables={}
 	if isinstance(command,str):
@@ -880,12 +883,13 @@ def _stdout_failed(error):
 		_display.closed=True
 		if _thread.get_ident()==threading.main_thread().ident:raise _StdoutClosed()
 		return
+	_point_at_devnull(sys.stdout);_display.lose(error,'mcmd')
+def _point_at_devnull(stream):
 	try:
 		devnull=os.open(os.devnull,os.O_WRONLY)
-		try:os.dup2(devnull,sys.stdout.fileno())
+		try:os.dup2(devnull,stream.fileno())
 		finally:os.close(devnull)
-	except(AttributeError,OSError,ValueError):pass
-	_display.lose(error,'mcmd')
+	except OSError:pass
 def _end_by_closed_stdout():
 	_kill_running_at_exit()
 	try:sys.stderr.flush()
@@ -945,14 +949,14 @@ def main():
 	_display.on_failed=_stdout_failed;_display.watch=_watch_stdout()
 	try:
 		try:status=_run_cli()
-		finally:
-			if sys.stdout is not None:_display.flush()
+		finally:_display.flush();_flush_stderr()
 		if _display.closed:raise _StdoutClosed()
 	except _StdoutClosed:_end_by_closed_stdout()
-	except OSError as e:
-		if not _no_reader(e):raise
-		_end_by_closed_stdout()
 	return status
+def _flush_stderr():
+	if sys.stderr is None:return
+	try:sys.stderr.flush()
+	except OSError:_point_at_devnull(sys.stderr)
 def _run_cli():
 	parser=argparse.ArgumentParser(description='Run multiple commands in parallel',epilog=_EXIT_STATUS_HELP,formatter_class=argparse.RawDescriptionHelpFormatter);parser.add_argument('commands',metavar='command',type=str,nargs='*',help='commands to run ( with -a: templates, {} is replaced by each input line )');parser.add_argument('-p','--parse',action='store_true',help='Parse ranged input and expand them into multiple commands');parser.add_argument('-t','--timeout',metavar='SECONDS',type=float,default=0,help='kill a command after SECONDS with no output at all ( 0 = never, the default )');parser.add_argument('-m','--max_threads',metavar='max_threads',type=int,default=1,help='maximum number of commands to run at once ( 0 = all )');parser.add_argument('--sudo',action='store_true',help='use sudo for commands');parser.add_argument('-q','--quiet',action='store_true',help='quiet mode: hide command output ( the summary still shows )');parser.add_argument('-n','--dry-run',action='store_true',help='print each command, quoted, instead of running it');parser.add_argument('--shell',action='store_true',help='run each command through /bin/sh -c ( pipes, ;, > and globs work )');parser.add_argument('-e','--env',metavar='NAME=VALUE',action='append',help='set NAME to VALUE in the environment of every command ( repeatable ); NAME alone removes it');parser.add_argument('-f','--file',metavar='FILE',action='append',help='read commands from FILE, one per line ( - for stdin; blank lines and # comments are skipped )');parser.add_argument('-a','--arg-file',metavar='FILE',action='append',help='run each command template once per line of FILE, with {} replaced by the line ( - for stdin )');summary=parser.add_mutually_exclusive_group();summary.add_argument('--summary',dest='summary',action='store_const',const='all',help='list every command in the end-of-run summary ( default: only failed ones )');summary.add_argument('--no-summary',dest='summary',action='store_const',const='none',help='do not print the end-of-run summary');parser.add_argument('--no-prefix',action='store_true',help='do not prefix output lines with [#] when commands run at once');parser.add_argument('--no-color',action='store_true',help='do not color output lines per command');pty_mode=parser.add_mutually_exclusive_group();pty_mode.add_argument('--pty',dest='pty',action='store_true',help='give commands a pseudo-terminal so they print live ( default when stdout is a terminal )');pty_mode.add_argument('--no-pty',dest='pty',action='store_false',help='give commands plain pipes');parser.set_defaults(summary='failed',pty=None);parser.add_argument('-V','--version',action='version',version=f"%(prog)s {version} @ {COMMIT_DATE} by pan@zopyr.us");args=parser.parse_args()
 	if not args.commands and not args.file:parser.error('no commands given')
@@ -966,10 +970,10 @@ def _run_cli():
 	set_sudo(args.sudo);_install_cli_signal_handlers()
 	try:
 		commands=_cli_commands(args)
-		if not commands:print('mcmd: no commands to run',file=sys.stderr);return 2
+		if not commands:_write_error('mcmd: no commands to run');return 2
 		use_pty=args.pty if args.pty is not None else _IS_POSIX and _stdout_isatty()and not args.quiet and not args.dry_run;tasks=run_commands(commands,timeout=args.timeout,max_threads=args.max_threads,quiet=args.quiet and not args.dry_run,dry_run=args.dry_run,with_stdErr=True,return_object=True,prefix=not args.no_prefix,color=False if args.no_color else None,pty=use_pty,extra_env=extra_env or None)
-	except(OSError,ValueError)as e:print(f"mcmd: {e}",file=sys.stderr);return 2
-	except KeyboardInterrupt:print('\nInterrupted',file=sys.stderr);return 130
+	except(OSError,ValueError)as e:_write_error(f"mcmd: {e}");return 2
+	except KeyboardInterrupt:_write_error('\nInterrupted');return 130
 	if args.dry_run:return 0
 	if len(tasks)>1 and args.summary!='none':_display.message(_summary(tasks,show_all=args.summary=='all'))
 	return _exit_status(tasks)
@@ -1118,10 +1122,10 @@ def _writable(text,stream):
 def print_progress_bar(iteration,total,prefix='',suffix=''):
 	prefix+=' |'if not prefix.endswith(' |')else'';suffix=f"| {suffix}"if not suffix.startswith('| ')else suffix
 	try:
-		columns,_=get_terminal_size();sys.stdout.write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout));sys.stdout.flush()
-		if iteration==total and total>0:print(file=sys.stdout)
+		columns,_=get_terminal_size();_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
+		if iteration==total and total>0:_display._write('\n')
 	except Exception:
-		if iteration%5==0:print(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout))
+		if iteration%5==0:_display._write(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout)+'\n')
 def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):
 	if to_int or isinstance(size,str):
 		if isinstance(size,int):return size

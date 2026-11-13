@@ -1,4 +1,5 @@
 import errno
+import io
 import sys
 
 import pytest
@@ -206,3 +207,26 @@ def test_on_failed_may_raise_in_the_writing_thread(monkeypatch):
 		display.message('header')
 	assert display.closed
 	assert display.lock.acquire(False)
+
+
+def test_text_the_stdout_encoding_cannot_take_is_written_with_backslash_escapes(monkeypatch):
+	# a command's output with an accent, on an ASCII stdout ( Python 3.6 in a C locale ): UnicodeEncodeError killed its reader
+	raw = io.BytesIO()
+	stdout = io.TextIOWrapper(raw, encoding='ascii', errors='strict', write_through=True)
+	monkeypatch.setattr(sys, 'stdout', stdout)
+	display = multiCMD._Display()
+	display.message('header')
+	display.lines(['caf\u00e9', 'plain'])
+	assert raw.getvalue() == b'header\n\ncaf\\xe9\nplain'
+	assert not display.lost
+
+
+def test_a_stdout_that_is_none_drops_the_output_silently(monkeypatch, capfd):
+	# `mcmd ... >&-` ( and pythonw ): print() ignores it, and so does the display, so every command runs
+	monkeypatch.setattr(sys, 'stdout', None)
+	display = multiCMD._Display()
+	display.message('header')
+	display.lines(['a'])
+	display.flush()
+	assert not display.lost and not display.closed
+	assert capfd.readouterr() == ('', '')

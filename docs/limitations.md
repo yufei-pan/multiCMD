@@ -221,9 +221,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   `mcmd`'s stdout is a socket, which 1.62 does not ask (only a pipe is). A reader that quits while the commands print nothing
   stops nothing until the next write, or until the commands end, as in 1.61: with ksh 93u+m on Debian 13,
   `mcmd 'sleep 3' | head -1` ended by SIGPIPE after 3.04 s and `mcmd -q 'sleep 3' | sleep 0.3` ended 0 after 3.05 s (bash,
-  dash, zsh, mksh and busybox on Linux, and macOS's ksh, give a pipe: those end at once). A write that fails still ends the
-  run, as in 1.61. The README says so in one clause. EL7 and EL8 ship ksh-20120801, from the same AT&T code: whether it does
-  the same is not checked.
+  dash, zsh, mksh and busybox on Linux, and macOS's ksh, give a pipe: those end at once). A write that finds the reader
+  gone still ends the run, as in 1.61. The README says so in one clause. EL7 and EL8 ship ksh-20120801, from the same AT&T
+  code: whether it does the same is not checked.
 - Why: asking a socket on Linux too would bring back a platform-by-kind branch in `_watch_stdout`, the kind that made the
   first poll stop jobs it should not (a hung-up terminal, a half-closed socket on macOS), for one shell's pipes.
 - Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.

@@ -27,9 +27,11 @@ has_dev_full = pytest.mark.skipif(not os.path.exists('/dev/full'), reason='needs
 LOST = 'mcmd: cannot write to stdout'
 
 
-def job(tmp_path, index, lines=10, status=0):
-	# writes its pid, prints for about lines * 50 ms, leaves done<index> and exits with status
-	script = (f'echo $$ > {tmp_path}/pid{index}; i=0; while [ $i -lt {lines} ]; do echo x{index}; sleep 0.05; i=$((i+1)); done; '
+def job(tmp_path, index, lines=10, status=0, wait=False):
+	# writes its pid, with wait waits for the test's go file, prints for about lines * 50 ms, leaves done<index> and exits
+	# with status
+	pause = f'while [ ! -e {tmp_path}/go ]; do sleep 0.02; done; ' if wait else ''
+	script = (f'echo $$ > {tmp_path}/pid{index}; {pause}i=0; while [ $i -lt {lines} ]; do echo x{index}; sleep 0.05; i=$((i+1)); done; '
 		f'touch {tmp_path}/done{index}; exit {status}')
 	return 'sh -c ' + shlex.quote(script)
 
@@ -66,23 +68,27 @@ def read_until(fd, marker, timeout=20):
 	return data
 
 
-def run_on_a_terminal_that_hangs_up(tmp_path, args):
+def run_on_a_terminal_that_hangs_up(tmp_path, args, stderr_on_terminal=False):
 	'''
-	The CLI with a terminal for stdout, in a session of its own ( `setsid mcmd ...`, or a job the hangup sends no SIGHUP ):
-	the terminal hangs up ( its master closes ) once the first command is running; its status and stderr
+	The CLI with a terminal for stdout ( and for stderr, if stderr_on_terminal: its stderr is then not read, and is '' ), in a
+	session of its own ( `setsid mcmd ...`, or a job the hangup sends no SIGHUP ): the terminal hangs up ( its master closes )
+	once the first command is running; its status and stderr
+	The commands wait for the go file ( see job() ), which this creates once the terminal is gone, so that the first write
+	after the hang-up is certain, however long the test took to close it.
 	'''
 	import pty
 	master, slave = pty.openpty()
 	try:
 		proc = subprocess.Popen([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=slave,
-			stderr=subprocess.PIPE, start_new_session=True)
+			stderr=slave if stderr_on_terminal else subprocess.PIPE, start_new_session=True)
 		os.close(slave)
 		slave = -1
 		try:
-			read_until(master, b'Running command')
+			assert b'Running command' in read_until(master, b'Running command')
 			wait_for_pidfiles(tmp_path, 1)
 			os.close(master)
 			master = -1
+			(tmp_path / 'go').write_text('')
 			return finish(proc)
 		finally:
 			if proc.poll() is None:
@@ -95,6 +101,7 @@ def run_on_a_terminal_that_hangs_up(tmp_path, args):
 
 
 @posix_only
+@pytest.mark.parametrize('stderr', ['pipe', 'terminal'])
 @pytest.mark.parametrize('options, kinds, status', [
 	pytest.param([], ['job', 'job3'], 1, id='serial'),
 	pytest.param(['-m', '2'], ['job', 'job', 'flood', 'job'], 0, id='pool'),
@@ -102,17 +109,20 @@ def run_on_a_terminal_that_hangs_up(tmp_path, args):
 	pytest.param(['--no-pty'], ['job', 'flood', 'job'], 0, id='no-pty'),
 	pytest.param(['-m', '2', '--no-pty', '--summary'], ['job', 'job3', 'job'], 1, id='pool-no-pty'),
 ])
-def test_a_terminal_that_hung_up_loses_the_output_and_every_command_runs(tmp_path, options, kinds, status):
+def test_a_terminal_that_hung_up_loses_the_output_and_every_command_runs(tmp_path, options, kinds, status, stderr):
+	# stderr on the terminal too ( `mcmd ... > log 2>&1` on one ): the line that says the output was lost fails as well, and
+	# must not end the run with 120 at exit
 	commands = []
 	for index, kind in enumerate(kinds, 1):
 		if kind == 'flood':
 			commands.append(flood(tmp_path, index))
 		else:
-			commands.append(job(tmp_path, index, status=3 if kind == 'job3' else 0))
-	got, err = run_on_a_terminal_that_hangs_up(tmp_path, options + commands)
+			commands.append(job(tmp_path, index, status=3 if kind == 'job3' else 0, wait=True))
+	got, err = run_on_a_terminal_that_hangs_up(tmp_path, options + commands, stderr_on_terminal=stderr == 'terminal')
 	assert done(tmp_path) == list(range(1, len(kinds) + 1))
 	assert got == status
-	assert len(lost_lines(err)) == 1 and LOST in err and '[Errno %d]' % errno.EIO in err
+	if stderr == 'pipe':
+		assert len(lost_lines(err)) == 1 and LOST in err and '[Errno %d]' % errno.EIO in err
 
 
 @posix_only
@@ -142,11 +152,12 @@ def test_a_quiet_run_on_a_terminal_that_hung_up_writes_nothing_and_says_nothing(
 	assert done(tmp_path) == [1]
 
 
-def run_with_stdout(path, args, timeout=60):
-	with open(path, 'wb') as out:
+def run_with_stdout(path, args, timeout=60, stderr_path=None):
+	'''The CLI with stdout on path, and stderr on stderr_path or a pipe; its status and stderr ( '' for a stderr_path )'''
+	with open(path, 'wb') as out, open(stderr_path or os.devnull, 'wb') as err:
 		proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=out,
-			stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
-	return proc.returncode, proc.stderr
+			stderr=err if stderr_path else subprocess.PIPE, universal_newlines=True, timeout=timeout)
+	return proc.returncode, proc.stderr or ''
 
 
 @has_dev_full
@@ -163,6 +174,71 @@ def test_a_full_disk_under_stdout_loses_the_output_and_every_command_runs(tmp_pa
 	assert done(tmp_path) == list(range(1, count + 1))
 	assert got == status
 	assert len(lost_lines(err)) == 1 and LOST in err and '[Errno %d]' % errno.ENOSPC in err
+
+
+@has_dev_full
+@posix_only
+@pytest.mark.parametrize('options, count, failing, status', [
+	pytest.param([], 3, 0, 0, id='serial'),
+	pytest.param(['-m', '2'], 5, 2, 1, id='pool'),
+	pytest.param(['-q', '-m', '2'], 4, 2, 1, id='quiet-pool'),
+	pytest.param(['--no-pty'], 1, 1, 3, id='one'),
+])
+def test_a_full_disk_under_stdout_and_stderr_ends_with_the_commands_status(tmp_path, options, count, failing, status):
+	# `mcmd ... > log 2>&1` on a full disk, which includes the README's `nohup mcmd -q ... > log 2>&1 &`: the line that says the
+	# output was lost stays in stderr's buffer, and Python's flush at exit failed with it: status 120
+	commands = [job(tmp_path, i, lines=2, status=3 if i == failing else 0) for i in range(1, count + 1)]
+	got, _ = run_with_stdout('/dev/full', options + commands, stderr_path='/dev/full')
+	assert done(tmp_path) == list(range(1, count + 1))
+	assert got == status
+
+
+@has_dev_full
+@pytest.mark.parametrize('args', [['-h'], ['-V']], ids=['help', 'version'])
+def test_a_full_disk_under_stdout_and_stderr_ends_0_for_help_and_version(args):
+	assert run_with_stdout('/dev/full', args, stderr_path='/dev/full')[0] == 0
+
+
+@posix_only
+@pytest.mark.parametrize('dead', ['full', 'closed-pipe'])
+@pytest.mark.parametrize('args, status', [
+	pytest.param(['no-such-command-xyz'], 127, id='not-found'),
+	pytest.param(['-f', os.devnull], 2, id='no-commands'),
+])
+def test_a_stderr_that_cannot_be_written_changes_no_exit_status(tmp_path, dead, args, status):
+	# the message that cannot be written is dropped ( 1.62 and 1.63: 120, from Python's flush at exit; or a traceback and 1 for
+	# the usage error )
+	if dead == 'full':
+		if not os.path.exists('/dev/full'):
+			pytest.skip('needs /dev/full')
+		with open('/dev/full', 'wb') as full:
+			proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+				stderr=full, timeout=60)
+	else:
+		read_end, write_end = os.pipe()
+		os.close(read_end)
+		try:
+			proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL,
+				stdout=subprocess.DEVNULL, stderr=write_end, timeout=60)
+		finally:
+			os.close(write_end)
+	assert proc.returncode == status
+
+
+@posix_only
+@pytest.mark.parametrize('options, count, failing, status', [
+	pytest.param([], 2, 0, 0, id='serial'),
+	pytest.param(['-m', '2'], 3, 2, 1, id='pool'),
+	pytest.param(['-q', '-m', '2'], 3, 2, 1, id='quiet-pool'),
+])
+def test_a_stdout_closed_at_start_drops_the_output_and_every_command_runs(tmp_path, options, count, failing, status):
+	# `mcmd ... >&-`: sys.stdout is None. 1.62 and 1.63: "Error running command" and a traceback, the commands not run ( a
+	# serial run ), or a traceback at the summary
+	commands = [job(tmp_path, i, lines=2, status=3 if i == failing else 0) for i in range(1, count + 1)]
+	proc = subprocess.run(['sh', '-c', 'exec "$@" >&-', 'sh', sys.executable, str(MULTICMD_PY), *options, *commands],
+		stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
+	assert done(tmp_path) == list(range(1, count + 1))
+	assert (proc.returncode, proc.stderr) == (status, '')
 
 
 @has_dev_full
@@ -223,6 +299,33 @@ def test_a_socket_its_peer_reset_ends_the_cli_by_sigpipe_and_stops_its_commands(
 	assert all(pid_gone(pid) for pid in pids_in(tmp_path))
 
 
+@posix_only
+def test_a_stdout_that_cannot_take_what_a_command_prints_loses_only_the_characters(tmp_path):
+	# an ASCII stdout ( Python 3.6 in a C locale, and later ones with the coercion and the UTF-8 mode off ) gets the text with
+	# backslash escapes: the reader thread used to die of the UnicodeEncodeError, and with it the command's pipe
+	env = dict(os.environ, LC_ALL='C', PYTHONCOERCECLOCALE='0', PYTHONUTF8='0')
+	env.pop('PYTHONIOENCODING', None)
+	argv = [sys.executable, '-c', 'import sys; sys.stdout.buffer.write("caf\\u00e9\\n".encode()); sys.stdout.flush()']
+	with open(tmp_path / 'out', 'wb') as out:
+		proc = subprocess.run([sys.executable, str(MULTICMD_PY), ' '.join(shlex.quote(a) for a in argv)], stdin=subprocess.DEVNULL,
+			stdout=out, stderr=subprocess.PIPE, env=env, timeout=60)
+	assert (proc.returncode, proc.stderr) == (0, b'')
+	assert b'caf\\xe9' in (tmp_path / 'out').read_bytes()
+
+
+def test_the_exit_does_not_wait_for_a_display_lock_a_ctrl_c_left_held():
+	# the approved limitation ( docs/limitations.md: a Ctrl-C as a lock is taken can leave it held ) promises the exit does not
+	# hang: 1.63's first build flushed under that lock, and a run that returned 130 waited for ever
+	code = ('import sys; sys.path.insert(0, %r); import multiCMD; multiCMD._display.lock.acquire(); '
+		'multiCMD._run_cli = lambda: 130; sys.exit(multiCMD.main())' % str(MULTICMD_PY.parent))
+	try:
+		proc = subprocess.run([sys.executable, '-c', code], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE, timeout=30)
+	except subprocess.TimeoutExpired:
+		pytest.fail('main() waited for a display lock nobody will release')
+	assert (proc.returncode, proc.stderr) == (130, b'')
+
+
 # in this process
 
 
@@ -249,7 +352,9 @@ class FailingStdout:
 	pytest.param(OSError(errno.ENOSPC, 'No space left on device'), False, id='ENOSPC'),
 	pytest.param(OSError(errno.EINVAL, 'Invalid argument'), False, id='EINVAL-posix'),
 ])
-def test_what_a_reader_that_quit_is(error, reader_quit):
+def test_what_a_reader_that_quit_is(monkeypatch, error, reader_quit):
+	# ( POSIX: on Windows EINVAL is a reader that quit for a pipe, as the next test checks )
+	monkeypatch.setattr(multiCMD, '_IS_POSIX', True)
 	assert multiCMD._no_reader(error) is reader_quit
 
 
@@ -301,5 +406,31 @@ def test_the_library_runs_every_command_when_stdout_fails(tmp_path, monkeypatch,
 		monkeypatch.undo()
 		os.close(fd)
 	assert [(task.returncode, task.stdout) for task in tasks] == [(0, [str(i)]) for i in range(4)]
+	err = capfd.readouterr().err
+	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1
+
+
+@pytest.mark.parametrize('call', ['bar', 'bar-fallback', 'join'])
+def test_the_bar_and_the_failure_report_lose_the_output_when_stdout_fails(tmp_path, monkeypatch, capfd, call):
+	# they wrote with a bare print() or sys.stdout.write(): a terminal that hung up raised OSError in the caller ( hpcp's bar )
+	fd = os.open(str(tmp_path / 'out'), os.O_WRONLY | os.O_CREAT)
+	try:
+		monkeypatch.setattr(sys, 'stdout', FailingStdout(fd, OSError(errno.EIO, 'Input/output error')))
+		if call == 'bar':
+			for i in range(1, 4):
+				multiCMD.print_progress_bar(i, 3)
+		elif call == 'bar-fallback':
+			# the plain line the bar falls back to when it cannot draw ( every fifth call )
+			monkeypatch.setattr(multiCMD, 'get_terminal_size', lambda: 1 / 0)
+			multiCMD.print_progress_bar(5, 10)
+			multiCMD.print_progress_bar(10, 10)
+		else:
+			executor = multiCMD.AsyncExecutor(quiet=True)
+			executor.run_command(['false'])
+			executor.join()
+			assert executor.get_return_codes() == [1]
+	finally:
+		monkeypatch.undo()
+		os.close(fd)
 	err = capfd.readouterr().err
 	assert err.count('multiCMD: cannot write to stdout') == 1 and len(lost_lines(err)) == 1

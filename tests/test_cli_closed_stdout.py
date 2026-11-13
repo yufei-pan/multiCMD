@@ -52,7 +52,7 @@ def finish(proc):
 		proc.kill()
 		proc.communicate()
 		pytest.fail('the CLI did not end 30 s after its reader quit')
-	return proc.returncode, err.decode(errors='replace')
+	return proc.returncode, (err or b'').decode(errors='replace')
 
 
 def pids_in(tmp_path):
@@ -726,7 +726,7 @@ def end_by_closed_stdout():
 
 
 @pytest.mark.parametrize('where', ['flush', 'run'])
-def test_main_ends_the_process_on_einval_from_a_stdout_pipe_on_windows(monkeypatch, einval_stdout, where):
+def test_main_on_windows_ends_the_process_for_einval_from_a_stdout_pipe_only(monkeypatch, einval_stdout, where):
 	# the final flush, or argparse writing its help or usage to the closed pipe; on a file it is not a reader that quit
 	monkeypatch.setattr(multiCMD, '_IS_POSIX', False)
 	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)

@@ -454,11 +454,13 @@ class _Display:
 	line. redrawable is True when that last line ended with '\r': the next line that replaces a
 	'\r' line, from any command, then overwrites it in place, and anything else starts a new line.
 
-	A write that fails never raises. It loses the output ( lose ): every later write is dropped, one line on stderr says so,
-	and the commands run on, as their readers keep reading. That is all a program that imports multiCMD gets, whatever the
-	error: its own writes to that stdout meet it themselves. The CLI sets on_failed ( _stdout_failed ), which gets the error
-	instead, in the thread that wrote, with the lock held: it sets closed for a reader that quit ( see _no_reader ), and
-	loses the output for anything else.
+	In the library a write that fails never raises. It loses the output ( lose ): every later write is dropped, one line on
+	stderr says so, and the commands run on, as their readers keep reading. That is all a program that imports multiCMD gets,
+	whatever the error: its own writes to that stdout meet it themselves, and so does Python's flush at exit, which still finds
+	what the failed write left in sys.stdout's buffer ( "Exception ignored" and exit status 120, unless the program handles it:
+	a library does not redirect its caller's stdout ). The CLI sets on_failed ( _stdout_failed ), which gets the error instead,
+	in the thread that wrote, with the lock held: it sets closed for a reader that quit ( see _no_reader ), and loses the output
+	for anything else. A stdout that is None ( closed at start ) drops the output silently, as print() does.
 	@attributes:
 		on_failed: Called with the OSError by the thread whose write failed ( None: lose )
 		closed: Whether stdout's reader quit, as the CLI's write or watch found it: the CLI stops its commands; writes dropped
@@ -477,13 +479,21 @@ class _Display:
 
 	def _write(self, text):
 		'''
-		Write text to stdout and flush it, with the lock held ( internal )
+		Write text to stdout and flush it, with the lock held ( internal ): lines(), message() and settle() take it; the final flush
+		of main() and print_progress_bar() do not, which a lock a Ctrl-C left held must not hang
+		Text the stdout's encoding cannot take ( Python 3.6 in a C locale: ASCII ) is written with backslash escapes, as a
+		command's undecodable bytes are read ( _read_stream ), so no reader dies of it
 		'''
-		if self.closed or self.lost:
+		stdout = sys.stdout
+		if self.closed or self.lost or stdout is None:
 			return
 		try:
-			sys.stdout.write(text)
-			sys.stdout.flush()
+			try:
+				stdout.write(text)
+			except UnicodeEncodeError:
+				encoding = getattr(stdout, 'encoding', None) or 'ascii'
+				stdout.write(text.encode(encoding, 'backslashreplace').decode(encoding))
+			stdout.flush()
 		except OSError as e:
 			if self.on_failed is None:
 				self.lose(e, 'multiCMD')
@@ -500,9 +510,11 @@ class _Display:
 	def flush(self):
 		'''
 		Flush stdout as a write does, so that what another writer left in its buffer ( argparse ) meets the same rule ( internal )
+		For main() at exit, without the lock: by then the run's threads have finished, or a stop gave up on them, and a lock a
+		signal left held ( docs/limitations.md ) must not hang the exit. A reader a stop gave up on may write meanwhile: at worst
+		a second line on stderr says the output was lost.
 		'''
-		with self.lock:
-			self._write('')
+		self._write('')
 
 	def lines(self, texts, decor=('', '', ''), replace_first=False, ends_with_cr=False):
 		'''
@@ -953,17 +965,15 @@ class AsyncExecutor:
 		self.wait(timeout=timeout, threads=threads)
 		if print_error:
 			for task in self.tasks:
+				# ( through the display: a stdout that fails loses the report, it does not raise out of join )
 				if not task._finalized:
 					if task.stop and task.thread is None:
-						print(f'Command: {task.command} skipped: stopped before it started')
+						_display.message(f'Command: {task.command} skipped: stopped before it started')
 					else:
-						print(f'Command: {task.command} still running')
+						_display.message(f'Command: {task.command} still running')
 				elif task.returncode not in (0, None):
-					print(f'Command: {task.command} failed with return code: {task.returncode}')
-					print('Stdout:')
-					print('\n  '.join(task.stdout))
-					print('Stderr:')
-					print('\n  '.join(task.stderr))
+					_display.message(f'Command: {task.command} failed with return code: {task.returncode}\n'
+						'Stdout:\n' + '\n  '.join(task.stdout) + '\nStderr:\n' + '\n  '.join(task.stderr))
 		return self.tasks
 	
 	def get_results(self, with_stdErr=False):
@@ -1247,7 +1257,7 @@ def set_sudo(use_sudo):
 	elif SUDO_PATH:
 		USE_SUDO = True
 	else:
-		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+		_write_error("sudo not found in PATH, cannot use sudo. ignoring it...")
 		USE_SUDO = False
 
 class _ExecRefused(OSError):
@@ -1786,7 +1796,7 @@ def _resolve_pty(pty):
 		return True
 	if not _PTY_WARNED:
 		_PTY_WARNED = True
-		print('multiCMD: pty mode needs a POSIX system, using pipes', file=sys.stderr)
+		_write_error('multiCMD: pty mode needs a POSIX system, using pipes')
 	return False
 
 def _open_pty(reserved=0):
@@ -1807,7 +1817,7 @@ def _open_pty(reserved=0):
 	except (ImportError, OSError) as e:
 		if not _PTY_WARNED:
 			_PTY_WARNED = True
-			print(f'multiCMD: cannot open a pty ({e}), using pipes', file=sys.stderr)
+			_write_error(f'multiCMD: cannot open a pty ({e}), using pipes')
 		return None, None
 	try:
 		import fcntl
@@ -2324,8 +2334,8 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 
 def _write_error(text):
 	'''
-	Write a failure message to stderr ( internal ): one that cannot be written ( stderr closed, a broken pipe ) is
-	dropped, as the failure it is about is already recorded on the task
+	Write a failure message or a warning to stderr ( internal ): one that cannot be written ( stderr closed, a broken pipe, a
+	full disk ) is dropped, as the failure it is about is already recorded on the task and a dead stderr changes no exit status
 	'''
 	try:
 		print(text, file=sys.stderr, flush=True)
@@ -2481,7 +2491,7 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 	# Guard against requesting sudo when it is not available. Without this,
 	# prepending a None SUDO_PATH would crash subprocess.Popen with a TypeError.
 	if use_sudo and not SUDO_PATH:
-		print("sudo not found in PATH, cannot use sudo. ignoring it...", file=sys.stderr)
+		_write_error("sudo not found in PATH, cannot use sudo. ignoring it...")
 		use_sudo = False
 	# split the commands in commands if it is a string
 	# one set of range variables per batch: shared by its commands, never by the next call
@@ -2514,7 +2524,7 @@ def _validate_sudo():
 	try:
 		subprocess.run([SUDO_PATH, '-v'])
 	except OSError as e:
-		print(f'sudo validation failed: {e}', file=sys.stderr)
+		_write_error(f'sudo validation failed: {e}')
 
 def __format_command(command,expand = False,shell = False,variables = None):
 	'''
@@ -2932,24 +2942,31 @@ def _stdout_failed(error):
 	thread leaves the flag to the main thread's waits ( _raise_if_stdout_closed ). Any other failure ( EIO from a terminal that
 	hung up, ENOSPC from a full disk ) loses the output and nothing else, as in the library ( _Display.lose ): every later
 	write is dropped, the commands run on, queued ones too, their readers draining as before, and one line on stderr says so.
-	The CLI also points stdout's descriptor at os.devnull, so that what the failed write left in Python's buffer goes there at
-	exit, instead of failing again ( "Exception ignored" and exit status 120, in place of the commands' own ).
+	The CLI also points stdout's descriptor at os.devnull ( _point_at_devnull ), so that what the failed write left in Python's
+	buffer goes there at exit, instead of failing again ( "Exception ignored" and exit status 120, in place of the commands' own ).
 	'''
 	if _no_reader(error):
 		_display.closed = True
 		if _thread.get_ident() == threading.main_thread().ident:
 			raise _StdoutClosed()
 		return
+	_point_at_devnull(sys.stdout)
+	_display.lose(error, 'mcmd')
+
+def _point_at_devnull(stream):
+	'''
+	Point stream's descriptor at os.devnull ( the CLI's stdout or stderr, once a write to it failed ), so that what the failed
+	write left in Python's buffer goes there at exit, instead of failing again ( internal )
+	'''
 	try:
 		devnull = os.open(os.devnull, os.O_WRONLY)
 		try:
-			os.dup2(devnull, sys.stdout.fileno())
+			os.dup2(devnull, stream.fileno())
 		finally:
 			os.close(devnull)
-	except (AttributeError, OSError, ValueError):
+	except OSError:
 		# ( no descriptor to point elsewhere: the writes are dropped all the same )
 		pass
-	_display.lose(error, 'mcmd')
 
 def _end_by_closed_stdout():
 	'''
@@ -3096,7 +3113,9 @@ def main():
 	The command line ( see _run_cli ). Output that nobody reads any more ( `mcmd ... | head` ) is taken as an interrupt: every
 	command is stopped, as a Ctrl-C stops them, and the process ends by SIGPIPE with nothing on stderr
 	( _end_by_closed_stdout ). A write to stdout that fails for any other reason ( a terminal that hung up, a full disk ) only
-	loses the output: every command runs, one line on stderr says so, and the exit status is theirs ( _stdout_failed ).
+	loses the output: every command runs, one line on stderr says so, and the exit status is theirs ( _stdout_failed ). A
+	stderr that cannot be written changes no exit status either: its messages are dropped ( _write_error ), and at exit its
+	descriptor is pointed at os.devnull, since Python's flush of what stderr could not write would end the process with 120.
 	The library's functions only lose the output, whatever the error ( see _Display ): they have no run of their own to end.
 	@returns:
 		int: The exit status
@@ -3107,20 +3126,29 @@ def main():
 		try:
 			status = _run_cli()
 		finally:
-			# what argparse's -h and -V left in the buffer, under the same rule: Python's own flush at exit would fail with a
-			# message and status 120
-			if sys.stdout is not None:
-				_display.flush()
+			# what argparse's -h and -V left in the buffer, under the same rule ( Python's own flush at exit would fail with a
+			# message and status 120 ), and what stderr could not take ( the line that says the output was lost, or a message of
+			# a command that could not run ), for the same reason
+			_display.flush()
+			_flush_stderr()
 		if _display.closed:
 			# a reader found it closed as the run ended, and no wait looked again
 			raise _StdoutClosed()
 	except _StdoutClosed:
 		_end_by_closed_stdout()
-	except OSError as e:
-		if not _no_reader(e):
-			raise
-		_end_by_closed_stdout()
 	return status
+
+def _flush_stderr():
+	'''
+	Flush stderr; if it cannot be written, point its descriptor at os.devnull ( the CLI's, at exit ), so that Python's flush at
+	exit does not fail with it ( exit status 120 in place of the commands' own ) ( internal )
+	'''
+	if sys.stderr is None:
+		return
+	try:
+		sys.stderr.flush()
+	except OSError:
+		_point_at_devnull(sys.stderr)
 
 def _run_cli():
 	parser = argparse.ArgumentParser(description='Run multiple commands in parallel', epilog=_EXIT_STATUS_HELP,
@@ -3166,7 +3194,7 @@ def _run_cli():
 	try:
 		commands = _cli_commands(args)
 		if not commands:
-			print('mcmd: no commands to run', file=sys.stderr)
+			_write_error('mcmd: no commands to run')
 			return 2
 		use_pty = args.pty if args.pty is not None else (_IS_POSIX and _stdout_isatty() and not args.quiet and not args.dry_run)
 		tasks = run_commands(commands, timeout=args.timeout, max_threads=args.max_threads,
@@ -3175,10 +3203,10 @@ def _run_cli():
 			prefix=not args.no_prefix, color=False if args.no_color else None, pty=use_pty,
 			extra_env=extra_env or None)
 	except (OSError, ValueError) as e:
-		print(f'mcmd: {e}', file=sys.stderr)
+		_write_error(f'mcmd: {e}')
 		return 2
 	except KeyboardInterrupt:
-		print('\nInterrupted', file=sys.stderr)
+		_write_error('\nInterrupted')
 		return 130
 	if args.dry_run:
 		return 0
@@ -3530,15 +3558,17 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
 	prefix += ' |' if not prefix.endswith(' |') else ''
 	suffix = f'| {suffix}' if not suffix.startswith('| ') else suffix
+	# Through the display's _write, so a stdout that fails ( a terminal that hung up ) loses the bar, as any output, and raises
+	# nothing in the caller. Without its lock: the bar is drawn from the caller's main thread in a loop, where a Ctrl-C that left
+	# the lock held ( docs/limitations.md ) would hang every later frame; it never took the lock before.
 	try:
 		columns, _ = get_terminal_size()
-		sys.stdout.write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
-		sys.stdout.flush()
+		_display._write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
 		if iteration == total and total > 0:
-			print(file=sys.stdout)
+			_display._write('\n')
 	except Exception:
 		if iteration % 5 == 0:
-			print(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout))
+			_display._write(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout) + '\n')
 
 def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_format=".2f"):
 	if to_int or isinstance(size, str):
