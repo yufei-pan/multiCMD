@@ -3258,8 +3258,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		prompt: The prompt to display to the user
 
 	@returns:
-		str: The input from the user or None if no input was received: the timeout ran out, or stdin has ended or is closed
-			( Ctrl-D, /dev/null ), which counts as no answer: the countdown still runs out first, never sooner than timeout
+		str: The input from the user or None if no input was received: the timeout ran out. A stdin that has ended or is closed
+			( Ctrl-D, /dev/null ) counts as no answer: the countdown still runs out, and takes an answer typed after a Ctrl-D
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
@@ -3271,23 +3271,26 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		import msvcrt
 	except ImportError:
 		msvcrt = None
-	# a stdin that is gone ( none, closed ) or at its end ( Ctrl-D, /dev/null, a pipe that ended ) can never answer, and is no
-	# reason to stop the countdown early: the default applies when it ends, and a Ctrl-C still aborts. select() calls a stdin at
-	# its end readable for ever and input() raises EOFError there: so once it has ended it is not asked again, and the loop only waits
-	ended = sys.stdin is None or getattr(sys.stdin, 'closed', False)
+	# a stdin with no answer ( none, closed, or at its end: Ctrl-D, /dev/null, a pipe that ended ) is no reason to stop the
+	# countdown early: the default applies when it ends, and a Ctrl-C still aborts. It is asked again every second, as the
+	# countdown is still asking: a terminal can answer after a Ctrl-D ( one select() and one input() a second: no busy loop )
+	no_stdin = sys.stdin is None or getattr(sys.stdin, 'closed', False)
 	# Loop until the timeout
 	for remaining in range(timeout, 0, -1):
 		# If there is an input, return it
-		if not ended:
+		if not no_stdin:
 			try:
 				if msvcrt is not None:
 					if msvcrt.kbhit():
 						return input().strip()
 				elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
 					return input().strip()
+			except io.UnsupportedOperation:
+				# a stdin select() cannot watch ( no descriptor: a StringIO ) was not asked: that is not "no answer", as in 1.64
+				raise
 			except (EOFError, OSError):
-				# EOFError: at its end; OSError: its descriptor closed, or its terminal gone
-				ended = True
+				# no answer this second. EOFError: at its end, or a Ctrl-D; OSError: its descriptor closed, or its terminal gone
+				pass
 		# Print the remaining time
 		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second

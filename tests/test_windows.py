@@ -81,7 +81,7 @@ def test_input_countdown_uses_msvcrt_when_present(monkeypatch):
 
 def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch):
 	# Ctrl-Z at a console, or a stdin that ended: input() raises EOFError ( 1.64 let it out ); no answer, so the countdown runs
-	# out, and the console is not asked again
+	# out, and the console is asked again each second
 	asked, slept = [], []
 	def at_its_end():
 		asked.append('input')
@@ -93,7 +93,7 @@ def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_
 	monkeypatch.setattr(builtins, 'input', at_its_end)
 	monkeypatch.setattr(multiCMD.time, 'sleep', slept.append)
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') is None
-	assert asked == ['kbhit', 'input']
+	assert asked == ['kbhit', 'input'] * 3
 	assert slept == [1, 1, 1]
 
 

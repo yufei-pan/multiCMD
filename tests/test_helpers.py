@@ -190,11 +190,12 @@ def test_input_with_timeout_and_countdown(monkeypatch):
 	assert input_with_timeout_and_countdown(1) is None
 
 
-def test_countdown_at_the_end_of_stdin_stops_reading_it_and_runs_out(monkeypatch, capsys):
+def test_countdown_at_the_end_of_stdin_asks_again_each_second_and_runs_out(monkeypatch, capsys):
 	# select() calls a stdin at its end readable for ever, and input() raises EOFError there ( 1.64 let it out ). Ctrl-D counts
-	# as no answer: the countdown goes on to its end, so the default applies then and a Ctrl-C can still abort, and the
-	# ended stdin is not asked again ( no busy loop )
+	# as no answer: the countdown goes on to its end, so the default applies then and a Ctrl-C can still abort, and stdin is
+	# asked again once a second, as a terminal can still answer after a Ctrl-D ( the first 1.65 build stopped asking )
 	asked, slept = [], []
+	monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
 	def at_its_end(prompt=""):
 		asked.append("input")
 		raise EOFError
@@ -205,7 +206,7 @@ def test_countdown_at_the_end_of_stdin_stops_reading_it_and_runs_out(monkeypatch
 	monkeypatch.setattr(select, "select", readable)
 	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
 	assert input_with_timeout_and_countdown(3, "Answer") is None
-	assert asked == ["select", "input"]
+	assert asked == ["select", "input"] * 3
 	assert slept == [1, 1, 1]
 	err = capsys.readouterr().err
 	assert "Answer [3s]: " in err and "Answer [2s]: " in err and "Answer [1s]: " in err
@@ -223,24 +224,33 @@ def test_countdown_at_the_end_of_stdin_lets_a_ctrl_c_abort_it(monkeypatch):
 		input_with_timeout_and_countdown(60)
 
 
+def test_countdown_says_so_when_select_cannot_watch_stdin(monkeypatch):
+	# a stdin with no descriptor ( a StringIO ) was not asked: not "no answer", and its line is not dropped in silence ( as 1.64 )
+	monkeypatch.setitem(sys.modules, "msvcrt", None)
+	monkeypatch.setattr(sys, "stdin", io.StringIO("yes\n"))
+	monkeypatch.setattr(multiCMD.time, "sleep", lambda seconds: None)
+	with pytest.raises(io.UnsupportedOperation):
+		input_with_timeout_and_countdown(3)
+
+
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX only")
 
-# the countdown of 1 s, in a program of its own: what it returned, and how long it took
+# the countdown ( of 1 s unless said ), in a program of its own: what it returned, and how long it took
 ASK = (
 	"import os, sys, time, multiCMD\n"
 	"%s"
 	"t = time.monotonic()\n"
-	"got = multiCMD.input_with_timeout_and_countdown(1, 'Answer')\n"
+	"got = multiCMD.input_with_timeout_and_countdown(%d, 'Answer')\n"
 	"sys.stdout.write('GOT %%r %%.2f\\n' %% (got, time.monotonic() - t))\n"
 	"sys.stdout.flush()\n"
 	"os._exit(0)\n")
 
 
-def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=None):
+def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=None, timeout=1):
 	# runs the countdown in a program of its own, with real descriptors; returns its exit status, what it said on stdout (the
 	# answer and the seconds it took) and what it wrote on stderr
 	program = tmp_path / "ask.py"
-	program.write_text(ASK % before)
+	program.write_text(ASK % (before, timeout))
 	argv = [sys.executable, str(program)]
 	if shell_prefix:
 		argv = ["sh", "-c", 'exec "$0" "$@" ' + shell_prefix] + argv
@@ -311,6 +321,21 @@ def test_countdown_runs_out_after_ctrl_d_at_a_terminal(tmp_path):
 		os.close(slave)
 		os.close(master)
 	assert answered_none_after_the_timeout(got)
+
+
+@posix_only
+def test_countdown_takes_an_answer_typed_after_ctrl_d_at_a_terminal(tmp_path):
+	# a terminal's Ctrl-D ends nothing: the countdown is still asking, and "n" typed after it is the answer, at the next second,
+	# not the default at the end ( the first 1.65 build stopped reading: None after the 3 s, and the "n" left for the shell )
+	import pty
+	master, slave = pty.openpty()
+	try:
+		status, out, err = ask(tmp_path, stdin=slave, timeout=3, feed=lambda: os.write(master, b"\x04n\n"))
+	finally:
+		os.close(slave)
+		os.close(master)
+	assert status == 0 and out.split()[:2] == ["GOT", "'n'"], (status, out, err)
+	assert 1.0 <= float(out.split()[2]) < 3.0, out
 
 
 @posix_only
