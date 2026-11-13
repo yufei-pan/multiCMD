@@ -311,4 +311,4 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   with a traceback. The same in 1.63 (ran, Python 3.14 and 3.6).
 - Why: `select()` reports a stdin at its end as readable, and `input()` raises there. Found by the 1.64 review's second
   opinion, outside 1.64's changes.
-- Revisit when: multiCMD 1.65: `EOFError` returns `None`, as no answer.
+- Revisit when: multiCMD 1.65: the end of stdin returns `None`, as its docstring says.
