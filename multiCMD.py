@@ -452,12 +452,13 @@ class _Display:
 	When stdout fails ( the README's table ): a write that fails never raises, in the thread that wrote; it is classified here,
 	once ( _no_reader ). A reader that quit sets closed, and every later write is dropped. Under mcmd every wait and every start
 	then stops ( _reader_quit ). In a program that imports multiCMD a shown command whose output keeps coming once the reader is
-	gone ( a second read of one of its streams ) stops its call, as SIGPIPE stops a command that writes to a closed pipe: its
-	commands are stopped as a Ctrl-C stops them, the queued ones skipped, and a waiting run_commands raises BrokenPipeError
-	( _read_stream, Task._unread ); its last words are only lost. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses the output
-	( lose ): every later write is dropped, one line on stderr says so, and the commands run on. Either way the failed write's
-	bytes stay in sys.stdout's buffer, which Python's flush at exit finds again: mcmd ends by SIGPIPE or points the descriptor
-	at os.devnull ( main ), a library does not redirect its caller's. A stdout that is None drops the output silently.
+	gone ( for over _LAST_WORDS ) stops its call, as SIGPIPE stops a command that writes to a closed pipe: its commands are
+	stopped as a Ctrl-C stops them, the queued ones skipped, and a waiting run_commands raises BrokenPipeError ( _read_stream,
+	Task._unread ); its last words are only lost. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full
+	disk ) loses the output ( lose ): every later write is dropped, one line on stderr says so, and the commands run on. Either
+	way the failed write's bytes stay in sys.stdout's buffer, which Python's flush at exit finds again: mcmd ends by SIGPIPE or
+	points the descriptor at os.devnull ( main ), a library does not redirect its caller's. A stdout that is None drops the
+	output silently.
 	@attributes:
 		cli: Whether this is mcmd's run ( set by main() for its run ): its rule is _reader_quit's, and it names itself on stderr
 		closed: Whether stdout's reader quit, as a write or the watch found it; writes dropped
@@ -1092,6 +1093,11 @@ def _expand_ranges_fast(inStr, variables=None):
 # backwards-compatible alias for the pre-rename public name
 _expand_ranges = _expand_ranges_fast
 
+# a tool writes its last words ( `umount: X: No such file or directory`, dd's summary ) in a few writes microseconds apart,
+# which can reach a reader as two or three reads; under a CPU quota the writer can wait one scheduler period ( 100 ms ) between
+# them. What a command prints after this long once its first lost read means it goes on printing ( _read_stream )
+_LAST_WORDS = 0.2
+
 def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	'''
 	Read one output stream of a command into target, showing complete lines live ( internal )
@@ -1100,8 +1106,8 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	in target and on screen. Chunks without '\r' are split in one pass; chunks with '\r' are
 	handled separator by separator. Every chunk refreshes task._last_output, which drives the
 	inactivity timeout. Once the task is finalized the reader keeps draining but records nothing.
-	Once stdout's reader has quit, the first read of shown output is only lost, and a second one stops the task's call
-	( Task._unread ).
+	Once multiCMD has found stdout's reader gone, what a stream gives within _LAST_WORDS of its next read is only lost ( a
+	command's last words ), and output after that stops the task's call ( Task._unread ).
 	The reader closes its stream when done. While it runs it is the only writer of target ( see _execute ).
 
 	@params:
@@ -1124,9 +1130,9 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 		# a '\n' right after '\r' ( a CRLF ending ): the redrawn line is complete, nothing may overwrite it now
 		if not quiet and not task._finalized:
 			_display.settle()
-	# whether a read of this stream came once stdout's reader had quit: the first is only lost ( a command's last words, however
-	# many lines ), a second means it goes on printing, and stops its call
-	unshown = False
+	# when the first read of this stream came once stdout's reader had quit: what arrives within _LAST_WORDS of it is the
+	# command's last words, only lost; output after that means it goes on printing, and stops its call
+	lost_at = None
 	# bytearray: a long line arriving in many small chunks grows in linear time
 	current = bytearray()
 	committed = True
@@ -1143,9 +1149,10 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 				break
 			task._last_output = time.monotonic()
 			if not quiet and _display.closed and not task._finalized:
-				if unshown and not task._unread:
+				if lost_at is None:
+					lost_at = task._last_output
+				elif task._last_output - lost_at > _LAST_WORDS and not task._unread:
 					task._unread.append(True)
-				unshown = True
 			if b'\r' not in chunk:
 				# fast path: split the whole chunk in one pass
 				parts = chunk.split(b'\n')
