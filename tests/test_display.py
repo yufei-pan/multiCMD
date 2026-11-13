@@ -230,3 +230,14 @@ def test_a_stdout_that_is_none_drops_the_output_silently(monkeypatch, capfd):
 	display.flush()
 	assert not display.lost and not display.closed
 	assert capfd.readouterr() == ('', '')
+
+
+def test_losing_the_output_twice_says_so_once(capfd):
+	# two writers that both met the failure ( a bar frame racing a live line, in a library program ): the second finds the
+	# output already lost, and says nothing
+	display = multiCMD._Display()
+	display.lose(OSError(errno.EIO, 'Input/output error'), 'multiCMD')
+	display.lose(OSError(errno.ENOSPC, 'No space left on device'), 'multiCMD')
+	err = capfd.readouterr().err
+	assert display.lost
+	assert err.count('multiCMD: cannot write to stdout') == 1 and '[Errno %d]' % errno.EIO in err and len(err.splitlines()) == 1

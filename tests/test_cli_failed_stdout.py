@@ -154,9 +154,14 @@ def test_a_quiet_run_on_a_terminal_that_hung_up_writes_nothing_and_says_nothing(
 
 def run_with_stdout(path, args, timeout=60, stderr_path=None):
 	'''The CLI with stdout on path, and stderr on stderr_path or a pipe; its status and stderr ( '' for a stderr_path )'''
-	with open(path, 'wb') as out, open(stderr_path or os.devnull, 'wb') as err:
-		proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=out,
-			stderr=err if stderr_path else subprocess.PIPE, universal_newlines=True, timeout=timeout)
+	with open(path, 'wb') as out:
+		if stderr_path:
+			with open(stderr_path, 'wb') as err:
+				proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=out,
+					stderr=err, universal_newlines=True, timeout=timeout)
+		else:
+			proc = subprocess.run([sys.executable, str(MULTICMD_PY), *args], stdin=subprocess.DEVNULL, stdout=out,
+				stderr=subprocess.PIPE, universal_newlines=True, timeout=timeout)
 	return proc.returncode, proc.stderr or ''
 
 
@@ -205,8 +210,8 @@ def test_a_full_disk_under_stdout_and_stderr_ends_0_for_help_and_version(args):
 	pytest.param(['no-such-command-xyz'], 127, id='not-found'),
 	pytest.param(['-f', os.devnull], 2, id='no-commands'),
 ])
-def test_a_stderr_that_cannot_be_written_changes_no_exit_status(tmp_path, dead, args, status):
-	# the message that cannot be written is dropped ( 1.62 and 1.63: 120, from Python's flush at exit; or a traceback and 1 for
+def test_a_stderr_that_cannot_be_written_changes_no_exit_status(dead, args, status):
+	# the message that cannot be written is dropped ( 1.62 and 1.63's first build: 120, from Python's flush at exit; or a traceback and 1 for
 	# the usage error )
 	if dead == 'full':
 		if not os.path.exists('/dev/full'):
@@ -232,13 +237,36 @@ def test_a_stderr_that_cannot_be_written_changes_no_exit_status(tmp_path, dead, 
 	pytest.param(['-q', '-m', '2'], 3, 2, 1, id='quiet-pool'),
 ])
 def test_a_stdout_closed_at_start_drops_the_output_and_every_command_runs(tmp_path, options, count, failing, status):
-	# `mcmd ... >&-`: sys.stdout is None. 1.62 and 1.63: "Error running command" and a traceback, the commands not run ( a
+	# `mcmd ... >&-`: sys.stdout is None. 1.62 and 1.63's first build: "Error running command" and a traceback, the commands not run ( a
 	# serial run ), or a traceback at the summary
 	commands = [job(tmp_path, i, lines=2, status=3 if i == failing else 0) for i in range(1, count + 1)]
 	proc = subprocess.run(['sh', '-c', 'exec "$@" >&-', 'sh', sys.executable, str(MULTICMD_PY), *options, *commands],
 		stdin=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True, timeout=60)
 	assert done(tmp_path) == list(range(1, count + 1))
 	assert (proc.returncode, proc.stderr) == (status, '')
+
+
+@posix_only
+@pytest.mark.parametrize('args, status, empty', [
+	pytest.param(['no-such-command-xyz'], 127, False, id='not-found'),
+	pytest.param(['-f', os.devnull], 2, True, id='no-commands'),
+	pytest.param(['--bogus'], 2, True, id='usage-error'),
+])
+def test_a_stderr_closed_at_start_gets_no_message_of_mcmds_in_stdout(tmp_path, args, status, empty):
+	# `mcmd ... 2>&-`: sys.stderr is None, and print( file=None ) and argparse write to stdout instead. 1.62 and 1.63's first
+	# build: "Command path not found", "mcmd: no commands to run" and argparse's usage in the file ( on 3.6 and 3.9 the usage
+	# error ended 1: argparse's None.write )
+	with open(tmp_path / 'out', 'wb') as out:
+		proc = subprocess.run(['sh', '-c', 'exec "$@" 2>&-', 'sh', sys.executable, str(MULTICMD_PY), *args],
+			stdin=subprocess.DEVNULL, stdout=out, timeout=60)
+	text = (tmp_path / 'out').read_text()
+	assert proc.returncode == status
+	assert 'not found' not in text and 'no commands' not in text and 'usage' not in text
+	if empty:
+		assert text == ''
+	else:
+		# the run's own output is still there
+		assert 'Running command: no-such-command-xyz' in text
 
 
 @has_dev_full
@@ -372,6 +400,19 @@ def test_windows_einval_is_a_reader_that_quit_on_a_pipe_only(tmp_path, monkeypat
 	finally:
 		monkeypatch.undo()
 		os.close(fd)
+
+
+def test_a_stderr_that_is_none_gets_no_message_in_stdout(monkeypatch, capsys):
+	# print( file=None ) writes to stdout: a library program with stderr closed ( or pythonw ) found its warnings and
+	# failure messages in the data stream. The library does not replace its caller's sys.stderr: it drops the message
+	with monkeypatch.context() as patch:
+		patch.setattr(sys, 'stderr', None)
+		multiCMD._write_error('a warning')
+		tasks = multiCMD.run_commands(['no-such-command-xyz'], return_object=True)
+	out = capsys.readouterr().out
+	assert tasks[0].returncode == 127
+	assert 'a warning' not in out and 'not found' not in out
+	assert 'Running command: no-such-command-xyz' in out
 
 
 def test_a_lost_stdout_points_at_devnull_and_says_so_once(tmp_path, monkeypatch, capfd):

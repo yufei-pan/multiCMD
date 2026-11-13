@@ -479,8 +479,8 @@ class _Display:
 
 	def _write(self, text):
 		'''
-		Write text to stdout and flush it, with the lock held ( internal ): lines(), message() and settle() take it; the final flush
-		of main() and print_progress_bar() do not, which a lock a Ctrl-C left held must not hang
+		Write text to stdout and flush it, with the lock held ( internal ): lines() and message() take it; the final flush of
+		main() and print_progress_bar() do not, which a lock a Ctrl-C left held must not hang
 		Text the stdout's encoding cannot take ( Python 3.6 in a C locale: ASCII ) is written with backslash escapes, as a
 		command's undecodable bytes are read ( _read_stream ), so no reader dies of it
 		'''
@@ -504,6 +504,9 @@ class _Display:
 		'''
 		Drop every later write, and say once on stderr that error lost the output, as name ( internal )
 		'''
+		if self.lost:
+			# another thread met the failure first ( a bar frame racing a live line ) and said so
+			return
 		self.lost = True
 		_write_error(f'{name}: cannot write to stdout ({error}): its output is dropped from here on')
 
@@ -2336,7 +2339,10 @@ def _write_error(text):
 	'''
 	Write a failure message or a warning to stderr ( internal ): one that cannot be written ( stderr closed, a broken pipe, a
 	full disk ) is dropped, as the failure it is about is already recorded on the task and a dead stderr changes no exit status
+	A stderr that is None ( closed at start ) drops it as well: print( file=None ) would write it to stdout
 	'''
+	if sys.stderr is None:
+		return
 	try:
 		print(text, file=sys.stderr, flush=True)
 	except Exception:
@@ -2937,7 +2943,7 @@ def _install_cli_signal_handlers():
 def _stdout_failed(error):
 	'''
 	What the CLI does when a write to stdout fails ( _Display.on_failed ), in the thread that wrote, with the display's
-	lock held ( internal )
+	lock held ( except main()'s final flush, which takes no lock ) ( internal )
 	A reader that quit ( _no_reader ) stops the run: _display.closed is set, the main thread raises _StdoutClosed, and another
 	thread leaves the flag to the main thread's waits ( _raise_if_stdout_closed ). Any other failure ( EIO from a terminal that
 	hung up, ENOSPC from a full disk ) loses the output and nothing else, as in the library ( _Display.lose ): every later
@@ -3117,9 +3123,13 @@ def main():
 	stderr that cannot be written changes no exit status either: its messages are dropped ( _write_error ), and at exit its
 	descriptor is pointed at os.devnull, since Python's flush of what stderr could not write would end the process with 120.
 	The library's functions only lose the output, whatever the error ( see _Display ): they have no run of their own to end.
+	A stderr closed at start ( `2>&-` ) is replaced by os.devnull, so that nothing of ours, and no argparse usage error, goes to
+	stdout instead ( print( file=None ) and argparse write there ).
 	@returns:
 		int: The exit status
 	'''
+	if sys.stderr is None:
+		sys.stderr = open(os.devnull, 'w')
 	_display.on_failed = _stdout_failed
 	_display.watch = _watch_stdout()
 	try:
@@ -3143,8 +3153,6 @@ def _flush_stderr():
 	Flush stderr; if it cannot be written, point its descriptor at os.devnull ( the CLI's, at exit ), so that Python's flush at
 	exit does not fail with it ( exit status 120 in place of the commands' own ) ( internal )
 	'''
-	if sys.stderr is None:
-		return
 	try:
 		sys.stderr.flush()
 	except OSError:

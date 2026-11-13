@@ -123,7 +123,9 @@ class _Display:
 		except OSError as e:
 			if self.on_failed is None:self.lose(e,'multiCMD')
 			else:self.on_failed(e)
-	def lose(self,error,name):self.lost=True;_write_error(f"{name}: cannot write to stdout ({error}): its output is dropped from here on")
+	def lose(self,error,name):
+		if self.lost:return
+		self.lost=True;_write_error(f"{name}: cannot write to stdout ({error}): its output is dropped from here on")
 	def flush(self):self._write('')
 	def lines(self,texts,decor=('','',''),replace_first=False,ends_with_cr=False):
 		prefix,start,end=decor
@@ -706,6 +708,7 @@ def __run_command(task,sem,timeout=60,quiet=False,dry_run=False,with_stdErr=Fals
 		if with_stdErr:return task.stdout+task.stderr
 		else:return task.stdout
 def _write_error(text):
+	if sys.stderr is None:return
 	try:print(text,file=sys.stderr,flush=True)
 	except Exception:pass
 def _cannot_run(task,returncode,what,error,quiet=False):
@@ -946,6 +949,7 @@ def _cli_commands(args):
 	if args.shell:commands=[_shell_argv(command)if isinstance(command,str)else command for command in commands]
 	return commands
 def main():
+	if sys.stderr is None:sys.stderr=open(os.devnull,'w')
 	_display.on_failed=_stdout_failed;_display.watch=_watch_stdout()
 	try:
 		try:status=_run_cli()
@@ -954,7 +958,6 @@ def main():
 	except _StdoutClosed:_end_by_closed_stdout()
 	return status
 def _flush_stderr():
-	if sys.stderr is None:return
 	try:sys.stderr.flush()
 	except OSError:_point_at_devnull(sys.stderr)
 def _run_cli():

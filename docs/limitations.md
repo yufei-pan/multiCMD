@@ -228,3 +228,37 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   first poll stop jobs it should not (a hung-up terminal, a half-closed socket on macOS), for one shell's pipes.
 - Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.
 - Approved: 2026-11-12, the user chose "Known limitation + README clause (Recommended)".
+
+### With stdout and stderr on the same dead target, the line that says the output was lost is lost too
+- Kind: known limitation
+- What the operator sees: with `nohup mcmd -q ... > log 2>&1 &` on a full disk, or both streams on a terminal that hung up,
+  the one line "output is dropped" goes to stderr, which is the target that failed, and is lost with the rest. The log just
+  stops, with nothing in it that says why. Every command runs, and the exit status is the commands' own. The line is kept
+  and written at exit if the target can take it by then (a full disk that has room again: checked on a 1 MB tmpfs, where a
+  command freed the space and the line was the last one in the log).
+- Why: stderr is the failed target, and the status stays the commands' own (the user's pick). `/dev/tty` is gone under cron,
+  systemd or a closed terminal, and syslog would be a new part.
+- Revisit when: someone needs to detect lost output from a script.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)".
+
+### A stdout that another program left non-blocking counts as a failed write at the first EAGAIN
+- Kind: known limitation
+- What the operator sees: when another program leaves stdout `O_NONBLOCK` (a shared terminal, a pipe), a momentarily full
+  pipe or terminal makes a write fail with EAGAIN (`[Errno 11] Resource temporarily unavailable`). 1.63 drops the output from
+  then on, says so once on stderr, and runs every command; the status is the commands' own. 1.62 printed tracebacks and did
+  not start the queued commands.
+- Why: a correct retry needs mcmd's own write loop on the descriptor (with a wait for POLLOUT). Retrying through Python's
+  stdout lost bytes once a single write passed its 8 KB buffer: 78,560 of 1,000,000 bytes with 20 KB writes, 336,448 with 100
+  KB, none with 100-byte writes (Docker, Python 3.14 and 3.6, the 1.63 second review's `pi.py`). The `O_NONBLOCK` is another
+  program's bug in the environment, and it breaks every other program that writes to that terminal.
+- Revisit when: someone hits it.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)".
+
+### format_bytes() writes its "Invalid size format" message to stdout with a bare print
+- Kind: deferred
+- What the operator sees: `format_bytes()` (hpcp parses its size limits through it at start) prints "Invalid size format ..."
+  and "Got: ..." with a bare `print()` to stdout, which is the data stream, and raises `OSError` if stdout is dead. It is a
+  write of multiCMD's own that the display rule does not cover. Older than 1.63; no caller is known to reach it with a dead
+  stdout.
+- Why: found in the 1.63 second review, after the build had gone through the display's door for every other write of its own.
+- Revisit when: multiCMD 1.64, which sends the message through `_write_error`.

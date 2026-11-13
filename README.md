@@ -168,7 +168,7 @@ mcmd --shell -m 4 "dmesg | tail -n 5" "journalctl -n 5 > /tmp/j.log"
 | Usage error (bad option, unbalanced quote, no commands) | `2` |
 | Ctrl-C | `130` (`128+N` after SIGTERM / SIGHUP) |
 | stdout has no reader (`mcmd ... \| head`) | ended by SIGPIPE, which a shell reports as `141`; `1` on Windows |
-| stdout fails otherwise (a full disk; a terminal that hung up, on a job its hang-up does not signal) | the commands' own status, as if it had not: every command runs, and one line on stderr says the output was lost. A job the hang-up does signal (the foreground job; any job of bash or zsh) ends `129`, as for any SIGHUP |
+| stdout fails otherwise (a full disk; a terminal that hung up, on a job its hang-up does not signal) | the commands' own status, as if it had not: every command runs, and one line on stderr says the output was lost (unless stderr is the same dead target, as with `> log 2>&1` on a full disk: then the log just stops) |
 
 ### Input files and templates
 
@@ -427,15 +427,20 @@ pipelines from sockets, so under it `mcmd ... | head` is the same: a write finds
 mksh, busybox and macOS's ksh give a pipe). A write to stdout that fails for any other reason (EIO from a terminal that
 hung up, ENOSPC from a full disk; on Windows, EINVAL from anything but a pipe) loses only the output: `mcmd` drops it from
 then on, runs every command, running and queued, says so in one line on stderr (`mcmd: cannot write to stdout ([Errno 5]
-Input/output error): its output is dropped from here on`), and exits with the commands' own status, also with stdout and
-stderr on the same file. A terminal that hangs up also sends SIGHUP to the job in its foreground (a closed terminal window,
-or `ssh -t` whose connection drops), and bash and zsh pass it on to every job they started, in the background too (dash does
-not): that stops the commands as before, and `mcmd` ends `129`. A job nobody signals runs to its end: one that was
-`disown`ed, started with `setsid` or `nohup`, or, in bash and dash, left in the background by `exit` (zsh signals its jobs on
-`exit` too). Over `ssh` without a pty, stdout is a pipe to sshd, and a dropped connection closes it: a reader that quit. So a
-run that must outlive its terminal or its connection, whatever starts it, sends its stdout to a file:
-`nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD gets no error from a failed write of multiCMD's (its live
-output, `print_progress_bar()`, the report of `AsyncExecutor.join()`), whatever the error: multiCMD's output is dropped from
+Input/output error): its output is dropped from here on`), if stderr can still take it, and exits with the commands' own
+status, also with stdout and stderr on the same file. If stderr is that same dead target (`> log 2>&1` on a full disk), the
+line is lost with the rest and the log just stops (it is written at exit if the target can take it by then). A stdout that
+another program left non-blocking (`O_NONBLOCK`) fails with EAGAIN whenever its pipe or terminal is momentarily full, and
+that counts as a failed write too: the output is dropped from then on (see docs/limitations.md). A terminal that hangs up
+also sends SIGHUP to the job in its foreground (a closed terminal window, or `ssh -t` whose connection drops), and bash and
+zsh pass it on to every job they started, in the background too (dash does not): that stops the commands as before, and
+`mcmd` ends `129`. A job nobody signals runs to its end: one that was `disown`ed, started with `setsid` or `nohup`, or, in
+bash and dash, left in the background by `exit` (zsh signals its jobs on `exit` too). Over `ssh` without a pty, stdout is a
+pipe to sshd, and a dropped connection closes it: a reader that quit. So a run that must outlive its terminal or its
+connection, whatever starts it, runs under `nohup` (against the hang-up's SIGHUP) with its stdout in a file (which no
+hang-up or dropped connection can close): `nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD gets no error
+from a failed write of multiCMD's (its live output, `print_progress_bar()`, the report of `AsyncExecutor.join()`),
+whatever the error: multiCMD's output is dropped from
 then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and every command runs. The program's own writes
 to that stdout meet the error themselves, and so does Python's flush at exit, which still finds what the failed write left in
 `sys.stdout`'s buffer: unless the program handles that, it ends with "Exception ignored" and status 120, as after a failed
@@ -447,8 +452,8 @@ multiCMD from its own threads (where Ctrl-C never arrives), can call `multiCMD.k
 handler. A command not seen to exit a second after SIGKILL is no longer tracked; its pid is named on
 stderr, unless quiet.
 
-multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers, nothing
-else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
+multiCMD never touches SIGINT's handler (`mcmd` sets its own SIGTERM / SIGHUP handlers and ignores SIGTTIN / SIGTTOU,
+nothing else). What your handler raises while a call waits for its commands is handled as a Ctrl-C.
 
 A command is registered from the moment `Popen` returns it. Before Python 3.11 the exec wrapper runs
 the command only once it is registered, so a Ctrl-C that Python raises inside `Popen` as a serial run
@@ -528,15 +533,19 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 - Nothing needs doing to upgrade.
 - Fix: a write to stdout that fails for another reason than a reader quitting no longer breaks the run. With a terminal that
-  hung up on a job nobody signals (EIO: `setsid mcmd ...`, `nohup`, or a `disown`ed job) or a full disk (ENOSPC), `mcmd`
+  hung up on a job nobody signals (EIO: `setsid mcmd ...` or a `disown`ed job) or a full disk (ENOSPC), `mcmd`
   drops its output from then on, runs every command (running and queued, serial and with `-m`; their output is still read,
-  so none blocks), says so in one line on stderr, and exits with the commands' own status, `> log 2>&1` included. 1.62 printed
+  so none blocks), says so in one line on stderr, if stderr can still take it (not with `> log 2>&1` on that disk: the log
+  just stops), and exits with the commands' own status, `> log 2>&1` included. 1.62 printed
   tracebacks, did not start the queued commands, often lost the running ones (they died at their next line), and exited 120.
   `-h`, `-V` and `-n` to a full disk end 0 with that line, where 1.62 ended 120 with "Exception ignored". A job its
   terminal's hang-up signals (the foreground job; any job of bash or zsh) still gets SIGHUP when it hangs up, and stops
   (`129`), as before.
 - Fix: a stderr that cannot be written (`mcmd ... 2>/dev/full`, or a pipe nobody reads) changes no exit status: its messages
   are dropped. 1.62 ended 120, from Python's flush at exit (`mcmd no-such-command 2>/dev/full` gave 120, not 127).
+- Fix: `mcmd ... 2>&-` (stderr closed at start) puts none of its messages, and no usage error, into stdout. 1.62 wrote them
+  there (`Command path not found`, `mcmd: no commands to run`, argparse's usage), and a usage error ended 1 on Python 3.6 and
+  3.9. In a program that imports multiCMD, its warnings and failure messages are dropped then, not written to stdout.
 - Fix: `mcmd ... >&-` (stdout closed at start) drops the output silently and runs every command. 1.62 printed "Error running
   command" and a traceback, and a serial run did not start its commands.
 - Fix, Python 3.6 in a C locale (ASCII stdout): a command's non-ASCII output is shown with backslash escapes (`caf\xe9`).
