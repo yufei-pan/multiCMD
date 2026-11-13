@@ -180,11 +180,9 @@ class Task:
 		self._pass_fds = ()
 		# whether the main thread asked for it once the exit hook had begun ( an atexit handler's call: see _cut_by_exit )
 		self._at_exit = False
-		# not empty once a shown command of its call printed again after its lines found stdout's reader gone: its waits and
+		# not empty once a shown command of its call went on printing after stdout's reader quit ( _read_stream ): its waits and
 		# starts ask it as they ask stop, so the call stops as one ( _build_tasks gives the tasks of a call one list )
 		self._unread = []
-		# whether a batch of this command's lines found the reader gone already ( _read_stream )
-		self._unshown = False
 
 	def __iter__(self):
 		yield from (
@@ -453,10 +451,10 @@ class _Display:
 
 	When stdout fails ( the README's table ): a write that fails never raises, in the thread that wrote; it is classified here,
 	once ( _no_reader ). A reader that quit sets closed, and every later write is dropped. Under mcmd every wait and every start
-	then stops ( _reader_quit ). In a program that imports multiCMD a shown command whose lines find the reader gone a second
-	time stops its call, as SIGPIPE stops a command that writes to a closed pipe: its commands are stopped as a Ctrl-C stops
-	them, the queued ones skipped, and a waiting run_commands raises BrokenPipeError ( _read_stream, Task._unread ); its last
-	words are only lost. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses the output
+	then stops ( _reader_quit ). In a program that imports multiCMD a shown command whose output keeps coming once the reader is
+	gone ( a second read of one of its streams ) stops its call, as SIGPIPE stops a command that writes to a closed pipe: its
+	commands are stopped as a Ctrl-C stops them, the queued ones skipped, and a waiting run_commands raises BrokenPipeError
+	( _read_stream, Task._unread ); its last words are only lost. Any other failure ( EIO from a terminal that hung up, ENOSPC from a full disk ) loses the output
 	( lose ): every later write is dropped, one line on stderr says so, and the commands run on. Either way the failed write's
 	bytes stay in sys.stdout's buffer, which Python's flush at exit finds again: mcmd ends by SIGPIPE or points the descriptor
 	at os.devnull ( main ), a library does not redirect its caller's. A stdout that is None drops the output silently.
@@ -512,10 +510,11 @@ class _Display:
 
 	def flush(self):
 		'''
-		Flush stdout as a write does, so that what another writer left in its buffer ( argparse ) meets the same rule ( internal )
-		For main() at exit, without the lock: by then the run's threads have finished, or a stop gave up on them, and a lock a
-		signal left held ( docs/limitations.md ) must not hang the exit. A reader a stop gave up on may write meanwhile: at worst
-		a second line on stderr says the output was lost.
+		Flush stdout as a write does, so that what another writer left in its buffer ( argparse; the countdown's caller ) meets the
+		same rule ( internal )
+		Without the lock: main() calls it at exit, where a lock a signal left held ( docs/limitations.md ) must not hang the exit,
+		and input_with_timeout_and_countdown() before its prompt. A reader a stop gave up on may write meanwhile: at worst a
+		second line on stderr says the output was lost.
 		'''
 		self._write('')
 
@@ -1101,6 +1100,8 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	in target and on screen. Chunks without '\r' are split in one pass; chunks with '\r' are
 	handled separator by separator. Every chunk refreshes task._last_output, which drives the
 	inactivity timeout. Once the task is finalized the reader keeps draining but records nothing.
+	Once stdout's reader has quit, the first read of shown output is only lost, and a second one stops the task's call
+	( Task._unread ).
 	The reader closes its stream when done. While it runs it is the only writer of target ( see _execute ).
 
 	@params:
@@ -1119,15 +1120,13 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 		target.extend(texts)
 		if not quiet:
 			_display.lines(texts, decor, replace_first, ends_with_cr)
-			if _display.closed:
-				# nobody reads what it says: its last words are only lost, and one that goes on printing stops its call
-				if task._unshown and not task._unread:
-					task._unread.append(True)
-				task._unshown = True
 	def settle():
 		# a '\n' right after '\r' ( a CRLF ending ): the redrawn line is complete, nothing may overwrite it now
 		if not quiet and not task._finalized:
 			_display.settle()
+	# whether a read of this stream came once stdout's reader had quit: the first is only lost ( a command's last words, however
+	# many lines ), a second means it goes on printing, and stops its call
+	unshown = False
 	# bytearray: a long line arriving in many small chunks grows in linear time
 	current = bytearray()
 	committed = True
@@ -1143,6 +1142,10 @@ def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 			if not chunk:
 				break
 			task._last_output = time.monotonic()
+			if not quiet and _display.closed and not task._finalized:
+				if unshown and not task._unread:
+					task._unread.append(True)
+				unshown = True
 			if b'\r' not in chunk:
 				# fast path: split the whole chunk in one pass
 				parts = chunk.split(b'\n')
@@ -3157,7 +3160,8 @@ def _flush_stderr():
 	'''
 	try:
 		sys.stderr.flush()
-	except OSError:
+	except (OSError, ValueError):
+		# ( ValueError: a sys.stderr the program closed, as at _point_at_devnull )
 		_point_at_devnull(sys.stderr)
 
 class _Parser(argparse.ArgumentParser):

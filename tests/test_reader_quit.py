@@ -301,11 +301,13 @@ def test_shown_calls_fanned_out_over_the_programs_threads_all_end(tmp_path):
 
 @posix_only
 def test_a_shown_command_that_starts_after_the_reader_quit_is_stopped_at_its_next_line(tmp_path):
-	# a loop that catches the error per item: 1.63 ran the second follower unseen, for ever
-	status, err, took = run_program(tmp_path, """
+	# a loop that catches the error per item: 1.63 ran the second follower unseen, for ever. The queued command of each call
+	# is skipped, as the first call's is
+	status, err, took = run_program(tmp_path, f"""
+		os.chdir({str(tmp_path)!r})
 		for attempt in (1, 2):
 			try:
-				multiCMD.run_commands([FOLLOW])
+				multiCMD.run_commands([FOLLOW, ['touch', 'queued-%d' % attempt]])
 			except BrokenPipeError:
 				sys.stderr.write('RAISED %d\\n' % attempt)
 		sys.stderr.write('ALIVE %d\\n' % alive())
@@ -314,6 +316,7 @@ def test_a_shown_command_that_starts_after_the_reader_quit_is_stopped_at_its_nex
 	assert took < 5
 	assert_followers_stopped(tmp_path, err)
 	assert len((tmp_path / 'pids').read_text().split()) == 2
+	assert not list(tmp_path.glob('queued-*'))
 
 
 @posix_only
@@ -399,11 +402,13 @@ def test_a_later_batch_of_an_executor_runs_its_silent_command_and_stops_its_foll
 
 @posix_only
 def test_a_pool_whose_one_command_prints_again_stops_its_silent_one_too(tmp_path):
-	# a call stops as one: its silent command is stopped with the one that printed
-	silent = f"['sh', '-c', 'echo $$ >> {tmp_path}/pids; exec sleep 30']"
+	# a call stops as one: its silent command is stopped with the one that printed. The follower prints only once the silent
+	# one has said it runs ( on a loaded runner the pool could start the follower first, and the stop find no silent pid to see )
+	silent = f"['sh', '-c', 'echo $$ >> {tmp_path}/pids; echo $$ > {tmp_path}/silent; exec sleep 30']"
+	follow = f"['sh', '-c', 'while [ ! -s {tmp_path}/silent ]; do sleep 0.01; done; echo $$ >> {tmp_path}/pids; while :; do echo tick; sleep 0.05; done']"
 	status, err, took = run_program(tmp_path, f"""
 		try:
-			multiCMD.run_commands([{silent}, FOLLOW], max_threads=2)
+			multiCMD.run_commands([{silent}, {follow}], max_threads=2)
 		except BrokenPipeError:
 			sys.stderr.write('RAISED\\n')
 		sys.stderr.write('ALIVE %d\\n' % alive())
@@ -412,3 +417,85 @@ def test_a_pool_whose_one_command_prints_again_stops_its_silent_one_too(tmp_path
 	assert took < 5
 	assert_followers_stopped(tmp_path, err)
 	assert len((tmp_path / 'pids').read_text().split()) == 2
+
+
+@posix_only
+@pytest.mark.parametrize('command', [
+	"['sh', '-c', 'echo /dev/loop0; echo warning >&2']",
+	"['printf', '/dev/loop0\\\\nno final newline']",
+	"['printf', 'step 1\\\\r/dev/loop0\\\\n']",
+], ids=['stdout-and-stderr', 'no-final-newline', 'carriage-return'])
+def test_last_words_that_arrive_at_once_are_only_lost(tmp_path, command):
+	# `losetup --find --show` that also warns, or ends without a newline: its call returns its result. The first 1.64 build
+	# counted each line it showed, per command: one line on each stream, or an unfinished last line, made the call raise
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		got = []
+		for i in range(5):
+			try:
+				got.append(multiCMD.run_commands([{command}], return_code_only=True)[0])
+			except BrokenPipeError:
+				got.append('raised')
+		sys.stderr.write('GOT %s\\n' % got)
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'GOT [0, 0, 0, 0, 0]\n' in err
+
+
+@posix_only
+def test_output_without_line_ends_that_keeps_coming_stops_its_call(tmp_path):
+	# a progress of dots: the first 1.64 build counted shown lines, and a command that never ends a line ran for ever
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			multiCMD.run_commands([['sh', '-c', 'echo $$ >> {tmp_path}/pids; while :; do printf .; sleep 0.01; done']])
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_command_that_exits_and_leaves_a_follower_holding_its_output_stops_its_call(tmp_path):
+	# the drain: the command exits at once, what it started prints for ever on its output
+	status, err, took = run_program(tmp_path, f"""
+		try:
+			multiCMD.run_commands([['sh', '-c', '(echo $$ >> {tmp_path}/pids; while :; do echo tick; sleep 0.05; done) & exit 0']])
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
+	assert took < 5
+	assert_followers_stopped(tmp_path, err)
+
+
+@posix_only
+def test_a_shown_dry_run_whose_reader_quit_raises(tmp_path):
+	# its lines are its output: it raises, whenever it began
+	status, err, took = run_program(tmp_path, """
+		try:
+			multiCMD.run_commands([['echo', str(i)] for i in range(20000)], dry_run=True)
+			sys.stderr.write('RETURNED\\n')
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'RAISED\n' in err
