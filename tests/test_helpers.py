@@ -190,29 +190,55 @@ def test_input_with_timeout_and_countdown(monkeypatch):
 	assert input_with_timeout_and_countdown(1) is None
 
 
-def test_input_with_timeout_and_countdown_returns_none_at_the_end_of_stdin(monkeypatch):
-	# select() calls a stdin at its end readable, and input() raises EOFError there ( 1.64 let it out )
+def test_countdown_at_the_end_of_stdin_stops_reading_it_and_runs_out(monkeypatch, capsys):
+	# select() calls a stdin at its end readable for ever, and input() raises EOFError there ( 1.64 let it out ). Ctrl-D counts
+	# as no answer: the countdown goes on to its end, so the default applies then and a Ctrl-C can still abort, and the
+	# ended stdin is not asked again ( no busy loop )
+	asked, slept = [], []
+	def at_its_end(prompt=""):
+		asked.append("input")
+		raise EOFError
+	def readable(r, w, x, timeout=None):
+		asked.append("select")
+		return ([sys.stdin], [], [])
+	monkeypatch.setattr(builtins, "input", at_its_end)
+	monkeypatch.setattr(select, "select", readable)
+	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
+	assert input_with_timeout_and_countdown(3, "Answer") is None
+	assert asked == ["select", "input"]
+	assert slept == [1, 1, 1]
+	err = capsys.readouterr().err
+	assert "Answer [3s]: " in err and "Answer [2s]: " in err and "Answer [1s]: " in err
+
+
+def test_countdown_at_the_end_of_stdin_lets_a_ctrl_c_abort_it(monkeypatch):
 	def at_its_end(prompt=""):
 		raise EOFError
+	def interrupted(seconds):
+		raise KeyboardInterrupt
 	monkeypatch.setattr(builtins, "input", at_its_end)
 	monkeypatch.setattr(select, "select", lambda r, w, x, timeout=None: ([sys.stdin], [], []))
-	assert input_with_timeout_and_countdown(5) is None
+	monkeypatch.setattr(multiCMD.time, "sleep", interrupted)
+	with pytest.raises(KeyboardInterrupt):
+		input_with_timeout_and_countdown(60)
 
 
 posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX only")
 
+# the countdown of 1 s, in a program of its own: what it returned, and how long it took
 ASK = (
 	"import os, sys, time, multiCMD\n"
 	"%s"
-	"t = time.time()\n"
-	"got = multiCMD.input_with_timeout_and_countdown(5, 'Answer')\n"
-	"sys.stdout.write('GOT %%r %%s\\n' %% (got, 'at once' if time.time() - t < 3 else 'late'))\n"
+	"t = time.monotonic()\n"
+	"got = multiCMD.input_with_timeout_and_countdown(1, 'Answer')\n"
+	"sys.stdout.write('GOT %%r %%.2f\\n' %% (got, time.monotonic() - t))\n"
 	"sys.stdout.flush()\n"
 	"os._exit(0)\n")
 
 
 def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=None):
-	# runs the countdown in a program of its own, with real descriptors; returns what the program said on stdout and stderr
+	# runs the countdown in a program of its own, with real descriptors; returns its exit status, what it said on stdout (the
+	# answer and the seconds it took) and what it wrote on stderr
 	program = tmp_path / "ask.py"
 	program.write_text(ASK % before)
 	argv = [sys.executable, str(program)]
@@ -231,41 +257,51 @@ def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=N
 	return proc.returncode, out.decode(), err.decode()
 
 
-@posix_only
-def test_countdown_at_the_end_of_stdin_returns_none_at_once_for_dev_null(tmp_path):
-	assert ask(tmp_path)[:2] == (0, "GOT None at once\n")
+def answered_none_after_the_timeout(got):
+	# None, and not sooner than the countdown of 1 s ( never at once ); the upper bound only catches a wait that is not the countdown
+	status, out, err = got
+	words = out.split()
+	assert status == 0 and words[:2] == ["GOT", "None"], got
+	assert 1.0 <= float(words[2]) < 6.0, got
+	assert "Answer [1s]: " in err, got
+	return True
 
 
 @posix_only
-def test_countdown_at_the_end_of_stdin_returns_none_at_once_for_a_pipe_that_ended(tmp_path):
-	proc_stdin = os.pipe()
-	os.close(proc_stdin[1])
+def test_countdown_at_the_end_of_stdin_runs_out_for_dev_null(tmp_path):
+	assert answered_none_after_the_timeout(ask(tmp_path))
+
+
+@posix_only
+def test_countdown_at_the_end_of_stdin_runs_out_for_a_pipe_that_ended(tmp_path):
+	read_end, write_end = os.pipe()
+	os.close(write_end)
 	try:
-		assert ask(tmp_path, stdin=proc_stdin[0])[:2] == (0, "GOT None at once\n")
+		assert answered_none_after_the_timeout(ask(tmp_path, stdin=read_end))
 	finally:
-		os.close(proc_stdin[0])
+		os.close(read_end)
 
 
 @posix_only
-def test_countdown_with_a_closed_stdin_returns_none_at_once(tmp_path):
+def test_countdown_with_a_closed_stdin_runs_out(tmp_path):
 	# `prog <&-`: Python has no sys.stdin at all
-	assert ask(tmp_path, shell_prefix="<&-")[:2] == (0, "GOT None at once\n")
+	assert answered_none_after_the_timeout(ask(tmp_path, shell_prefix="<&-"))
 
 
 @posix_only
 @pytest.mark.parametrize("before", ["sys.stdin.close()\n", "os.close(0)\n"], ids=["sys.stdin closed", "descriptor 0 closed"])
-def test_countdown_whose_stdin_the_program_closed_returns_none_at_once(tmp_path, before):
+def test_countdown_whose_stdin_the_program_closed_runs_out(tmp_path, before):
 	# a pipe that stays open, so that nothing but the close ends it
 	read_end, write_end = os.pipe()
 	try:
-		assert ask(tmp_path, before=before, stdin=read_end)[:2] == (0, "GOT None at once\n")
+		assert answered_none_after_the_timeout(ask(tmp_path, before=before, stdin=read_end))
 	finally:
 		os.close(read_end)
 		os.close(write_end)
 
 
 @posix_only
-def test_countdown_returns_none_at_once_for_ctrl_d_at_a_terminal(tmp_path):
+def test_countdown_runs_out_after_ctrl_d_at_a_terminal(tmp_path):
 	import pty
 	master, slave = pty.openpty()
 	try:
@@ -274,16 +310,16 @@ def test_countdown_returns_none_at_once_for_ctrl_d_at_a_terminal(tmp_path):
 	finally:
 		os.close(slave)
 		os.close(master)
-	assert got[:2] == (0, "GOT None at once\n")
-	assert "Answer [5s]: " in got[2]
+	assert answered_none_after_the_timeout(got)
 
 
 @posix_only
-def test_countdown_still_returns_what_was_typed_and_still_times_out(tmp_path):
+def test_countdown_still_returns_what_was_typed_at_once(tmp_path):
 	read_end, write_end = os.pipe()
 	try:
 		os.write(write_end, b" yes \n")
-		assert ask(tmp_path, stdin=read_end)[:2] == (0, "GOT 'yes' at once\n")
+		status, out, err = ask(tmp_path, stdin=read_end)
 	finally:
 		os.close(read_end)
 		os.close(write_end)
+	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"] and float(out.split()[2]) < 1.0

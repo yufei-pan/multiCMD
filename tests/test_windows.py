@@ -79,13 +79,22 @@ def test_input_countdown_uses_msvcrt_when_present(monkeypatch):
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') == 'yes'
 
 
-def test_input_countdown_returns_none_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch):
-	# Ctrl-Z at a console, or a stdin that ended: input() raises EOFError ( 1.64 let it out )
+def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch):
+	# Ctrl-Z at a console, or a stdin that ended: input() raises EOFError ( 1.64 let it out ); no answer, so the countdown runs
+	# out, and the console is not asked again
+	asked, slept = [], []
 	def at_its_end():
+		asked.append('input')
 		raise EOFError
-	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=lambda: True))
+	def key_waiting():
+		asked.append('kbhit')
+		return True
+	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=key_waiting))
 	monkeypatch.setattr(builtins, 'input', at_its_end)
+	monkeypatch.setattr(multiCMD.time, 'sleep', slept.append)
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') is None
+	assert asked == ['kbhit', 'input']
+	assert slept == [1, 1, 1]
 
 
 def test_posix_only_modules_are_imported_lazily():

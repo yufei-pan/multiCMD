@@ -988,13 +988,14 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	_display.flush();_write_error(f"{prompt} [{timeout}s]: ",end='')
 	try:import msvcrt
 	except ImportError:msvcrt=None
-	if sys.stdin is None or getattr(sys.stdin,'closed',False):return
+	ended=sys.stdin is None or getattr(sys.stdin,'closed',False)
 	for remaining in range(timeout,0,-1):
-		try:
-			if msvcrt is not None:
-				if msvcrt.kbhit():return input().strip()
-			elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
-		except(EOFError,OSError):return
+		if not ended:
+			try:
+				if msvcrt is not None:
+					if msvcrt.kbhit():return input().strip()
+				elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
+			except(EOFError,OSError):ended=True
 		_write_error(f"\r{prompt} [{remaining}s]: ",end='');time.sleep(1)
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
 	import re,unicodedata;version=1.21;_=version

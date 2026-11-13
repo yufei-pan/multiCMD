@@ -3258,7 +3258,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		prompt: The prompt to display to the user
 
 	@returns:
-		str: The input from the user or None if no input was received
+		str: The input from the user or None if no input was received: the timeout ran out, or stdin has ended or is closed
+			( Ctrl-D, /dev/null ), which counts as no answer: the countdown still runs out first, never sooner than timeout
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
@@ -3270,22 +3271,23 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		import msvcrt
 	except ImportError:
 		msvcrt = None
-	# a stdin that is gone ( none, closed ) or at its end ( Ctrl-D, /dev/null, a pipe that ended ) can never answer: None at once,
-	# not after the countdown. select() calls a stdin at its end readable, and input() raises EOFError there
-	if sys.stdin is None or getattr(sys.stdin, 'closed', False):
-		return None
+	# a stdin that is gone ( none, closed ) or at its end ( Ctrl-D, /dev/null, a pipe that ended ) can never answer, and is no
+	# reason to stop the countdown early: the default applies when it ends, and a Ctrl-C still aborts. select() calls a stdin at
+	# its end readable for ever and input() raises EOFError there: so once it has ended it is not asked again, and the loop only waits
+	ended = sys.stdin is None or getattr(sys.stdin, 'closed', False)
 	# Loop until the timeout
 	for remaining in range(timeout, 0, -1):
 		# If there is an input, return it
-		try:
-			if msvcrt is not None:
-				if msvcrt.kbhit():
+		if not ended:
+			try:
+				if msvcrt is not None:
+					if msvcrt.kbhit():
+						return input().strip()
+				elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
 					return input().strip()
-			elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-				return input().strip()
-		except (EOFError, OSError):
-			# EOFError: at its end; OSError: its descriptor closed, or its terminal gone
-			return None
+			except (EOFError, OSError):
+				# EOFError: at its end; OSError: its descriptor closed, or its terminal gone
+				ended = True
 		# Print the remaining time
 		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second
