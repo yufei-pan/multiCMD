@@ -79,6 +79,15 @@ def test_input_countdown_uses_msvcrt_when_present(monkeypatch):
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') == 'yes'
 
 
+def test_input_countdown_returns_none_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch):
+	# Ctrl-Z at a console, or a stdin that ended: input() raises EOFError ( 1.64 let it out )
+	def at_its_end():
+		raise EOFError
+	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=lambda: True))
+	monkeypatch.setattr(builtins, 'input', at_its_end)
+	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') is None
+
+
 def test_posix_only_modules_are_imported_lazily():
 	tree = ast.parse((PACKAGE_ROOT / 'multiCMD.py').read_text())
 	top_level = set()

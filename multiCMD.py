@@ -3270,14 +3270,22 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		import msvcrt
 	except ImportError:
 		msvcrt = None
+	# a stdin that is gone ( none, closed ) or at its end ( Ctrl-D, /dev/null, a pipe that ended ) can never answer: None at once,
+	# not after the countdown. select() calls a stdin at its end readable, and input() raises EOFError there
+	if sys.stdin is None or getattr(sys.stdin, 'closed', False):
+		return None
 	# Loop until the timeout
 	for remaining in range(timeout, 0, -1):
 		# If there is an input, return it
-		if msvcrt is not None:
-			if msvcrt.kbhit():
+		try:
+			if msvcrt is not None:
+				if msvcrt.kbhit():
+					return input().strip()
+			elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
 				return input().strip()
-		elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-			return input().strip()
+		except (EOFError, OSError):
+			# EOFError: at its end; OSError: its descriptor closed, or its terminal gone
+			return None
 		# Print the remaining time
 		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second

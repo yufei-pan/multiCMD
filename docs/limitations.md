@@ -308,12 +308,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   returns 0 with a line on stderr. The same in 1.63 (ran, Python 3.14).
 - Why: the unit check falls through when `to_str` is false. Found by the 1.64 review's second opinion, outside 1.64's changes.
 - Revisit when: multiCMD 1.65: an unknown unit is an invalid size (the stderr line, and 0).
-
-### input_with_timeout_and_countdown() raises EOFError at the end of stdin
-- Kind: deferred
-- What the operator sees: with stdin at its end (Ctrl-D at the prompt, or `< /dev/null`), the countdown raises `EOFError`
-  instead of returning `None` as its docstring says. hpcp asks only when stdin is a terminal, so a Ctrl-D there ends hpcp
-  with a traceback. The same in 1.63 (ran, Python 3.14 and 3.6).
-- Why: `select()` reports a stdin at its end as readable, and `input()` raises there. Found by the 1.64 review's second
-  opinion, outside 1.64's changes.
-- Revisit when: multiCMD 1.65: the end of stdin returns `None`, as its docstring says.
