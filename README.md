@@ -461,6 +461,7 @@ These and the other known limits are in [docs/limitations.md](docs/limitations.m
 test_a_reader_that_quits_while_the_commands_print_nothing_ends_the_cli_at_once ), test_cli_failed_stdout.py ( test_a_socket_its_peer_reset_ends_the_cli_by_sigpipe_and_stops_its_commands ).
 Library, reader quit: test_reader_quit.py ( test_a_program_whose_reader_quit_stops_its_command_and_gets_broken_pipe_error, test_shown_calls_fanned_out_over_the_programs_threads_all_end,
 test_a_shown_command_that_prints_nothing_runs_whoever_met_the_reader_quitting_first, test_the_last_words_of_a_command_that_then_ends_are_only_lost,
+test_a_second_piece_of_output_at_half_the_window_is_still_last_words, test_a_second_piece_of_output_at_one_and_a_half_times_the_window_stops_the_call,
 test_last_words_that_arrive_at_once_are_only_lost, test_a_call_of_commands_that_each_print_once_runs_them_all_and_returns,
 test_output_without_line_ends_that_keeps_coming_stops_its_call, test_a_command_that_exits_and_leaves_a_follower_holding_its_output_stops_its_call,
 test_a_shown_dry_run_whose_reader_quit_raises,
@@ -473,7 +474,7 @@ Closed at start: test_cli_failed_stdout.py ( test_a_stdout_closed_at_start_drops
 
 | What happened to stdout | `mcmd` | A program that imports multiCMD |
 |---|---|---|
-| Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command whose output keeps coming after the quit is stopped, and so is the rest of its call: its queued commands are skipped and, if it waits, the call raises `BrokenPipeError`. A call whose commands print nothing more, or only their last words (all within 0.2 s), runs them all to their end, queued commands included. A quiet call never looks at stdout |
+| Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command whose output keeps coming after the quit is stopped, and so is the rest of its call: its queued commands are skipped and, if it waits, the call raises `BrokenPipeError`. A call whose commands print nothing more, or only their last words (all within 1 s), runs them all to their end, queued commands included. A quiet call never looks at stdout |
 | Any other failed write (a terminal that hung up, a full disk; in a program, a `sys.stdout` it closed) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised; the program's own writes still meet the error (a library does not redirect its caller's stdout) |
 | Closed at start (`>&-`) | The output is dropped silently; every command runs | The same (`sys.stdout` is `None`) |
 
@@ -538,16 +539,16 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   commands are stopped, its queued ones skipped and, if it waits, it raises `BrokenPipeError`, whenever it began (1.63: a
   write that found the reader gone stopped every shown call in flight, and every later call ran unseen, so a thread pool of
   shown calls under `prog | head` could run for ever). `mcmd` is unchanged.
-- Changed, library: a call whose commands print nothing more, or only their last words (all within 0.2 s, on stdout and
+- Changed, library: a call whose commands print nothing more, or only their last words (all within 1 s, on stdout and
   stderr), runs them all to their end, also when a command's own header met the closed pipe: a silent `umount` in a `finally`
   runs, `losetup --find --show` still hands over its device, and a call of commands that each print one line runs them all
   and returns (1.63: a call in flight was stopped and raised; a later one ran unseen). A command that prints nothing more is
   no longer stopped by another write's failure (docs/limitations.md).
 - Changed, library: a shown dry run whose line finds the reader gone raises `BrokenPipeError` if it waits, whenever it began
   (1.63: a dry run made after the reader quit returned).
-- hpcp 9.89 and 9.90 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a cleanup step that
-  prints as it works (the delayed `e2fsck` and `tune2fs`) is cut, and its call raises before the loop devices are detached,
-  where 1.63 ran it unseen; a later hpcp runs its cleanup quiet.
+- hpcp 9.89 and 9.90 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a delayed `e2fsck` that
+  prints for longer than 1 s is cut, with the `tune2fs` queued after it, and its call raises before the loop devices are
+  detached, where 1.63 ran it unseen; a later hpcp runs its cleanup quiet.
 - Changed: `input_with_timeout_and_countdown()` writes its prompt and countdown to stderr, after flushing stdout, and
   `format_bytes()` its error message (1.63: stdout, where a dead one raised `BrokenPipeError` and `> log` hid the prompt).
 - Fix: a `sys.stdout` the program closed loses the output and every command runs (1.63: `ValueError`, and nothing ran), and
