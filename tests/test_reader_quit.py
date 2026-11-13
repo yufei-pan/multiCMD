@@ -398,6 +398,7 @@ def second_piece_after(tmp_path, fraction, then):
 			sys.stderr.write('RETURNED %s\\n' % codes)
 		except BrokenPipeError:
 			sys.stderr.write('RAISED\\n')
+		sys.stderr.write('ALIVE %d\\n' % alive())
 		sys.stderr.flush()
 		os._exit(0)
 		""")
@@ -418,6 +419,7 @@ def test_a_second_piece_of_output_at_one_and_a_half_times_the_window_stops_the_c
 	err = second_piece_after(tmp_path, 1.5, 'sleep 30')
 	assert 'RAISED\n' in err
 	assert not (tmp_path / 'queued-ran').exists()
+	assert_followers_stopped(tmp_path, err)
 
 
 @posix_only
@@ -573,11 +575,12 @@ def test_a_call_of_commands_that_each_print_once_runs_them_all_and_returns(tmp_p
 @posix_only
 def test_output_shown_before_the_quit_does_not_count_against_the_last_words(tmp_path):
 	# a command that printed while the reader read, and says its last words once another command found the reader gone: its
-	# call returns. The reader reads the four headers and `before`, then quits; `other` finds it gone; `last` comes 0.5 s later
+	# call returns. The reader reads the four headers and a blank line, then quits; `other` finds it gone; `last` comes 1.5
+	# windows later, so a window counted from `before` ( any read, not the first after the quit ) would stop the call
 	status, err, took = run_program(tmp_path, f"""
 		try:
 			codes = multiCMD.run_commands([
-				['sh', '-c', 'echo before; while [ ! -e {tmp_path}/reader-closed ]; do sleep 0.01; done; sleep 0.5; echo last'],
+				['sh', '-c', 'echo before; while [ ! -e {tmp_path}/reader-closed ]; do sleep 0.01; done; sleep {1.5 * multiCMD._LAST_WORDS}; echo last'],
 				['sh', '-c', 'while [ ! -e {tmp_path}/reader-closed ]; do sleep 0.01; done; echo other'],
 			], max_threads=2, return_code_only=True)
 		except BrokenPipeError:
