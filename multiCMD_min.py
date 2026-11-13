@@ -26,7 +26,7 @@ _draining={}
 _PTY_WARNED=False
 _exiting=False
 class Task:
-	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False;self._error=False;self._env=None;self._extra_env=None;self._pass_fds=();self._at_exit=False;self._unread=[];self._unshown=False
+	def __init__(self,command):self.command=command;self.returncode=None;self.stdout=[];self.stderr=[];self.thread=None;self.stop=False;self.start_time=None;self.end_time=None;self._last_output=None;self._finalized=False;self._pty=False;self._error=False;self._env=None;self._extra_env=None;self._pass_fds=();self._at_exit=False;self._unread=[]
 	def __iter__(self):yield from(('command',self.command),('returncode',self.returncode),('stdout',self.stdout),('stderr',self.stderr))
 	def __repr__(self):return f"""Task(command={pformat(self.command)},
 returncode={self.returncode!r},
@@ -302,14 +302,10 @@ def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 		texts=[line.decode('utf-8',errors='backslashreplace')for line in lines]
 		if replace_first:target.pop()
 		target.extend(texts)
-		if not quiet:
-			_display.lines(texts,decor,replace_first,ends_with_cr)
-			if _display.closed:
-				if task._unshown and not task._unread:task._unread.append(True)
-				task._unshown=True
+		if not quiet:_display.lines(texts,decor,replace_first,ends_with_cr)
 	def settle():
 		if not quiet and not task._finalized:_display.settle()
-	current=bytearray();committed=True
+	unshown=False;current=bytearray();committed=True
 	try:
 		while True:
 			try:chunk=stream.read1(65536)
@@ -318,6 +314,9 @@ def _read_stream(stream,target,task,decor=('','',''),quiet=False):
 				raise
 			if not chunk:break
 			task._last_output=time.monotonic()
+			if not quiet and _display.closed and not task._finalized:
+				if unshown and not task._unread:task._unread.append(True)
+				unshown=True
 			if b'\r'not in chunk:
 				parts=chunk.split(b'\n')
 				if len(parts)==1:current+=chunk;continue
@@ -959,7 +958,7 @@ def main():
 	return status
 def _flush_stderr():
 	try:sys.stderr.flush()
-	except OSError:_point_at_devnull(sys.stderr)
+	except(OSError,ValueError):_point_at_devnull(sys.stderr)
 class _Parser(argparse.ArgumentParser):
 	def error(self,message):_write_error(self.format_usage()+f"{self.prog}: error: {message}");sys.exit(2)
 def _run_cli():
