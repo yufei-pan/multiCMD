@@ -416,15 +416,19 @@ def test_a_stderr_that_is_none_gets_no_message_in_stdout(monkeypatch, capsys):
 
 
 def test_a_lost_stdout_points_at_devnull_and_says_so_once(tmp_path, monkeypatch, capfd):
-	# so that what the failed write left in Python's buffer goes nowhere at exit, instead of failing again ( status 120 )
+	# so that what the failed write left in Python's buffer goes nowhere at exit, instead of failing again ( status 120 ):
+	# mcmd does it as main() returns; a program that imports multiCMD keeps its descriptor
 	path = tmp_path / 'out'
 	fd = os.open(str(path), os.O_WRONLY | os.O_CREAT)
 	try:
 		monkeypatch.setattr(sys, 'stdout', FailingStdout(fd, OSError(errno.EIO, 'Input/output error')))
-		multiCMD._display.on_failed = multiCMD._stdout_failed
-		multiCMD._display.message('header')
-		multiCMD._display.lines(['a', 'b'])
-		multiCMD._display.flush()
+		def run():
+			multiCMD._display.message('header')
+			multiCMD._display.lines(['a', 'b'])
+			return 3
+		monkeypatch.setattr(multiCMD, '_run_cli', run)
+		monkeypatch.setattr(multiCMD, '_watch_stdout', lambda: None)
+		assert multiCMD.main() == 3
 		assert multiCMD._display.lost and not multiCMD._display.closed
 		os.write(fd, b'after')
 	finally:

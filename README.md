@@ -438,13 +438,24 @@ zsh pass it on to every job they started, in the background too (dash does not):
 bash and dash, left in the background by `exit` (zsh signals its jobs on `exit` too). Over `ssh` without a pty, stdout is a
 pipe to sshd, and a dropped connection closes it: a reader that quit. So a run that must outlive its terminal or its
 connection, whatever starts it, runs under `nohup` (against the hang-up's SIGHUP) with its stdout in a file (which no
-hang-up or dropped connection can close): `nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD gets no error
-from a failed write of multiCMD's (its live output, `print_progress_bar()`, the report of `AsyncExecutor.join()`),
-whatever the error: multiCMD's output is dropped from
-then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and every command runs. The program's own writes
-to that stdout meet the error themselves, and so does Python's flush at exit, which still finds what the failed write left in
-`sys.stdout`'s buffer: unless the program handles that, it ends with "Exception ignored" and status 120, as after a failed
-print of its own (a library does not redirect its caller's stdout). At interpreter exit
+hang-up or dropped connection can close): `nohup mcmd -q ... > log 2>&1 &`. A program that imports multiCMD follows the same
+rule for the writes of multiCMD's own output (its live output, `print_progress_bar()`, the report of `AsyncExecutor.join()`),
+and none of those writes raises in the thread that wrote. A reader that quit (`BrokenPipeError`, `ConnectionResetError`, or on
+Windows `OSError` EINVAL from a pipe) stops the calls that are showing their commands (not quiet): their commands are
+stopped as a Ctrl-C stops them, the queued ones are skipped (return code `None`), and a call that waits raises
+`BrokenPipeError` once its commands are dead, whichever of those forms the platform gave the write (`except OSError` catches
+it too). A pool stops all its commands, and a call on a thread of the program's own raises in that thread. Commands nobody
+waits for (`AsyncExecutor`, `run_commands(wait_for_return=False)`) are stopped without an error: `wait()`, `join()` and
+`join_threads()` return, and the tasks tell (a stopped one has the kill's return code, a queued one `None`). A call made after
+that runs its commands without showing them, so a cleanup in a `finally` (an unmount) still runs, and a quiet call never looks
+at stdout. The library learns that its reader quit only from a failed write, and does not poll the pipe as `mcmd` does, so a
+shown command that prints nothing more (`tail -f` of a log that went idle, under `prog | head -1`) runs until its next line
+(see docs/limitations.md). Any other failed write (EIO from a terminal that hung up, ENOSPC from a full disk) loses only the
+output: multiCMD's output is dropped from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and
+every command runs. The program's own writes to that stdout meet the error themselves, and so does Python's flush at exit,
+which still finds what the failed write left in `sys.stdout`'s buffer: unless the program handles that, it ends with
+"Exception ignored" and status 120, as after a failed print of its own (a library does not redirect its caller's stdout).
+At interpreter exit
 the commands still running are killed, and a command queued on one of multiCMD's threads fails (-1,
 "not started: the interpreter is exiting") instead of outliving the program; one run from an `atexit`
 handler after that, on the main thread, runs as usual. A program that handles SIGTERM itself, or runs
@@ -555,12 +566,20 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 - Changed, Windows: EINVAL from a write to stdout is a reader that quit only when stdout is a pipe. On any other stdout
   it loses the output as above, where 1.62 stopped the commands and exited 1 (Windows' C runtime gives EINVAL for other
   write errors too).
-- Changed, library: a failed write of multiCMD's own output (not quiet) no longer raises, whatever the error. Its output is
-  dropped from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and every command runs. 1.62
-  raised the error in the thread that wrote: a command whose "Running command" line could not be written counted as failed
-  (-1) without running, a reader that could not write a line died with a traceback, taking the command's output pipe with
-  it, a pool worker left a traceback, and a serial call raised the error to the caller. `print_progress_bar()` and the report
-  of `AsyncExecutor.join()` meet the same rule (1.62: `OSError` from a terminal that hung up). A program that imports
+- Changed, library: a failed write of multiCMD's own output (not quiet) no longer raises in the thread that wrote, and
+  `BrokenPipeError` now means a reader that quit, in every form. A reader that quit (EPIPE, ECONNRESET, on Windows EINVAL
+  from a pipe) stops the calls that show their commands: they stop them, skip the queued ones, and a waiting
+  `run_commands()` (`run_command()` too) raises `BrokenPipeError` once they are dead. 1.62 documented "`BrokenPipeError`;
+  `OSError` EINVAL on Windows", and a reset socket gave `ConnectionResetError`: now it is one error, and `except OSError`
+  catches it as before. Commands nobody waits for (`AsyncExecutor`, `wait_for_return=False`) are stopped without an error.
+  Calls made after that run their commands without showing them (a cleanup that shows its commands still runs), where 1.62
+  raised again and ran nothing. The library does not poll the pipe as `mcmd` does: a shown command that prints nothing more
+  runs until its next line (docs/limitations.md; 1.62's was the same). Any other failed write only loses the output: dropped
+  from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and every command runs. 1.62 raised the
+  error in the thread that wrote: a command whose "Running command" line could not be written counted as failed (-1) without
+  running, a reader that could not write a line died with a traceback, taking the command's output pipe with it, a pool
+  worker left a traceback, and a serial call raised the error to the caller. `print_progress_bar()` and the report of
+  `AsyncExecutor.join()` meet the same rule (1.62: `OSError` from a terminal that hung up). A program that imports
   multiCMD meets the error in its own next write to that stdout, and in Python's flush at exit, which still finds what the
   failed write left in `sys.stdout`'s buffer ("Exception ignored" and status 120, unless the program handles it).
 

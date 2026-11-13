@@ -142,43 +142,34 @@ class FailingStdout:
 		raise self.error
 
 
-@pytest.mark.parametrize('error', [BrokenPipeError(errno.EPIPE, 'Broken pipe'), OSError(errno.EIO, 'Input/output error')],
-	ids=['EPIPE', 'EIO'])
-def test_a_failed_write_loses_the_output_for_the_library(monkeypatch, capfd, error):
-	# on_failed is the CLI's: a program that imports multiCMD has no run of multiCMD's to end, whatever the error. 1.62 raised
-	# it in the thread that wrote: a command whose header failed did not run, a reader died with a traceback
+@pytest.mark.parametrize('error, flag', [
+	(BrokenPipeError(errno.EPIPE, 'Broken pipe'), 'closed'),
+	(ConnectionResetError(errno.ECONNRESET, 'Connection reset by peer'), 'closed'),
+	(OSError(errno.EIO, 'Input/output error'), 'lost'),
+	(OSError(errno.ENOSPC, 'No space left on device'), 'lost'),
+], ids=['EPIPE', 'ECONNRESET', 'EIO', 'ENOSPC'])
+def test_a_failed_write_is_classified_once_where_it_is_written(monkeypatch, capfd, error, flag):
+	# for mcmd and for a program that imports multiCMD alike: a reader that quit closes the display ( the calls that show
+	# commands stop them ), anything else loses the output, said once on stderr; neither raises in the thread that wrote,
+	# and every later write is dropped. 1.62 raised it there: a command whose header failed did not run, a reader died
 	stdout = FailingStdout(error)
 	monkeypatch.setattr(sys, 'stdout', stdout)
 	display = multiCMD._Display()
 	display.message('header')
 	display.lines(['a'])
-	display.flush()
-	assert display.lost and not display.closed
-	assert stdout.writes == 1
-	err = capfd.readouterr().err
-	assert err.count('multiCMD: cannot write to stdout') == 1 and len(err.splitlines()) == 1
-
-
-@pytest.mark.parametrize('flag', ['closed', 'lost'])
-def test_on_failed_gets_the_error_once_and_every_later_write_is_dropped(monkeypatch, flag):
-	# the CLI's hook sets closed ( a reader that quit ) or lost ( anything else ): either drops the writes that follow
-	stdout = FailingStdout(OSError(errno.EIO, 'Input/output error'))
-	monkeypatch.setattr(sys, 'stdout', stdout)
-	display = multiCMD._Display()
-	calls = []
-	def failed(error):
-		calls.append(error.errno)
-		setattr(display, flag, True)
-	display.on_failed = failed
-	display.message('header')
-	display.lines(['a'])
 	display.message('footer')
 	display.flush()
-	assert calls == [errno.EIO]
+	assert (display.closed, display.lost) == (flag == 'closed', flag == 'lost')
 	assert stdout.writes == 1
+	assert display.lock.acquire(False)
+	err = capfd.readouterr().err
+	if flag == 'closed':
+		assert err == ''
+	else:
+		assert err.count('multiCMD: cannot write to stdout') == 1 and len(err.splitlines()) == 1
 
 
-def test_flush_meets_the_same_hook(monkeypatch):
+def test_flush_meets_the_same_rule(monkeypatch):
 	# what argparse left in the buffer: main()'s final flush goes through the display
 	class FlushFails:
 		def write(self, text):
@@ -188,24 +179,8 @@ def test_flush_meets_the_same_hook(monkeypatch):
 			raise OSError(errno.ENOSPC, 'No space left on device')
 	monkeypatch.setattr(sys, 'stdout', FlushFails())
 	display = multiCMD._Display()
-	calls = []
-	display.on_failed = lambda error: calls.append(error.errno)
 	display.flush()
-	assert calls == [errno.ENOSPC]
-	assert display.lock.acquire(False)
-
-
-def test_on_failed_may_raise_in_the_writing_thread(monkeypatch):
-	# the main thread's answer to a reader that quit ( _stdout_failed ): the write is the one that raises, with the lock let go
-	monkeypatch.setattr(sys, 'stdout', ClosedPipe())
-	display = multiCMD._Display()
-	def stop(error):
-		display.closed = True
-		raise multiCMD._StdoutClosed()
-	display.on_failed = stop
-	with pytest.raises(multiCMD._StdoutClosed):
-		display.message('header')
-	assert display.closed
+	assert display.lost and not display.closed
 	assert display.lock.acquire(False)
 
 
@@ -236,8 +211,8 @@ def test_losing_the_output_twice_says_so_once(capfd):
 	# two writers that both met the failure ( a bar frame racing a live line, in a library program ): the second finds the
 	# output already lost, and says nothing
 	display = multiCMD._Display()
-	display.lose(OSError(errno.EIO, 'Input/output error'), 'multiCMD')
-	display.lose(OSError(errno.ENOSPC, 'No space left on device'), 'multiCMD')
+	display.lose(OSError(errno.EIO, 'Input/output error'))
+	display.lose(OSError(errno.ENOSPC, 'No space left on device'))
 	err = capfd.readouterr().err
 	assert display.lost
 	assert err.count('multiCMD: cannot write to stdout') == 1 and '[Errno %d]' % errno.EIO in err and len(err.splitlines()) == 1

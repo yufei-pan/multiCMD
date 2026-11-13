@@ -229,6 +229,19 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.
 - Approved: 2026-11-12, the user chose "Known limitation + README clause (Recommended)".
 
+### A program that imports multiCMD learns that its reader quit only from a failed write
+- Kind: known limitation
+- What the operator sees: a program that shows its commands (not quiet) with its stdout on a pipe, and whose reader quits
+  (`prog | head -1`), stops them, skips the queued ones and gets `BrokenPipeError` when a write of multiCMD's own output
+  fails. The library does not ask the pipe, as `mcmd` does. So a shown command that prints nothing more, such as `tail -f`
+  of a log that has gone idle, runs until its next line (or its end), and the program stays until then; `mcmd 'tail -f log'
+  | head -1` in the same place ends at once. 1.62's library was the same: it raised at the next write. The README says so in
+  one sentence.
+- Why: asking the pipe means polling a stdout the library does not own, with one poll object per shown call and per thread
+  (a poll object is one thread's), handed down to every wait; `mcmd` does it in `main()`, which owns the process.
+- Revisit when: someone hits it.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)".
+
 ### With stdout and stderr on the same dead target, the line that says the output was lost is lost too
 - Kind: known limitation
 - What the operator sees: with `nohup mcmd -q ... > log 2>&1 &` on a full disk, or both streams on a terminal that hung up,
