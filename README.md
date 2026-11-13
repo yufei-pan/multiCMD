@@ -530,6 +530,25 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.64 from 1.63
+
+- Changed, library: once the reader of stdout quit, a shown command that goes on printing stops its call, which skips its
+  queued commands and, if it waits, raises `BrokenPipeError`, whenever the call began (1.63: any failed
+  write of multiCMD's stopped every shown call in flight, and every later call ran unseen, so a thread pool of shown calls
+  under `prog | head` could run for ever). `mcmd` is unchanged.
+- Changed, library: a command that prints nothing more, or only its last lines, runs to its end and its call returns, also
+  when its own header met the closed pipe: a silent `umount` in a `finally` runs, and `losetup --find --show` still hands
+  over its device (1.63: skipped, or raised; a command that prints nothing more is no longer stopped by another write's
+  failure: docs/limitations.md).
+- hpcp 9.89 with 1.64 installed beside it: when its reader quits, a cleanup step that prints as it works (the delayed
+  `e2fsck` and `tune2fs`) is cut, and its call raises before the loop devices are detached, where 1.63 ran it unseen;
+  hpcp's next version runs its cleanup quiet.
+- Changed: `input_with_timeout_and_countdown()` writes its prompt and countdown to stderr, after flushing stdout, and
+  `format_bytes()` its error message (1.63: stdout, where a dead one raised `BrokenPipeError` and `> log` hid the prompt).
+- Fix: a `sys.stdout` the program closed loses the output and every command runs, and a program that runs
+  `multiCMD.main()` itself gets the library's rule back once it returns (1.63: `ValueError` and nothing ran; the watch stayed).
+- Fix: a usage error with a stderr that cannot be written ends 2 on Python 3.9 and 3.10 too (1.63: 1).
+
 ## Upgrading to 1.63 from 1.62
 
 - Nothing needs doing to upgrade, except for three kinds of library program. One that catches `ConnectionResetError` from a
