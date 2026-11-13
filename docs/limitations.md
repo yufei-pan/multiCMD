@@ -244,13 +244,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 ### A program that imports multiCMD learns that its reader quit only from a failed write
 - Kind: known limitation
 - What the operator sees: a program that shows its commands (not quiet) with its stdout on a pipe, under `prog | head -1`,
-  learns that the reader quit only when the output of its own commands meets the closed pipe: the library does not ask the
-  pipe, as `mcmd` does. A shown command that prints nothing more (`tail -f` of a log that has gone idle, a `sleep`) runs
-  until its next lines or its end, and a call whose commands all print nothing returns normally; the program stays until
-  then. 1.63 stopped such a command when another write of multiCMD's failed (the next command's header, a progress bar on
-  another thread, another call's output), and its call raised `BrokenPipeError`. `mcmd 'tail -f log' | head -1` in the same
-  place ends at once on Linux and macOS (on Windows, and under ksh93 on Linux, `mcmd` too learns it from a failed write).
-  1.62's library was the same: it raised at the next write. The README's "When stdout fails" says so.
+  acts on the reader quitting only when a command's output keeps coming: the library does not ask the pipe, as `mcmd` does.
+  A shown command that prints nothing more (`tail -f` of a log that has gone idle, a `sleep`) runs until its output keeps
+  coming or it ends (unless another command of its call goes on printing: a call stops as one), and a call whose commands
+  all print nothing returns normally; the program stays until then. 1.63 stopped such a command once any write of
+  multiCMD's found the reader gone (the next command's header, a progress bar on another thread, another call's output),
+  and its call raised `BrokenPipeError`; 1.62's library raised at its next write. `mcmd 'tail -f log' | head -1` in the
+  same place ends at once on Linux and macOS (on Windows, and under ksh93 on Linux, `mcmd` too learns it from a failed
+  write). The README's "When stdout fails" says so.
 - Why: stopping it needs either the pipe poll in the library (asking a stdout the library does not own, with one poll
   object per shown call and per thread, handed down to every wait; declined 2026-11-12) or a stop on somebody else's failed
   write, the global flag whose timing made 1.63's findings: a fan-out of shown calls over the program's threads ran for
@@ -292,4 +293,22 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-11-12, the user chose "Known limitation (Recommended)". Widened 2026-11-12 (a reader that quits after the
   EAGAIN is not seen by the library): the user chose "Release, widen the KL (Recommended)"; the user did not ask for it, the
-  1.63 re-review's second opinion found it.
+  1.63 re-review's second opinion found it. Widened 2026-11-13 to `mcmd` on a socket stdout: the user chose "Approve the
+  sentence (Recommended)".
+
+### format_bytes() returns None for a size with an unknown unit
+- Kind: deferred
+- What the operator sees: `format_bytes('5 foo', to_int=True)` (a unit other than B, K, M, G, T, P, E, Z or Y, with or without
+  an `i`) returns `None`, not an int, and says nothing; `int()` of it raises `TypeError`. A size it cannot parse at all
+  returns 0 with a line on stderr. The same in 1.63 (ran, Python 3.14).
+- Why: the unit check falls through when `to_str` is false. Found by the 1.64 review's second opinion, outside 1.64's changes.
+- Revisit when: multiCMD 1.65: an unknown unit is an invalid size (the stderr line, and 0).
+
+### input_with_timeout_and_countdown() raises EOFError at the end of stdin
+- Kind: deferred
+- What the operator sees: with stdin at its end (Ctrl-D at the prompt, or `< /dev/null`), the countdown raises `EOFError`
+  instead of returning `None` as its docstring says. hpcp asks only when stdin is a terminal, so a Ctrl-D there ends hpcp
+  with a traceback. The same in 1.63 (ran, Python 3.14 and 3.6).
+- Why: `select()` reports a stdin at its end as readable, and `input()` raises there. Found by the 1.64 review's second
+  opinion, outside 1.64's changes.
+- Revisit when: multiCMD 1.65: `EOFError` returns `None`, as no answer.

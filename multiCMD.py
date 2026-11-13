@@ -2314,7 +2314,7 @@ def __run_command(task,sem, timeout=60, quiet=False,dry_run=False,with_stdErr=Fa
 			if _reader_quit():
 				# mcmd: one of those writes found the reader gone ( it raises nothing, in any thread ): skipped as at the top,
 				# unfinished ( the finally below marks it finalized, which nothing reads for a task skipped so ). In a program
-				# that imports multiCMD a header that fails stops nothing: the command runs, and stops if it prints again
+				# that imports multiCMD a header that fails stops nothing: the command runs, and stops if its output keeps coming
 				return task.stdout + task.stderr if with_stdErr else task.stdout
 			_execute(task, timeout, quiet, decor, use_pty)
 		except Exception as e:
@@ -2521,7 +2521,7 @@ def _build_tasks(commands, parse=False, use_sudo=..., shell=False, env=None, ext
 	tasks = [Task(command) for command in formatedCommands]
 	# a call the main thread makes once the exit hook has begun ( from an atexit handler: see _cut_by_exit )
 	at_exit = _exiting and threading.current_thread() is threading.main_thread()
-	# the call stops as one once a shown command of it printed again into a stdout nobody reads ( see _Display )
+	# the call stops as one once the output of a shown command of it keeps coming into a stdout nobody reads ( see _Display )
 	unread = []
 	for task in tasks:
 		task._env = env
@@ -2767,7 +2767,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 	On Python 3.11+ a Ctrl-C that lands inside Popen as a serial run starts a command can leave that command running
 	unregistered ( see run_command ).
 
-	A shown command ( not quiet ) that goes on printing once the reader of sys.stdout is gone stops its call: its commands are
+	A shown command ( not quiet ) whose output keeps coming once the reader of sys.stdout is gone stops its call: its commands are
 	stopped, the queued ones skipped, and the call raises BrokenPipeError when it waits. The rule and the rest: see _Display.
 
 	@params:

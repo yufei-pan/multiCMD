@@ -1,7 +1,8 @@
 '''
 A program that imports multiCMD and shows its commands ( not quiet ), when the reader of its stdout quits ( `prog | head` ):
-a shown command that goes on printing stops its call, which skips its queued commands and raises BrokenPipeError, whenever
-the call began; a command that prints nothing more, or only its last lines, runs to its end; a quiet call never looks.
+a shown command whose output keeps coming stops its call, which skips its queued commands and raises BrokenPipeError, whenever
+the call began; a command that prints nothing more, or only its last words ( output that arrives at once ), runs to its end;
+a quiet call never looks.
 1.63's first builds lost the output and ran on: a command that never ends ( `tail -f` ) kept the program running for ever.
 '''
 import errno
@@ -274,7 +275,7 @@ def test_any_other_failed_write_still_loses_only_the_output(tmp_path):
 	assert (tmp_path / 'a').exists() and (tmp_path / 'b').exists()
 
 
-# --- 1.64: one rule. A shown command is stopped when a line of its output finds the reader gone, whenever its call began
+# --- 1.64: one rule. A shown command is stopped when its output keeps coming after the reader quit, whenever its call began
 
 @posix_only
 def test_shown_calls_fanned_out_over_the_programs_threads_all_end(tmp_path):
@@ -499,3 +500,27 @@ def test_a_shown_dry_run_whose_reader_quit_raises(tmp_path):
 		os._exit(0)
 		""")
 	assert 'RAISED\n' in err
+
+
+@posix_only
+@pytest.mark.parametrize('kwargs', ['', ', max_threads=4'], ids=['serial', 'pool'])
+def test_a_call_of_commands_that_each_print_once_runs_them_all_and_returns(tmp_path, kwargs):
+	# `ssh host hostname` for 20 hosts under `prog | head`: the user's pick, 2026-11-13: the queued commands still start. A call
+	# stops only when a command's output keeps coming ( 1.62 and 1.63 raised at once, and ran none )
+	commands = ', '.join(f"['sh', '-c', 'echo host-{i}; touch {tmp_path}/ran-{i}']" for i in range(20))
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			codes = multiCMD.run_commands([{commands}], return_code_only=True{kwargs})
+		except BrokenPipeError:
+			codes = 'raised'
+		sys.stderr.write('CODES %s\\n' % (codes,))
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	assert 'CODES %s\n' % ([0] * 20) in err
+	assert len(list(tmp_path.glob('ran-*'))) == 20

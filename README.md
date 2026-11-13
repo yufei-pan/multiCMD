@@ -461,6 +461,9 @@ These and the other known limits are in [docs/limitations.md](docs/limitations.m
 test_a_reader_that_quits_while_the_commands_print_nothing_ends_the_cli_at_once ), test_cli_failed_stdout.py ( test_a_socket_its_peer_reset_ends_the_cli_by_sigpipe_and_stops_its_commands ).
 Library, reader quit: test_reader_quit.py ( test_a_program_whose_reader_quit_stops_its_command_and_gets_broken_pipe_error, test_shown_calls_fanned_out_over_the_programs_threads_all_end,
 test_a_shown_command_that_prints_nothing_runs_whoever_met_the_reader_quitting_first, test_the_last_words_of_a_command_that_then_ends_are_only_lost,
+test_last_words_that_arrive_at_once_are_only_lost, test_a_call_of_commands_that_each_print_once_runs_them_all_and_returns,
+test_output_without_line_ends_that_keeps_coming_stops_its_call, test_a_command_that_exits_and_leaves_a_follower_holding_its_output_stops_its_call,
+test_a_shown_dry_run_whose_reader_quit_raises,
 test_commands_nobody_waits_for_are_stopped_and_their_tasks_say_so, test_a_quiet_call_never_looks_at_stdout ).
 mcmd, other failed write: test_cli_failed_stdout.py ( test_a_terminal_that_hung_up_loses_the_output_and_every_command_runs, test_a_full_disk_under_stdout_loses_the_output_and_every_command_runs ).
 Library, other failed write: test_reader_quit.py ( test_any_other_failed_write_still_loses_only_the_output ), test_cli_failed_stdout.py ( test_the_library_runs_every_command_when_stdout_fails,
@@ -469,17 +472,15 @@ Closed at start: test_cli_failed_stdout.py ( test_a_stdout_closed_at_start_drops
 
 | What happened to stdout | `mcmd` | A program that imports multiCMD |
 |---|---|---|
-| Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command that goes on printing is stopped; its call skips what it has not started and, if it waits, raises `BrokenPipeError`. A command that prints nothing more, or only its last lines, runs to its end. A quiet call never looks at stdout |
-| Any other failed write (a terminal that hung up, a full disk; in a program, a `sys.stdout` it closed) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised. The program's own writes, and Python's flush at exit (status 120), still meet the error: a library does not redirect its caller's stdout |
+| Its reader quit (`... \| head`, a socket its peer closed or reset) | Stops every command as a Ctrl-C does and ends by SIGPIPE (141; 1 on Windows), with nothing on stderr | A shown command whose output keeps coming after the quit is stopped, and so is the rest of its call: its queued commands are skipped and, if it waits, the call raises `BrokenPipeError`. A command that prints nothing more, or only its last words (output that arrives at once), runs to its end, and its call goes on, queued commands included. A quiet call never looks at stdout |
+| Any other failed write (a terminal that hung up, a full disk; in a program, a `sys.stdout` it closed) | The output is dropped from then on, one line on stderr says so if stderr can still take it, every command runs, and the exit status is the commands' own | The same, and nothing is raised; the program's own writes still meet the error (a library does not redirect its caller's stdout) |
 | Closed at start (`>&-`) | The output is dropped silently; every command runs | The same (`sys.stdout` is `None`) |
 
 On Linux and macOS, with stdout on a pipe, `mcmd` asks the pipe as it waits, so a command that prints nothing more is
-stopped too (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout (a socket, as ksh93 on Linux builds its
-pipelines) and on Windows it learns that its reader quit from its next failed write. A run that must outlive its terminal or
-its connection runs as `nohup mcmd -q ... > log 2>&1 &`: a terminal that hangs up sends SIGHUP to its foreground job (bash and
-zsh to every job they started), which stops the commands (`mcmd` ends 129), and over `ssh` without a pty a dropped connection
-is a reader that quit; in a program, a cleanup that must run whatever stdout does passes `quiet=True`. The exceptions, with
-their evidence, are in [docs/limitations.md](docs/limitations.md).
+stopped too (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout, and on Windows, it learns that its reader quit
+from its next failed write. A run that must outlive its terminal or its connection: `nohup mcmd -q ... > log 2>&1 &`. In a
+program, a cleanup that must run whatever stdout does passes `quiet=True`. The exceptions, with their evidence, are in
+[docs/limitations.md](docs/limitations.md).
 
 ## Key functions and objects
 
@@ -532,21 +533,24 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 ## Upgrading to 1.64 from 1.63
 
-- Changed, library: once the reader of stdout quit, a shown command that goes on printing stops its call, which skips its
-  queued commands and, if it waits, raises `BrokenPipeError`, whenever the call began (1.63: any failed
-  write of multiCMD's stopped every shown call in flight, and every later call ran unseen, so a thread pool of shown calls
-  under `prog | head` could run for ever). `mcmd` is unchanged.
-- Changed, library: a command that prints nothing more, or only its last lines, runs to its end and its call returns, also
-  when its own header met the closed pipe: a silent `umount` in a `finally` runs, and `losetup --find --show` still hands
-  over its device (1.63: skipped, or raised; a command that prints nothing more is no longer stopped by another write's
-  failure: docs/limitations.md).
+- Changed, library: once the reader of stdout quit, a shown command whose output keeps coming stops its call: the call's
+  commands are stopped, its queued ones skipped and, if it waits, it raises `BrokenPipeError`, whenever it began (1.63: a
+  write that found the reader gone stopped every shown call in flight, and every later call ran unseen, so a thread pool of
+  shown calls under `prog | head` could run for ever). `mcmd` is unchanged.
+- Changed, library: a command that prints nothing more, or only its last words (output that arrives at once, on stdout and
+  stderr), runs to its end and its call goes on, also when its own header met the closed pipe: a silent `umount` in a
+  `finally` runs, `losetup --find --show` still hands over its device, and a call of commands that each print one line runs
+  them all and returns (1.63: a call in flight was stopped and raised; a later one ran unseen). A command that prints nothing
+  more is no longer stopped by another write's failure (docs/limitations.md).
+- Changed, library: a shown dry run whose line finds the reader gone raises `BrokenPipeError`, whenever it began (1.63: a dry
+  run made after the reader quit returned).
 - hpcp 9.89 with 1.64 installed beside it: when its reader quits, a cleanup step that prints as it works (the delayed
   `e2fsck` and `tune2fs`) is cut, and its call raises before the loop devices are detached, where 1.63 ran it unseen;
   hpcp's next version runs its cleanup quiet.
 - Changed: `input_with_timeout_and_countdown()` writes its prompt and countdown to stderr, after flushing stdout, and
   `format_bytes()` its error message (1.63: stdout, where a dead one raised `BrokenPipeError` and `> log` hid the prompt).
-- Fix: a `sys.stdout` the program closed loses the output and every command runs, and a program that runs
-  `multiCMD.main()` itself gets the library's rule back once it returns (1.63: `ValueError` and nothing ran; the watch stayed).
+- Fix: a `sys.stdout` the program closed loses the output and every command runs (1.63: `ValueError`, and nothing ran), and
+  `multiCMD.main()` called in a program leaves no stdout watch behind (1.63: its later quiet calls still asked the pipe).
 - Fix: a usage error with a stderr that cannot be written ends 2 on Python 3.9 and 3.10 too (1.63: 1).
 
 ## Upgrading to 1.63 from 1.62
