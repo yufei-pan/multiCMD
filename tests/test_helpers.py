@@ -64,6 +64,34 @@ def test_format_bytes_roundtrip():
 	assert format_bytes("1 KiB", to_int=True) == 1024
 
 
+@pytest.mark.parametrize("size", ["5 foo", "5foo", "5 fooi", "5 KiBx", "1.5 gigs", "5 bytes"])
+@pytest.mark.parametrize("kwargs", [{"to_int": True}, {}, {"use_1024_bytes": True}, {"to_int": True, "use_1024_bytes": False}],
+	ids=["to_int", "no flags", "1024", "to_int 1000"])
+def test_format_bytes_a_unit_it_does_not_know_is_an_invalid_size(capsys, size, kwargs):
+	# 1.64 returned None, silently, and int() of it raised TypeError; a size it cannot read at all already gave 0 and a line
+	got = format_bytes(size, **kwargs)
+	assert got == 0 and isinstance(got, int)
+	out, err = capsys.readouterr()
+	assert out == ""
+	assert "Invalid size format" in err and "Got: " + size in err
+
+
+@pytest.mark.parametrize("kwargs", [{"to_str": True}, {"to_str": True, "to_int": True}], ids=["to_str", "to_str to_int"])
+def test_format_bytes_to_str_hands_back_a_size_it_does_not_know_the_unit_of(capsys, kwargs):
+	# unchanged: the string asked to be shown comes back as it came, with nothing said
+	assert format_bytes("5 foo", **kwargs) == "5 foo"
+	assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("size, kwargs, expected", [
+	("5", {}, 5), ("5 B", {"to_int": True}, 5), ("2.5 kb", {"to_int": True}, 2500), ("2.5 KiB", {}, 2560),
+	("1 M", {"use_1024_bytes": True}, 1048576), ("3gib", {"to_int": True}, 3 * 1024 ** 3), ("1 T", {}, 10 ** 12),
+	(7, {"to_int": True}, 7), (7.9, {"to_int": True}, 7)], ids=str)
+def test_format_bytes_reads_every_unit_it_knows(capsys, size, kwargs, expected):
+	assert format_bytes(size, **kwargs) == expected
+	assert capsys.readouterr() == ("", "")
+
+
 def test_int_to_color_deterministic_and_in_range():
 	assert int_to_color(0x123456) == (36, 103, 171)
 	assert int_to_color(0) == (160, 160, 160)

@@ -3620,23 +3620,6 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			return size
 		elif isinstance(size, str):
 			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
-			if not match:
-				if to_str:
-					return size
-				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
-				return 0
-			number, _, unit = match.groups()
-			number = float(number)
-			unit = unit.strip().lower().rstrip("b")
-			if unit.endswith("i"):
-				use_1024_bytes = True
-			elif use_1024_bytes is None:
-				use_1024_bytes = False
-			unit = unit.rstrip("i")
-			if use_1024_bytes:
-				power = 2**10
-			else:
-				power = 10**3
 			unit_labels = {
 				"": 0,
 				"k": 1,
@@ -3648,18 +3631,33 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				"z": 7,
 				"y": 8,
 			}
-			if unit not in unit_labels:
+			if match:
+				number, _, unit = match.groups()
+				number = float(number)
+				unit = unit.strip().lower().rstrip("b")
+				if unit.endswith("i"):
+					use_1024_bytes = True
+				elif use_1024_bytes is None:
+					use_1024_bytes = False
+				unit = unit.rstrip("i")
+			# no number, or a unit that is none of these: not a size ( 1.64 returned None for the unit )
+			if not match or unit not in unit_labels:
 				if to_str:
 					return size
+				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
+				return 0
+			if use_1024_bytes:
+				power = 2**10
 			else:
-				if to_str:
-					return format_bytes(
-						size=int(number * (power**unit_labels[unit])),
-						use_1024_bytes=use_1024_bytes,
-						to_str=True,
-						str_format=str_format,
-					)
-				return int(number * (power**unit_labels[unit]))
+				power = 10**3
+			if to_str:
+				return format_bytes(
+					size=int(number * (power**unit_labels[unit])),
+					use_1024_bytes=use_1024_bytes,
+					to_str=True,
+					str_format=str_format,
+				)
+			return int(number * (power**unit_labels[unit]))
 		else:
 			try:
 				return int(size)

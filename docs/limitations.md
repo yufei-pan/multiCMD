@@ -300,11 +300,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   EAGAIN is not seen by the library): the user chose "Release, widen the KL (Recommended)"; the user did not ask for it, the
   1.63 re-review's second opinion found it. Widened 2026-11-13 to `mcmd` on a socket stdout: the user chose "Approve the
   sentence (Recommended)".
-
-### format_bytes() returns None for a size with an unknown unit
-- Kind: deferred
-- What the operator sees: `format_bytes('5 foo', to_int=True)` (a unit other than B, K, M, G, T, P, E, Z or Y, with or without
-  an `i`) returns `None`, not an int, and says nothing; `int()` of it raises `TypeError`. A size it cannot parse at all
-  returns 0 with a line on stderr. The same in 1.63 (ran, Python 3.14).
-- Why: the unit check falls through when `to_str` is false. Found by the 1.64 review's second opinion, outside 1.64's changes.
-- Revisit when: multiCMD 1.65: an unknown unit is an invalid size (the stderr line, and 0).
