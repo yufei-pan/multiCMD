@@ -29,7 +29,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.64'
+version = '1.65'
 __version__ = version
 COMMIT_DATE = '2026-11-13'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no

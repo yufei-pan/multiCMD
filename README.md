@@ -533,6 +533,18 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.65 from 1.64
+
+- Nothing needs doing to upgrade: `mcmd` is unchanged, and the two library changes below only replace an exception or a
+  `None`.
+- Changed, library: `format_bytes()` given a string with a unit it does not know (`'5 foo'`, `'1.5 gigs'`) returns `0` and
+  writes the "Invalid size format" line to stderr, as for a string with no number (1.64: `None`, silently). A program that
+  reads a size from its user and cannot tell this 0 from a real one checks the string itself: hpcp up to 9.91 takes the 0 as
+  the size for `-ddr`, `-L` and `-F` (1.64: it stopped with a `TypeError`).
+- Changed, library: `input_with_timeout_and_countdown()` returns `None` at once when stdin has ended (Ctrl-D, `/dev/null`),
+  is closed or is missing, as its docstring says (1.64: `EOFError`, `ValueError`, `TypeError` or `OSError`). A caller that
+  takes `None` as its default now gets the default on Ctrl-D, as it does on Enter.
+
 ## Upgrading to 1.64 from 1.63
 
 - Changed, library: once the reader of stdout quit, a shown command whose output keeps coming stops its call: the call's
