@@ -3124,7 +3124,7 @@ def main():
 	( _end_by_closed_stdout ). Any other failed write only loses the output ( _Display ); at exit stdout's descriptor is then
 	pointed at os.devnull, so that what the failed write left in Python's buffer cannot fail again ( status 120 ), and so is
 	a stderr that cannot be written ( its messages are dropped: _write_error ). What only the process's owner may do stays
-	here: the pipe poll, the two redirects and the end by SIGPIPE; as it returns, the library's rule is back.
+	here: the pipe poll, the two redirects and the end by SIGPIPE; as it returns, it leaves no stdout watch behind.
 	A stderr closed at start ( `2>&-` ) is replaced by os.devnull, so that nothing of ours, and no argparse usage error, goes to
 	stdout instead ( print( file=None ) and argparse write there ).
 	@returns:

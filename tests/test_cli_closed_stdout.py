@@ -794,3 +794,16 @@ def test_main_called_in_a_program_leaves_no_watch_behind(monkeypatch):
 	monkeypatch.setattr(sys, 'argv', ['mcmd', '-n', 'true'])
 	assert multiCMD.main() == 0
 	assert multiCMD._display.watch is None and not multiCMD._display.cli
+
+
+def test_main_called_in_a_program_that_closed_sys_stderr_returns_and_leaves_no_watch_behind(tmp_path, monkeypatch):
+	# _flush_stderr let the ValueError of a closed sys.stderr out of main(), which then left the CLI's state set
+	closed = open(tmp_path / 'err', 'w')
+	closed.close()
+	monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', end_by_closed_stdout)
+	monkeypatch.setattr(multiCMD, '_watch_stdout', Watched)
+	monkeypatch.setattr(multiCMD, '_install_cli_signal_handlers', lambda: None)
+	monkeypatch.setattr(sys, 'argv', ['mcmd', '-n', 'true'])
+	monkeypatch.setattr(sys, 'stderr', closed)
+	assert multiCMD.main() == 0
+	assert multiCMD._display.watch is None and not multiCMD._display.cli
