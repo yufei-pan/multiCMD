@@ -229,14 +229,28 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: ksh93 on Linux builds its pipelines from pipes, or a run is reported that this left running.
 - Approved: 2026-11-12, the user chose "Known limitation + README clause (Recommended)".
 
+### On Windows, a reader that quit is found by the next write
+- Kind: known limitation
+- What the operator sees: on Windows `mcmd 'long-quiet-command' | head -1` runs until the command prints again or ends. A
+  command that keeps printing is stopped at its next line (`mcmd` ends 1, with an empty stderr). On Linux and macOS `mcmd`
+  asks the pipe as it waits and stops at once. This is 1.62's behaviour, which the README says (the signals paragraph and
+  "Upgrading to 1.62").
+- Why: Windows has no cheap way to ask a pipe whether its reader is still there (`PeekNamedPipe` through `ctypes` would be
+  the route, testable only on GitHub's Windows runner). cas runs on Linux HPC hosts.
+- Revisit when: a Windows user hits it.
+- Approved: 2026-11-12, the user chose "Known limitation (Recommended)". The user did not ask for it explicitly; the 1.63
+  review's second opinion found it.
+
 ### A program that imports multiCMD learns that its reader quit only from a failed write
 - Kind: known limitation
 - What the operator sees: a program that shows its commands (not quiet) with its stdout on a pipe, and whose reader quits
-  (`prog | head -1`), stops them, skips the queued ones and gets `BrokenPipeError` when a write of multiCMD's own output
-  fails. The library does not ask the pipe, as `mcmd` does. So a shown command that prints nothing more, such as `tail -f`
-  of a log that has gone idle, runs until its next line (or its end), and the program stays until then; `mcmd 'tail -f log'
-  | head -1` in the same place ends at once. 1.62's library was the same: it raised at the next write. The README says so in
-  one sentence.
+  (`prog | head -1`): when a write of multiCMD's own output fails, the calls that show commands stop them and skip the
+  queued ones, and a waiting call raises `BrokenPipeError` once they are dead (an `AsyncExecutor` or a
+  `wait_for_return=False` call gets no error). The library does not ask the pipe, as `mcmd` does. So a shown command that
+  prints nothing more, such as `tail -f` of a log that has gone idle, runs until its next line (or its end), and the program
+  stays until then; `mcmd 'tail -f log' | head -1` in the same place ends at once on Linux and macOS (on Windows, and under
+  ksh93 on Linux, `mcmd` too learns it from a failed write). 1.62's library was the same: it raised at the next write. The
+  README says so in one sentence.
 - Why: asking the pipe means polling a stdout the library does not own, with one poll object per shown call and per thread
   (a poll object is one thread's), handed down to every wait; `mcmd` does it in `main()`, which owns the process.
 - Revisit when: someone hits it.
@@ -267,11 +281,49 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-11-12, the user chose "Known limitation (Recommended)".
 
-### format_bytes() writes its "Invalid size format" message to stdout with a bare print
+### format_bytes() and input_with_timeout_and_countdown() write to stdout with a bare print
 - Kind: deferred
 - What the operator sees: `format_bytes()` (hpcp parses its size limits through it at start) prints "Invalid size format ..."
-  and "Got: ..." with a bare `print()` to stdout, which is the data stream, and raises `OSError` if stdout is dead. It is a
-  write of multiCMD's own that the display rule does not cover. Older than 1.63; no caller is known to reach it with a dead
-  stdout.
-- Why: found in the 1.63 second review, after the build had gone through the display's door for every other write of its own.
-- Revisit when: multiCMD 1.64, which sends the message through `_write_error`.
+  and "Got: ..." with a bare `print()` (multiCMD.py:3590 and :3594), and `input_with_timeout_and_countdown()` prints its
+  prompt and its countdown the same way (multiCMD.py:3238 and :3253; hpcp calls it at six places, hpcp.py:8176, 11479,
+  13376, 13420, 13446 and 14339 at ae258b0). Both write to stdout, which is the data stream, and raise `OSError` if stdout is
+  dead. They are writes of multiCMD's own that the display rule does not cover. Older than 1.63; no caller is known to
+  reach either with a dead stdout.
+- Why: `format_bytes()` was found in the 1.63 second review, after the build had gone through the display's door for every
+  other write of its own; the prompt in the third review's second opinion.
+- Revisit when: multiCMD 1.64, which sends both through the display rule (the message through `_write_error`, the prompt
+  and its countdown through the display).
+
+### A shown call that starts after the reader quit runs its commands unseen to their end, on any thread
+- Kind: deferred
+- What the operator sees: a shown call (not quiet) that starts after multiCMD has found the reader of stdout gone is made
+  quiet at its start, so nothing asks its commands to stop: they run unseen to their end, on any thread. A program that fans
+  shown calls out over its own threads (a thread pool) under `prog | head` keeps running while a remaining call's command
+  never ends (`tail -f`): 3 of 8 calls raised and 5 were still pending at 12 s, where 1.62 raised `BrokenPipeError` in all 8
+  within 0.1 s. Two shown calls started on two threads together do the same (5 to 8 of 10 runs hung, by run and Python). A call already in
+  flight stops and raises, as the README says. No cas tool has the shape: hpcp's shown calls are serial, and statblk and
+  statbtrfs pass `quiet=True`. Workaround: run such a fan-out as one call with `max_threads`, which stops as one, or stop
+  submitting on `BrokenPipeError`. The README says so in the signals paragraph and in "Upgrading to 1.63".
+- Why: `run_commands` decides at its start, from one global flag, whether the call is a later call (multiCMD.py:2803, and
+  `AsyncExecutor.run_commands` at :832), and a later call is quiet, so no wait asks it to stop. Making every later shown
+  call raise instead would bring back hpcp's cleanup leaks (a cleanup's `umount` raised, so loop devices and mount-point
+  directories stayed behind in 30 of 30 rows of the 1.63 third review's VM runs). The user decided 2026-11-12: "Release,
+  fix in 1.64 (Recommended)".
+- Revisit when: multiCMD 1.64. A design check comes first, of Unix's SIGPIPE rule for later calls: a later call's command
+  is stopped when it prints, so a silent cleanup such as `umount` still runs and a follower ends at its next line. Then
+  build it.
+
+### A shown call whose own first lines meet the reader quitting is not a later call, so a cleanup after it can be skipped
+- Kind: deferred
+- What the operator sees: when the reader of stdout quits before multiCMD has found it gone (the program's own write met the
+  dead pipe first, or the quit lands in a call's own header or a later line), that call is a call in flight, not a later
+  call: its commands are skipped (or stop) and it raises `BrokenPipeError`. A cleanup after it that shows its commands
+  (`umount`) is then skipped too, and so is whatever the program's `finally` runs after the raise. hpcp 9.89 `-di img |
+  head -K` left a mount, a loop device or the mount-point directory behind in 8 of 30 rows (K = 10, 60, 75, 80 in VM 901; 1.62
+  left something in 30 of 30). A cleanup that must run whatever stdout does passes `quiet=True`; the README says so.
+- Why: the later-call rule reads one flag that only a failed write of multiCMD's own sets. Flushing `sys.stdout` at the start
+  of a shown call that is not yet a later call (`if not quiet and not _display.closed: _display.flush()`) makes what the
+  program's own failed write left in Python's buffer fail there, so the call is recognised as a later call: a prototype took
+  K = 60 from 5 of 5 runs leaving the mount and the loop device to 0 of 5. K = 10, 75 and 80 need hpcp's cleanup not to depend
+  on stdout (its `umount` quiet, no step cut short by another's exception, the output it parses from `losetup` quiet).
+- Revisit when: multiCMD 1.64 (the flush), and hpcp's next version (its cleanup).

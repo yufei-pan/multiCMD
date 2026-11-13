@@ -157,7 +157,7 @@ def _reader_quit(quiet=False):
 			if events&_READER_QUIT:_display.closed=True
 	return _display.closed
 def _raise_if_reader_quit(quiet=False):
-	if _reader_quit(quiet):raise BrokenPipeError(errno.EPIPE,'the reader of stdout quit, so the commands were stopped')
+	if _reader_quit(quiet):raise BrokenPipeError(errno.EPIPE,'the reader of stdout quit')
 class AsyncExecutor:
 	def __init__(self,max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
 		self.max_threads=max_threads

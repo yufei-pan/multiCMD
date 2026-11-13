@@ -495,7 +495,7 @@ class _Display:
 
 	def lose(self, error):
 		'''
-		Drop every later write, and say once on stderr that error lost the output, as name ( internal )
+		Drop every later write, and say once on stderr that error lost the output, as self.name ( internal )
 		'''
 		if self.lost:
 			# another thread met the failure first ( a bar frame racing a live line ) and said so
@@ -605,7 +605,8 @@ def _reader_quit(quiet=False):
 	and so does every start ( __run_command ): a flag, so nothing is raised through a wait, which a signal handler's raise
 	would be, landing wherever the main thread is, in a __del__ among them, where Python drops it and the stop is lost.
 	Only the main thread asks the watch ( a poll object is one thread's ); the others see what it found, or a write did.
-	A call made after the reader quit is made quiet by run_commands, so it asks nothing.
+	A call made after the reader quit is made quiet by run_commands and AsyncExecutor.run_commands, so without a watch it
+	asks nothing; under a watch ( mcmd ) a quiet call asks too, and answers for the reader whatever quiet says.
 	'''
 	if _display.watch is None:
 		return _display.closed and not quiet
@@ -617,11 +618,12 @@ def _reader_quit(quiet=False):
 
 def _raise_if_reader_quit(quiet=False):
 	'''
-	Raise BrokenPipeError at the end of a waiting run_commands whose commands were stopped because the reader of their output
-	quit, whichever form the platform gave the failed write ( EPIPE, ECONNRESET, Windows' EINVAL ) ( internal )
+	Raise BrokenPipeError at the end of a waiting run_commands once the reader of its output quit, whichever form the platform
+	gave the failed write ( EPIPE, ECONNRESET, Windows' EINVAL ). The commands were stopped or skipped, or had already finished
+	( or, for a dry run, were only shown ) ( internal )
 	'''
 	if _reader_quit(quiet):
-		raise BrokenPipeError(errno.EPIPE, 'the reader of stdout quit, so the commands were stopped')
+		raise BrokenPipeError(errno.EPIPE, 'the reader of stdout quit')
 
 class AsyncExecutor:
 	def __init__(self, max_threads=1,semaphore=...,timeout=0,quiet=True,dry_run=False,parse=False,shell=False,prefix=False,color=None,pty=False,env=None,extra_env=None,pass_fds=()):
@@ -1846,7 +1848,7 @@ def _watch(task, proc, timeout, quiet=False):
 		proc: The command's process
 		timeout: Inactivity timeout in seconds ( 0: none )
 	@returns:
-		None | str: None when it exited, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
+		None | str: None when it exited, 'stop' when task.stop was set or the reader quit ( _reader_quit ), 'timeout' after timeout seconds without output
 	'''
 	sleep_time = 1.0e-7 # 100 nanoseconds
 	while proc.poll() is None:  # while the process is still running
@@ -1890,7 +1892,7 @@ def _drain(task, readers, timeout, quiet=False):
 		readers: The reader threads
 		timeout: Inactivity timeout in seconds ( 0: none )
 	@returns:
-		None | str: None once all output ended, 'stop' when task.stop was set, 'timeout' after timeout seconds without output
+		None | str: None once all output ended, 'stop' when task.stop was set or the reader quit ( _reader_quit ), 'timeout' after timeout seconds without output
 	'''
 	while _any_alive(readers):
 		if task.stop or _reader_quit(quiet):
@@ -2862,7 +2864,7 @@ def run_commands(commands, timeout=0,max_threads=1,quiet=False,dry_run=False,wit
 			_stop_tasks(tasks)
 			raise
 	if wait_for_return:
-		# the reader of what this call shows quit meanwhile: its commands were stopped, the queued ones skipped
+		# the reader of what this call shows quit meanwhile: its commands were stopped or skipped, or had already finished
 		_raise_if_reader_quit(quiet)
 	# return the only the output for the tasks
 	if raise_error:

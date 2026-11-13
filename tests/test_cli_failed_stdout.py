@@ -417,7 +417,7 @@ def test_a_stderr_that_is_none_gets_no_message_in_stdout(monkeypatch, capsys):
 
 def test_a_lost_stdout_points_at_devnull_and_says_so_once(tmp_path, monkeypatch, capfd):
 	# so that what the failed write left in Python's buffer goes nowhere at exit, instead of failing again ( status 120 ):
-	# mcmd does it as main() returns; a program that imports multiCMD keeps its descriptor
+	# mcmd does it as main() returns
 	path = tmp_path / 'out'
 	fd = os.open(str(path), os.O_WRONLY | os.O_CREAT)
 	try:
@@ -426,10 +426,14 @@ def test_a_lost_stdout_points_at_devnull_and_says_so_once(tmp_path, monkeypatch,
 			multiCMD._display.message('header')
 			multiCMD._display.lines(['a', 'b'])
 			return 3
+		ended = []
 		monkeypatch.setattr(multiCMD, '_run_cli', run)
 		monkeypatch.setattr(multiCMD, '_watch_stdout', lambda: None)
+		# ( replaced first: a main() that found the reader gone would end this test run by SIGPIPE )
+		monkeypatch.setattr(multiCMD, '_end_by_closed_stdout', lambda: ended.append(True))
 		assert multiCMD.main() == 3
 		assert multiCMD._display.lost and not multiCMD._display.closed
+		assert ended == []
 		os.write(fd, b'after')
 	finally:
 		monkeypatch.undo()

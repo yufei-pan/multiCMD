@@ -119,15 +119,6 @@ def test_quote_command():
 	assert multiCMD._quote_command('echo hi') == 'echo hi'
 
 
-class ClosedPipe:
-	'''A stdout nobody reads: every write fails as a pipe whose reader quit does'''
-	def write(self, text):
-		raise BrokenPipeError(errno.EPIPE, 'Broken pipe')
-
-	def flush(self):
-		pass
-
-
 class FailingStdout:
 	'''A stdout every write and flush of which fails with error'''
 	def __init__(self, error):

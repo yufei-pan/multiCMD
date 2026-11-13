@@ -368,8 +368,8 @@ def test_a_closed_stdout_ends_the_wait_for_output_that_a_command_left_open(tmp_p
 
 
 def test_the_stop_that_a_closed_stdout_starts_is_not_cut_short(tmp_path):
-	# raised once: the waits of the stop ( up to 2 s here: the command ignores SIGINT and SIGTERM, and only SIGKILL ends it )
-	# do not raise it again, so the command is dead when it reaches the caller
+	# the stop is not cut short: the waits of the stop ( up to 2 s here: the command ignores SIGINT and SIGTERM, and only
+	# SIGKILL ends it ) go on although the reader is gone, so the command is dead before the call raises
 	script = f'trap "" INT TERM; echo $$ > {tmp_path}/pid1; i=0; while [ $i -lt 240 ]; do sleep 0.05; i=$((i+1)); done'
 	closer = CloseOnceStarted(tmp_path, 1)
 	try:
@@ -656,7 +656,7 @@ def test_a_stdout_descriptor_that_is_not_open_is_not_taken_for_a_reader_that_qui
 @has_poll
 def test_the_library_does_not_poll_stdout(monkeypatch):
 	# only the CLI is a filter that ends when its reader quits: a program that imports multiCMD, with a pipe for stdout
-	# whose reader quit, gets no BrokenPipeError from a quiet run, which writes nothing and asks nothing ( known limitation )
+	# whose reader quit, gets no BrokenPipeError from a quiet run, which writes nothing and asks nothing
 	read_end, write_end = os.pipe()
 	os.close(read_end)
 	pipe = os.fdopen(write_end, 'w')

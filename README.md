@@ -422,7 +422,8 @@ commands on SIGTERM / SIGHUP (unless started with them ignored, as under `nohup`
 has no reader (`mcmd ... | head`, or a socket its peer closed or reset): it stops them as a Ctrl-C does, and ends by
 SIGPIPE, as `yes | head` does, with nothing on stderr. When stdout is a pipe on Linux and macOS it also asks the pipe as it waits, so a command that prints
 nothing more is stopped as well (`mcmd 'sleep 4' | head -2` ends at once); with any other stdout, and on Windows, it
-learns it only when a write fails, and a command that prints nothing more runs to its end first. ksh93 on Linux builds its
+learns it only when a write fails, and a command that prints nothing more runs to its end first (on Windows that is a known
+limitation, docs/limitations.md). ksh93 on Linux builds its
 pipelines from sockets, so under it `mcmd ... | head` is the same: a write finds the reader gone, as in 1.61 (bash, dash, zsh,
 mksh, busybox and macOS's ksh give a pipe). A write to stdout that fails for any other reason (EIO from a terminal that
 hung up, ENOSPC from a full disk; on Windows, EINVAL from anything but a pipe) loses only the output: `mcmd` drops it from
@@ -444,11 +445,18 @@ and none of those writes raises in the thread that wrote. A reader that quit (`B
 Windows `OSError` EINVAL from a pipe) stops the calls that are showing their commands (not quiet): their commands are
 stopped as a Ctrl-C stops them, the queued ones are skipped (return code `None`), and a call that waits raises
 `BrokenPipeError` once its commands are dead, whichever of those forms the platform gave the write (`except OSError` catches
-it too). A pool stops all its commands, and a call on a thread of the program's own raises in that thread. Commands nobody
-waits for (`AsyncExecutor`, `run_commands(wait_for_return=False)`) are stopped without an error: `wait()`, `join()` and
-`join_threads()` return, and the tasks tell (a stopped one has the kill's return code, a queued one `None`). A call made after
-that runs its commands without showing them, so a cleanup in a `finally` (an unmount) still runs, and a quiet call never looks
-at stdout. The library learns that its reader quit only from a failed write, and does not poll the pipe as `mcmd` does, so a
+it too). A pool stops all its commands, and a call on a thread of the program's own raises in that thread. Shown commands
+nobody waits for (an `AsyncExecutor` made with `quiet=False`, `run_commands(wait_for_return=False)`; an `AsyncExecutor` is
+quiet by default, and a quiet one is never stopped) are stopped without an error: `wait()`, `join()` and `join_threads()`
+return, and the tasks tell (a stopped one has the kill's return code, a queued one `None`). Every call made after multiCMD
+has found the reader gone, for the rest of the process, runs its commands unseen, and multiCMD's own stderr lines for it
+(`Command path not found`, `Error running command`) are not printed either. So a cleanup in a `finally` (an unmount) runs
+once an earlier shown call has raised. A call whose own first lines meet the reader quitting, or that follows only the
+program's own failed write, is a shown call like any other: its commands are skipped and it raises. A cleanup that must run
+whatever stdout does passes `quiet=True`. A quiet call never looks at stdout. One edge of that rule (deferred to 1.64,
+docs/limitations.md): a shown call that starts after multiCMD has found the reader gone runs its commands unseen to their end,
+on any thread, so a program that fans shown calls out over its own threads (a thread pool) under `prog | head` keeps running
+while a remaining call's command never ends; run such a fan-out as one call with `max_threads`, which stops as one. The library learns that its reader quit only from a failed write, and does not poll the pipe as `mcmd` does, so a
 shown command that prints nothing more (`tail -f` of a log that went idle, under `prog | head -1`) runs until its next line
 (see docs/limitations.md). Any other failed write (EIO from a terminal that hung up, ENOSPC from a full disk) loses only the
 output: multiCMD's output is dropped from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and
@@ -542,7 +550,10 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 ## Upgrading to 1.63 from 1.62
 
-- Nothing needs doing to upgrade.
+- Nothing needs doing to upgrade, except for two kinds of library program. One that catches `ConnectionResetError` from a
+  shown call now gets `BrokenPipeError` for a reset socket (catch `OSError` or `BrokenPipeError`). One that relied on 1.62's
+  error from every shown call made after the reader quit (a loop that catches per item, a thread pool) now has those calls
+  run unseen: see the library bullet below.
 - Fix: a write to stdout that fails for another reason than a reader quitting no longer breaks the run. With a terminal that
   hung up on a job nobody signals (EIO: `setsid mcmd ...` or a `disown`ed job) or a full disk (ENOSPC), `mcmd`
   drops its output from then on, runs every command (running and queued, serial and with `-m`; their output is still read,
@@ -553,12 +564,15 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   terminal's hang-up signals (the foreground job; any job of bash or zsh) still gets SIGHUP when it hangs up, and stops
   (`129`), as before.
 - Fix: a stderr that cannot be written (`mcmd ... 2>/dev/full`, or a pipe nobody reads) changes no exit status: its messages
-  are dropped. 1.62 ended 120, from Python's flush at exit (`mcmd no-such-command 2>/dev/full` gave 120, not 127).
+  are dropped. 1.62 ended 120, from Python's flush at exit (`mcmd no-such-command 2>/dev/full` gave 120, not 127). A usage
+  error on Python 3.9 still ends 1 there (1.62: 120; Python 3.6 and 3.11 give 2).
 - Fix: `mcmd ... 2>&-` (stderr closed at start) puts none of its messages, and no usage error, into stdout. 1.62 wrote them
   there (`Command path not found`, `mcmd: no commands to run`, argparse's usage), and a usage error ended 1 on Python 3.6 and
   3.9. In a program that imports multiCMD, its warnings and failure messages are dropped then, not written to stdout.
 - Fix: `mcmd ... >&-` (stdout closed at start) drops the output silently and runs every command. 1.62 printed "Error running
-  command" and a traceback, and a serial run did not start its commands.
+  command" and a traceback, and a serial run did not start its commands. In a program that imports multiCMD, a `None`
+  `sys.stdout` does the same: the output is dropped and the command runs, where 1.62 raised `AttributeError`, printed "Error
+  running command" and did not run it (return code -1).
 - Fix, Python 3.6 in a C locale (ASCII stdout): a command's non-ASCII output is shown with backslash escapes (`caf\xe9`).
   1.62 killed the thread that read the command's output with a `UnicodeEncodeError`.
 - Fix: a socket its peer reset (ECONNRESET) is a reader that quit, as a closed pipe is: `mcmd` stops its commands and ends
@@ -571,9 +585,14 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   from a pipe) stops the calls that show their commands: they stop them, skip the queued ones, and a waiting
   `run_commands()` (`run_command()` too) raises `BrokenPipeError` once they are dead. 1.62 documented "`BrokenPipeError`;
   `OSError` EINVAL on Windows", and a reset socket gave `ConnectionResetError`: now it is one error, and `except OSError`
-  catches it as before. Commands nobody waits for (`AsyncExecutor`, `wait_for_return=False`) are stopped without an error.
-  Calls made after that run their commands without showing them (a cleanup that shows its commands still runs), where 1.62
-  raised again and ran nothing. The library does not poll the pipe as `mcmd` does: a shown command that prints nothing more
+  catches it as before. Shown commands nobody waits for (an `AsyncExecutor` made with `quiet=False`,
+  `wait_for_return=False`; an `AsyncExecutor` is quiet by default, and is then never stopped) are stopped without an error.
+  Calls made after multiCMD has found the reader gone run their commands unseen, without multiCMD's own stderr lines, where
+  1.62 raised again and ran nothing (a cleanup still runs, unseen, once an earlier shown call has raised; one that must run
+  whatever stdout does passes `quiet=True`). A shown call that starts after that runs its commands unseen to their end on any
+  thread, so a fan-out over the program's own threads (a thread pool) under `prog | head` can keep running while a remaining
+  call's command never ends, where 1.62 raised in every call: run it as one call with `max_threads`, which stops as one
+  (deferred to 1.64, docs/limitations.md). The library does not poll the pipe as `mcmd` does: a shown command that prints nothing more
   runs until its next line (docs/limitations.md; 1.62's was the same). Any other failed write only loses the output: dropped
   from then on, one line on stderr says so (`multiCMD: cannot write to stdout ...`), and every command runs. 1.62 raised the
   error in the thread that wrote: a command whose "Running command" line could not be written counted as failed (-1) without
