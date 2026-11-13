@@ -252,7 +252,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   and its call raised `BrokenPipeError`; 1.62's library raised at its next write. `mcmd 'tail -f log' | head -1` in the
   same place ends at once on Linux and macOS (on Windows, and under ksh93 on Linux, `mcmd` too learns it from a failed
   write). Output with no line end (`ping -f`, a `printf .` loop) is never written, so a command already running when the
-  reader quit never finds it gone: it runs until it ends a line or ends. The README's "When stdout fails" says so.
+  reader quit does not find it gone by itself: it runs until it ends a line, ends, or another write of multiCMD's finds
+  the reader gone (another command's line, a progress bar), and then stops as any output that keeps coming. The README's
+  "When stdout fails" says so.
 - Why: stopping it needs either the pipe poll in the library (asking a stdout the library does not own, with one poll
   object per shown call and per thread, handed down to every wait; declined 2026-11-12) or a stop on somebody else's failed
   write, the global flag whose timing made 1.63's findings: a fan-out of shown calls over the program's threads ran for
@@ -260,7 +262,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: someone hits it.
 - Approved: 2026-11-12, the user chose "Known limitation (Recommended)". Reworded 2026-11-13 for 1.64's rule: the user chose
   "Reword the KL (Recommended)". Widened 2026-11-13 to output with no line end: the user chose "Known limitation
-  (Recommended)".
+  (Recommended)". Narrowed 2026-11-13 (another write of multiCMD's that finds the reader gone stops it): the main session's
+  call.
 
 ### With stdout and stderr on the same dead target, the line that says the output was lost is lost too
 - Kind: known limitation
