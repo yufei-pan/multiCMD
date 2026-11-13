@@ -1,7 +1,7 @@
 '''
 A program that imports multiCMD and shows its commands ( not quiet ), when the reader of its stdout quits ( `prog | head` ):
 a shown command whose output keeps coming stops its call, which skips its queued commands and raises BrokenPipeError, whenever
-the call began; a command that prints nothing more, or only its last words ( output within 0.2 s ), runs to its end;
+the call began; a command that prints nothing more, or only its last words ( output within 1 s ), runs to its end;
 a quiet call never looks.
 1.63's first builds lost the output and ran on: a command that never ends ( `tail -f` ) kept the program running for ever.
 '''
@@ -16,6 +16,7 @@ import time
 
 import pytest
 
+import multiCMD
 from conftest import PACKAGE_ROOT
 
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='POSIX only')
@@ -376,6 +377,47 @@ def test_the_last_words_of_a_command_that_then_ends_are_only_lost(tmp_path):
 		""")
 	assert "GOT 0 ['/dev/loop0']" in err
 	assert (tmp_path / 'attached').exists()
+
+
+# the number the window is sized for ( multiCMD._LAST_WORDS ): at least 0.5 s, the longest a process starved of CPU waited
+# between two writes of its last words ( 18 processes sharing a quarter CPU ); at most 2 s, the longest the follower tests
+# above ( took < 5 ) allow for a stop. These two tests pin the window's edges: a second piece of output at half the window
+# after the first lost one is last words, and one at 1.5 times the window means the command goes on printing
+def second_piece_after(tmp_path, fraction, then):
+	window = multiCMD._LAST_WORDS
+	assert 0.5 <= window <= 2
+	gap = fraction * window
+	status, err, took = run_program(tmp_path, f"""
+		for i in range(5):
+			print('line', i, flush=True)
+		deadline = time.monotonic() + 10
+		while not os.path.exists(MARK) and time.monotonic() < deadline:
+			time.sleep(0.01)
+		try:
+			codes = multiCMD.run_commands([['sh', '-c', 'echo $$ >> {tmp_path}/pids; echo first; sleep {gap}; echo second; {then}'], ['touch', {str(tmp_path / 'queued-ran')!r}]], return_code_only=True)
+			sys.stderr.write('RETURNED %s\\n' % codes)
+		except BrokenPipeError:
+			sys.stderr.write('RAISED\\n')
+		sys.stderr.flush()
+		os._exit(0)
+		""")
+	return err
+
+
+@posix_only
+def test_a_second_piece_of_output_at_half_the_window_is_still_last_words(tmp_path):
+	# the reader quit before the call, as under hpcp's cleanup: the first line is the first lost read
+	err = second_piece_after(tmp_path, 0.5, 'true')
+	assert 'RETURNED [0, 0]\n' in err
+	assert (tmp_path / 'queued-ran').exists()
+
+
+@posix_only
+def test_a_second_piece_of_output_at_one_and_a_half_times_the_window_stops_the_call(tmp_path):
+	# the command is still running ( sleep 30 ): the stop kills it
+	err = second_piece_after(tmp_path, 1.5, 'sleep 30')
+	assert 'RAISED\n' in err
+	assert not (tmp_path / 'queued-ran').exists()
 
 
 @posix_only

@@ -740,7 +740,7 @@ def test_windows_einval_from_a_pipe_reaches_the_library_caller_as_broken_pipe_er
 	command = [sys.executable, '-c', 'import sys; sys.exit(3)']
 	if kind == 'pipe':
 		with pytest.raises(BrokenPipeError) as raised:
-			multiCMD.run_command([sys.executable, '-u', '-c', 'import time; print("a line"); time.sleep(0.3); print("another"); time.sleep(30)'])
+			multiCMD.run_command([sys.executable, '-u', '-c', 'import time; print("a line"); time.sleep(1.5); print("another"); time.sleep(30)'])
 		assert raised.value.errno == errno.EPIPE
 		assert multiCMD._display.closed and not multiCMD._display.lost
 		# a command that prints nothing runs once the reader was found gone, and nothing is raised

@@ -1094,9 +1094,11 @@ def _expand_ranges_fast(inStr, variables=None):
 _expand_ranges = _expand_ranges_fast
 
 # a tool writes its last words ( `umount: X: No such file or directory`, dd's summary ) in a few writes microseconds apart,
-# which can reach a reader as two or three reads; under a CPU quota the writer can wait one scheduler period ( 100 ms ) between
-# them. What a command prints after this long once its first lost read means it goes on printing ( _read_stream )
-_LAST_WORDS = 0.2
+# which can reach a reader as two or three reads. A process starved of CPU waited up to 0.5 s between two of them ( 18
+# processes sharing a quarter CPU ), and this is twice that: 0 of 10 pooled calls of 16 and 32 Python commands raised there,
+# where 0.2 s raised 3 and 4. What a command prints after this long once its first lost read means it goes on printing
+# ( _read_stream ); a follower is stopped about this long after the reader quit
+_LAST_WORDS = 1.0
 
 def _read_stream(stream, target, task, decor=('', '', ''), quiet=False):
 	'''
