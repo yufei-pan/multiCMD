@@ -990,8 +990,13 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	except ImportError:msvcrt=None
 	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False);fd=None
 	if msvcrt is None and not no_stdin:fd=sys.stdin.fileno()
-	try:tty=fd is not None and os.isatty(fd)
-	except OSError:tty=False
+	tty=False
+	if fd is not None:
+		try:import termios;tty=bool(termios.tcgetattr(fd)[3]&termios.ICANON)
+		except Exception:pass
+	if fd is not None and not tty:
+		try:sys.stdin.seek(sys.stdin.tell())
+		except(OSError,ValueError,AttributeError):pass
 	deadline=time.monotonic()+timeout;typed=bytearray();shown=None;late=0
 	while True:
 		remaining=deadline-time.monotonic();seconds=max(math.ceil(remaining),0)
@@ -1005,7 +1010,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 				if data and b'\n'not in data:
 					if remaining<=0:late+=len(data)
 					if late<4096:continue
-				elif typed:line=bytes(typed).split(b'\n',1)[0];return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8','replace').strip()
+				elif typed:line=bytes(typed).split(b'\n',1)[0];errors=getattr(sys.stdin,'errors',None);return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',errors if errors and errors!='strict'else'replace').strip()
 				else:
 					ended=True
 					if not tty:
@@ -1013,7 +1018,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 						if line:return line.strip()
 		except(EOFError,OSError,ValueError):ended=True
 		if remaining<=0:return
-		if ended:time.sleep(wait)
+		if ended:time.sleep(max(deadline-(seconds-1)-time.monotonic(),0))
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
 	import re,unicodedata;version=1.21;_=version
 	if not data:return''
@@ -1158,7 +1163,7 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 	if to_int or isinstance(size,str):
 		if isinstance(size,int):return size
 		elif isinstance(size,str):
-			match=re.fullmatch('(\\d+(\\.\\d*)?)\\s*((?:[kmgtpezy]i?)?b?)',size.strip(),re.IGNORECASE);unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
+			match=re.fullmatch('(\\d+(\\.\\d*)?)\\s*((?:[kmgtpezyKMGTPEZY][iI]?)?[bB]?)',size.strip());unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
 			if match:
 				number,_,unit=match.groups();number=float(number);unit=unit.lower().rstrip('b')
 				if unit.endswith('i'):use_1024_bytes=True

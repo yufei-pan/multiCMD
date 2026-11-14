@@ -191,6 +191,8 @@ def fake_select(clock, ready):
 	out its timeout on the clock'''
 	def select(r, w, x, timeout=None):
 		clock.waited.append(timeout)
+		# a countdown that never ends fails here and does not hang the suite ( the longest one here asks 4,100 times )
+		assert len(clock.waited) < 10000, "the countdown does not end"
 		if ready(clock):
 			return (list(r), [], [])
 		clock.now += timeout

@@ -3281,13 +3281,25 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# the count is by the clock, and stdin is read by its descriptor: input() would wait for a whole line with no timeout
 	# ( text typed and then Ctrl-D, a program that loaded readline, a pipe that sent part of a line ), while the descriptor is
 	# read only as far as select() says there is something, and only up to the end of the line, so what follows it stays for
-	# whoever reads stdin next. A terminal gives at most a line per read ( its line mode ), and must be read in whole reads:
+	# whoever reads stdin next. A terminal in its line mode gives at most a line per read, and must be read in whole reads:
 	# macOS tells text that a Ctrl-D handed over from the end of the input only so ( read a byte at a time, the Ctrl-D comes
-	# back as an end of its own ); anything else is read a byte at a time, as the shell's read does
-	try:
-		tty = fd is not None and os.isatty(fd)
-	except OSError:
-		tty = False
+	# back as an end of its own ); anything else is read a byte at a time, as the shell's read does, a terminal out of its
+	# line mode too ( cbreak, raw: one read there gives all that was typed, the next line with it )
+	tty = False
+	if fd is not None:
+		try:
+			import termios
+			tty = bool(termios.tcgetattr(fd)[3] & termios.ICANON)
+		except Exception:
+			# not a terminal, one that is gone, or no termios
+			pass
+	if fd is not None and not tty:
+		# a file the program read part of through sys.stdin: put the descriptor where Python's own reading stands, so the
+		# answer is the line Python would give next ( a pipe cannot be put back )
+		try:
+			sys.stdin.seek(sys.stdin.tell())
+		except (OSError, ValueError, AttributeError):
+			pass
 	deadline = time.monotonic() + timeout
 	typed = bytearray()
 	shown = None
@@ -3321,10 +3333,13 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				elif typed:
 					# Enter, or the end of the input after text ( a pipe whose last line has no newline; Ctrl-D twice )
 					line = bytes(typed).split(b'\n', 1)[0]
-					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', 'replace').strip()
+					# bytes that are not text are kept as stdin itself keeps them ( surrogateescape under the C locale ), and
+					# replaced where stdin would raise
+					errors = getattr(sys.stdin, 'errors', None)
+					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', errors if errors and errors != 'strict' else 'replace').strip()
 				else:
 					# at its end, or a Ctrl-D: no answer this second. What Python itself already read ahead of a stdin
-					# that is not a terminal ( a pipe or a file the program read a line of ) is there to take, as in 1.65
+					# that is not a terminal ( a pipe the program read a line of ) is there to take, as in 1.65
 					ended = True
 					if not tty:
 						line = sys.stdin.readline()
@@ -3338,7 +3353,7 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 			return None
 		# an ended stdin is asked again at the next second, not in a busy loop: a terminal can answer after a Ctrl-D
 		if ended:
-			time.sleep(wait)
+			time.sleep(max(deadline - (seconds - 1) - time.monotonic(), 0))
 
 def pretty_format_table(data, delimiter=None, header=None, full=False, remove_empty_columns=False):
 	import re
@@ -3669,7 +3684,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			# the whole string is a size: a number, then a unit or none ( K to Y, an i after it for 1024s, a B at the end ), with
 			# blanks around them; anything else, text after the unit too ( '5Gb/s', '1e9' ), is not one ( 1.65 read its start ).
 			# The blanks around go by strip(): a \s* at each end of the pattern would retry every split of a long run of them
-			match = re.fullmatch(r"(\d+(\.\d*)?)\s*((?:[kmgtpezy]i?)?b?)", size.strip(), re.IGNORECASE)
+			match = re.fullmatch(r"(\d+(\.\d*)?)\s*((?:[kmgtpezyKMGTPEZY][iI]?)?[bB]?)", size.strip())
 			unit_labels = {
 				"": 0,
 				"k": 1,
