@@ -306,10 +306,21 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: a program reads a line of stdin itself (`input()`, `sys.stdin`) and then calls
   `input_with_timeout_and_countdown()`, with stdin a pipe that was fed ahead. The lines Python already holds are passed
   over while the pipe has more: with `a` and `y` written ahead and `z` a second later the call returns `'z'` (1.65:
-  `'y'`). Once the pipe has ended, the line Python holds is returned. A terminal, a file, and a program that leaves
-  stdin to the prompt are not affected.
+  `'y'`). Once the pipe has ended, the line Python holds is returned. At a terminal, text the program's own partial read left in Python's buffer (`sys.stdin.read(1)` of `abc`) stays there for the program, and the answer is the line typed at the prompt (1.65 took `'bc'` when stdout was not the terminal). A file, and a program that leaves stdin to the prompt, are not affected.
 - Why: the call reads the descriptor itself to keep its timeout, and Python cannot be asked what its reader holds
   without a read that may wait for the rest of a line.
+- Revisit when: someone hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)". Widened 2026-11-13: the user chose "Say it in the entry (Recommended)".
+
+### A program that loaded readline has only the terminal's own editing at the countdown
+- Kind: known limitation
+- What the operator sees: in a program that loaded `readline` (it imported it, or created a `pdb.Pdb()`), the prompt of
+  `input_with_timeout_and_countdown()` at a terminal has only the terminal's own editing (Backspace, Ctrl-U, Ctrl-W):
+  `readline`'s arrow keys and history come in as text. `ab`, Left, `c`, Enter gives `'ab\x1b[Dc'` (1.65: `'acb'`). No cas
+  tool loads `readline`.
+- Why: `readline` edits only inside `input()`, which has no timeout: in 1.65 a half-typed line or a Ctrl-D there held the
+  call past its end, against the user's pick that the default applies when the countdown ends. Python's `readline`
+  module has no read with a timeout.
 - Revisit when: someone hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
 
