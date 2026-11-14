@@ -300,3 +300,26 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   EAGAIN is not seen by the library): the user chose "Release, widen the KL (Recommended)"; the user did not ask for it, the
   1.63 re-review's second opinion found it. Widened 2026-11-13 to `mcmd` on a socket stdout: the user chose "Approve the
   sentence (Recommended)".
+
+### A program that read part of a piped stdin itself can get a later line at the countdown
+- Kind: known limitation
+- What the operator sees: a program reads a line of stdin itself (`input()`, `sys.stdin`) and then calls
+  `input_with_timeout_and_countdown()`, with stdin a pipe that was fed ahead. The lines Python already holds are passed
+  over while the pipe has more: with `a` and `y` written ahead and `z` a second later the call returns `'z'` (1.65:
+  `'y'`). Once the pipe has ended, the line Python holds is returned. A terminal, a file, and a program that leaves
+  stdin to the prompt are not affected.
+- Why: the call reads the descriptor itself to keep its timeout, and Python cannot be asked what its reader holds
+  without a read that may wait for the rest of a line.
+- Revisit when: someone hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### On Windows, a key pressed with no Enter holds the countdown
+- Kind: known limitation
+- What the operator sees: on Windows, a key pressed with no Enter at the prompt of `input_with_timeout_and_countdown()`
+  stops the countdown: the call waits past its timeout until Enter. A redirected stdin is not read there: only the
+  console's keys are asked. The same in 1.64 and 1.65. Untested: there is no Windows host.
+- Why: the Windows path asks `msvcrt.kbhit()` and then reads the line with `input()`, which has no timeout. Reading
+  the keys one at a time means a line editor of our own (the echo, Backspace, two-part special keys, Ctrl-C and
+  Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
+- Revisit when: a Windows user hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)".

@@ -536,12 +536,16 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ## Upgrading to 1.66 from 1.65
 
 - Nothing needs doing for `mcmd`, which is unchanged, nor for hpcp 9.92, which checks its sizes itself. hpcp up to 9.91
-  hands its size options to `format_bytes()` as typed, so `-L 10MB/s` there becomes `0`, no limit: upgrade hpcp to 9.92
-  before or with 1.66, as for 1.65.
+  hands `-L`, `-F`, `-dis` and `-ddr` to `format_bytes()` as typed and takes its `0` as the size: with 1.66 a value
+  with text after the size is `0`, so `-L 10MB/s` there is no limit and `-ddr 100G,50G` a 0-byte partition (1.65
+  read 100 G). Upgrade hpcp to 9.92 before or with 1.66, as for 1.65.
 - Changed, library: `input_with_timeout_and_countdown()` returns when its timeout runs out, whatever stdin holds: text with
-  no Enter (typed, then Ctrl-D; a pipe that sent part of a line) is no answer, and a program that loaded `readline` waits no
-  longer (1.65: it waited for the line to end). A line typed before the end, also after a Ctrl-D, comes back as soon as
-  Enter is pressed (1.65: within a second), and the rest of stdin stays unread. `timeout` may be a float (1.65: `TypeError`).
+  no Enter (typed, then Ctrl-D; a pipe that sent part of a line and stays open) is no answer, and a program that loaded
+  `readline` waits no longer (1.65: it waited for the line to end). A line typed before the end, also after a Ctrl-D, is
+  the answer: it comes back when Enter is pressed, or within a second after a Ctrl-D (1.65: always within a second),
+  and the rest of stdin stays unread. `timeout` may be a float (1.65: `TypeError`). On Windows a key pressed with no Enter
+  still holds it ([docs/limitations.md](docs/limitations.md)). A program that reads part of a piped stdin itself before the
+  prompt can get a later line ([docs/limitations.md](docs/limitations.md)).
 - Changed, library: `format_bytes()` takes a string only when all of it is a size: text after the unit (`'5Gb/s'`, `'1e9'`,
   `'5 kB extra'`) or an `i` with no prefix (`'5 iB'`) gives `0` and the "Invalid size format" line, as an unknown unit does
   (1.65: it read the start). Blanks around the size are fine, now before it too. With `to_str` such a string comes back as
