@@ -301,16 +301,33 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   1.63 re-review's second opinion found it. Widened 2026-11-13 to `mcmd` on a socket stdout: the user chose "Approve the
   sentence (Recommended)".
 
-### A program that read part of a piped stdin itself can get a later line at the countdown
+### A program that read part of a line at a terminal itself keeps the rest of it
 - Kind: known limitation
-- What the operator sees: a program reads a line of stdin itself (`input()`, `sys.stdin`) and then calls
-  `input_with_timeout_and_countdown()`, with stdin a pipe that was fed ahead. The lines Python already holds are passed
-  over while the pipe has more: with `a` and `y` written ahead and `z` a second later the call returns `'z'` (1.65:
-  `'y'`). Once the pipe has ended, the line Python holds is returned. At a terminal, text the program's own partial read left in Python's buffer (`sys.stdin.read(1)` of `abc`) stays there for the program, and the answer is the line typed at the prompt (1.65 took `'bc'` when stdout was not the terminal). A file, and a program that leaves stdin to the prompt, are not affected.
-- Why: the call reads the descriptor itself to keep its timeout, and Python cannot be asked what its reader holds
-  without a read that may wait for the rest of a line.
+- What the operator sees: a program reads part of a line at a terminal itself (`sys.stdin.read(1)` of `abc`) and then
+  calls `input_with_timeout_and_countdown()`. The rest (`bc`) stays in Python's buffer for the program, and the answer
+  is the line typed at the prompt (1.65 took `'bc'` when stdout was not the terminal). A program that reads whole
+  lines, or leaves stdin to the prompt, is not affected, nor is a stdin that is not a terminal.
+- Why: at a terminal the call reads the descriptor itself to keep its timeout, and Python cannot be asked what its
+  reader holds without a read that may wait for the rest of a line.
 - Revisit when: someone hits it.
-- Approved: 2026-11-13, the user chose "Known limitation (Recommended)". Widened 2026-11-13: the user chose "Say it in the entry (Recommended)".
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)" for the piped-stdin entry that this sentence was
+  part of. Widened 2026-11-13: the user chose "Say it in the entry (Recommended)". Re-scoped 2026-11-14: the user chose
+  "Terminal only (Recommended)"; the piped part went when a stdin that is not a terminal went back to Python's reader.
+
+### A stdin that is not a terminal can hold the countdown past its timeout
+- Kind: known limitation
+- What the operator sees: a stdin that is not a terminal (a pipe, a file, a device) is read through Python's `input()`
+  once it has something, as in 1.64 and 1.65. A pipe that sent part of a line and stays open holds
+  `input_with_timeout_and_countdown()` past its timeout until the line ends or the pipe closes; an endless stdin with
+  no newline (`/dev/zero`) is read until memory runs out; and Python reads ahead, so the lines after the answer are
+  gone for another program that shares the pipe or file. At a terminal the call returns at its timeout whatever was
+  typed.
+- Why: only Python knows what its own reader already holds, and it cannot be asked without a read that may wait.
+  Reading the descriptor beside it, as the first 1.66 builds did, gave a wrong answer in a new place at each review: a
+  later line from a pipe the program had read from, the middle of a line from a file, a lost answer behind a `codecs`
+  reader. hpcp asks only at a terminal.
+- Revisit when: someone hits it.
+- Approved: 2026-11-14, the user chose "Terminal only (Recommended)".
 
 ### A program that loaded readline has only the terminal's own editing at the countdown
 - Kind: known limitation
@@ -334,3 +351,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### `format_bytes()` with `to_str` raises for a size of 1000 Y or more
+- Kind: deferred
+- What the operator sees: `format_bytes('1000 Y', to_str=True)` raises `KeyError: 9`, and so does any size of 10^27 or
+  more (1024 Yi or more with 1024s). The same in 1.65. hpcp 9.92 caps its sizes below that itself.
+- Why: the loop that picks the unit steps past Y, the last one in its table. Found by 1.66's second opinion, outside
+  1.66's change.
+- Revisit when: multiCMD 1.67: stop at the last unit.

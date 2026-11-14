@@ -539,17 +539,18 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   hands `-L`, `-F`, `-dis` and `-ddr` to `format_bytes()` as typed and takes its `0` as the size: with 1.66 a value
   with text after the size is `0`, so `-L 10MB/s` there is no limit and `-ddr 100G,50G` a 0-byte partition (1.65
   read 100 G). Upgrade hpcp to 9.92 before or with 1.66, as for 1.65.
-- Changed, library: `input_with_timeout_and_countdown()` returns when its timeout runs out, whatever stdin holds: text with
-  no Enter (typed, then one Ctrl-D; a pipe that sent part of a line and stays open) is no answer, and a program that
-  loaded `readline` waits no longer (1.65: it waited for the line to end). With `readline` loaded, only the terminal's own
-  editing works at this prompt ([docs/limitations.md](docs/limitations.md)). A line ended before then, by Enter or by the
-  end of the input, is the answer, and the rest of stdin stays unread. `timeout` may be a float (1.65: `TypeError`). On
-  Windows a key pressed with no Enter still holds it ([docs/limitations.md](docs/limitations.md)). A program that reads
-  part of a piped stdin itself before the prompt can get a later line ([docs/limitations.md](docs/limitations.md)).
+- Changed, library: at a terminal `input_with_timeout_and_countdown()` returns when its timeout runs out, whatever was
+  typed: text with no Enter (typed, then one Ctrl-D) is no answer, and a program that loaded `readline` waits no longer
+  (1.65: it waited for the line to end). With `readline` loaded, only the terminal's own editing works at this prompt
+  ([docs/limitations.md](docs/limitations.md)). A line ended before then, by Enter or by the end of the input, is the
+  answer. `timeout` may be a float (1.65: `TypeError`). A stdin that is not a terminal is read as in 1.65: a pipe that
+  sent part of a line still holds the call ([docs/limitations.md](docs/limitations.md)). On Windows a key pressed with
+  no Enter still holds it ([docs/limitations.md](docs/limitations.md)). A program that read part of a line at a
+  terminal itself keeps the rest of it ([docs/limitations.md](docs/limitations.md)).
 - Changed, library: `format_bytes()` takes a string only when all of it is a size: text after the unit (`'5Gb/s'`, `'1e9'`,
   `'5 kB extra'`) or an `i` with no prefix (`'5 iB'`) gives `0` and the "Invalid size format" line, as an unknown unit does
-  (1.65: it read the start). Blanks around the size are fine, now before it too. With `to_str` such a string comes back as
-  given.
+  (1.65: it read the start). Blanks around the size are fine, now before it too. A unit after a number that ends in a point
+  is read (`'5.G'`: 5 G; 1.65: 5). With `to_str` such a string comes back as given.
 
 ## Upgrading to 1.65 from 1.64
 
