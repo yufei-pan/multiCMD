@@ -536,8 +536,8 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 ## Upgrading to 1.66 from 1.65
 
 - Nothing needs doing for `mcmd`, which is unchanged, nor for hpcp 9.92, which checks its sizes itself. hpcp up to 9.91
-  hands its size options to `format_bytes()` as typed, so `-L 10MB/s` there becomes `0`, no limit: upgrade hpcp to 9.92 first,
-  as for 1.65.
+  hands its size options to `format_bytes()` as typed, so `-L 10MB/s` there becomes `0`, no limit: upgrade hpcp to 9.92
+  before or with 1.66, as for 1.65.
 - Changed, library: `input_with_timeout_and_countdown()` returns when its timeout runs out, whatever stdin holds: text with
   no Enter (typed, then Ctrl-D; a pipe that sent part of a line) is no answer, and a program that loaded `readline` waits no
   longer (1.65: it waited for the line to end). A line typed before the end, also after a Ctrl-D, comes back as soon as
