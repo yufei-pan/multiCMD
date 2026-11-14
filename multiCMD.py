@@ -3318,23 +3318,24 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				data = os.read(fd, 4096 if canon else 1)
 				typed += data
 				if data and b'\n' not in data:
-					# read on at once: the rest of the line is there, or comes
+					# read on at once: the rest of the line is there, or comes. Once the countdown has ended, it is no answer
+					if remaining <= 0:
+						return None
 					continue
 				if typed:
 					# Enter, or the end of the input after text ( Ctrl-D twice )
 					line = bytes(typed).split(b'\n', 1)[0]
-					# bytes that are not text are kept as stdin itself keeps them ( surrogateescape under the C locale ), and
-					# replaced where stdin would raise
-					errors = getattr(sys.stdin, 'errors', None)
-					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', errors if errors and errors != 'strict' else 'replace').strip()
+					# decoded as stdin itself decodes: bytes that are not text are kept under the C locale ( surrogateescape ), and a
+					# strict stdin raises, as in 1.65 and as input() does for any other stdin
+					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', getattr(sys.stdin, 'errors', None) or 'strict').strip()
 				# a Ctrl-D: no answer this second
 				ended = True
-		except UnicodeDecodeError:
-			# a line that stdin cannot decode ( a strict stdin that is not a terminal ) raises, as in 1.65
+		except io.UnsupportedOperation:
+			# a stdin that cannot be read ( one the program opened for writing ) was not asked: not "no answer", as in 1.65
 			raise
-		except (EOFError, OSError, ValueError):
-			# no answer this second. EOFError: input() at the end of the input ( msvcrt's Ctrl-Z too ); OSError: the descriptor
-			# closed, or its terminal gone; ValueError: sys.stdin closed meanwhile
+		except (EOFError, OSError):
+			# no answer this second, as in 1.65. EOFError: input() at the end of the input ( msvcrt's Ctrl-Z too ); OSError: the
+			# descriptor closed, or its terminal gone
 			ended = True
 		if remaining <= 0:
 			return None

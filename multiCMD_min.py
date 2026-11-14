@@ -1005,11 +1005,13 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 			elif fd is not None and select.select([fd],[],[],wait)[0]:
 				if not tty:return input().strip()
 				data=os.read(fd,4096 if canon else 1);typed+=data
-				if data and b'\n'not in data:continue
-				if typed:line=bytes(typed).split(b'\n',1)[0];errors=getattr(sys.stdin,'errors',None);return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',errors if errors and errors!='strict'else'replace').strip()
+				if data and b'\n'not in data:
+					if remaining<=0:return
+					continue
+				if typed:line=bytes(typed).split(b'\n',1)[0];return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',getattr(sys.stdin,'errors',None)or'strict').strip()
 				ended=True
-		except UnicodeDecodeError:raise
-		except(EOFError,OSError,ValueError):ended=True
+		except io.UnsupportedOperation:raise
+		except(EOFError,OSError):ended=True
 		if remaining<=0:return
 		if ended:time.sleep(max(deadline-(seconds-1)-time.monotonic(),0))
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):

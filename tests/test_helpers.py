@@ -576,15 +576,20 @@ def test_countdown_at_a_terminal_returns_at_its_end_with_a_line_not_ended(termin
 
 
 @posix_only
-@pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", "\ufffdy")])
-def test_countdown_at_a_terminal_keeps_bytes_that_are_not_text_as_stdin_keeps_them(terminal, errors, expected):
-	# under the C locale stdin keeps such a byte ( surrogateescape ), so a file name typed with it still opens, as in 1.65; a
-	# strict stdin would raise, and gets a replacement character
+@pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", UnicodeDecodeError)])
+def test_countdown_at_a_terminal_decodes_bytes_that_are_not_text_as_stdin_does(terminal, errors, expected):
+	# under the C locale stdin keeps such a byte ( surrogateescape ), so a file name typed with it still opens; a strict stdin
+	# raises, as in 1.65 and as for a pipe ( a 1.66 build replaced it, and a typed path became another path )
 	master = terminal(encoding="utf-8", errors=errors)
 	os.write(master, b"\xffy\n")
-	assert input_with_timeout_and_countdown(5) == expected
+	if expected is UnicodeDecodeError:
+		with pytest.raises(UnicodeDecodeError):
+			input_with_timeout_and_countdown(5)
+	else:
+		assert input_with_timeout_and_countdown(5) == expected
 
 
+@posix_only
 @pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", UnicodeDecodeError)])
 def test_countdown_takes_bytes_that_are_not_text_of_a_pipe_as_input_does(monkeypatch, errors, expected):
 	# a stdin that is not a terminal is read through input(), as in 1.65: a strict stdin raises
@@ -606,8 +611,8 @@ def test_countdown_takes_bytes_that_are_not_text_of_a_pipe_as_input_does(monkeyp
 
 @posix_only
 def test_countdown_takes_each_line_of_a_file_behind_a_codecs_reader(tmp_path):
-	# a program whose stdin is a codecs reader ( no seek, no tell ), asking twice over "n", "y": Python's reader keeps its place
-	# and the descriptor is not read beside it ( a second 1.66 build lost the second line: None )
+	# a program whose stdin is a codecs reader, asking twice over "n", "y": the reader keeps what it read ahead, and nothing
+	# reads or moves the descriptor beside it ( a second 1.66 build put the descriptor back after the first line: None )
 	answers = tmp_path / "answers"
 	answers.write_bytes(b"n\ny\n")
 	program = tmp_path / "twice.py"
@@ -732,6 +737,63 @@ def test_countdown_at_a_terminal_out_of_its_line_mode_leaves_the_next_line(tmp_p
 		os.close(slave)
 		os.close(master)
 	assert out.decode().split() == ["GOT", "'a'", "'b\\n'"], (out, err)
+
+
+@posix_only
+@pytest.mark.parametrize("mode", ["line mode", "cbreak"])
+def test_countdown_at_a_terminal_returns_at_its_end_while_text_keeps_coming(terminal, fake_clock, monkeypatch, mode):
+	# text with no Enter that keeps coming ( Ctrl-D after each piece in line mode; keys out of it ) is read only to the end of
+	# the countdown, which returns then, not when the text stops ( a 1.66 build read on: None at 5.97 s for a timeout of 1 )
+	master = terminal()
+	if mode == "cbreak":
+		import tty
+		tty.setcbreak(sys.stdin.fileno())
+		os.write(master, b"x" * 40)
+	else:
+		os.write(master, b"x\x04" * 40)
+	real_select = select.select
+	def a_piece_each_quarter_second(clock):
+		clock.now += 0.25
+		return bool(real_select([sys.stdin], [], [], 0)[0])
+	monkeypatch.setattr(select, "select", fake_select(fake_clock, a_piece_each_quarter_second))
+	with monkeypatch.context() as guarded:
+		no_line_reads(guarded, sys.stdin)
+		assert input_with_timeout_and_countdown(1, "Answer") is None
+	assert fake_clock.now == 1001.25
+
+
+def test_countdown_raises_for_a_stdin_the_program_opened_for_writing(tmp_path, monkeypatch):
+	# not readable: it was not asked, so it is not "no answer" ( as 1.65 )
+	monkeypatch.setitem(sys.modules, "msvcrt", None)
+	with open(str(tmp_path / "out"), "w") as written:
+		monkeypatch.setattr(sys, "stdin", written)
+		with pytest.raises(io.UnsupportedOperation):
+			input_with_timeout_and_countdown(1)
+
+
+@posix_only
+def test_countdown_raises_when_select_cannot_watch_stdin_s_descriptor(monkeypatch):
+	# select() takes descriptors below FD_SETSIZE ( 1024 ) only: one above it was not asked, so it is not "no answer" ( as 1.65 )
+	import resource
+	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+	if soft <= 1100:
+		if hard != resource.RLIM_INFINITY and hard <= 1100:
+			pytest.skip("needs more than 1100 open files")
+		resource.setrlimit(resource.RLIMIT_NOFILE, (2048, hard))
+	read_end, write_end = os.pipe()
+	os.dup2(read_end, 1100)
+	os.close(read_end)
+	stdin = io.open(1100, "r")
+	monkeypatch.setattr(sys, "stdin", stdin)
+	monkeypatch.setitem(sys.modules, "msvcrt", None)
+	try:
+		os.write(write_end, b"yes\n")
+		with pytest.raises(ValueError):
+			input_with_timeout_and_countdown(1)
+	finally:
+		stdin.close()
+		os.close(write_end)
+		resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
 
 @posix_only
