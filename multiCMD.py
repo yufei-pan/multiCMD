@@ -31,7 +31,7 @@ from pprint import pformat
 #%% global vars
 version = '1.66'
 __version__ = version
-COMMIT_DATE = '2026-11-13'
+COMMIT_DATE = '2026-11-14'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
