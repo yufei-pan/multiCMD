@@ -29,7 +29,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.66'
+version = '1.67'
 __version__ = version
 COMMIT_DATE = '2026-11-14'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -3690,7 +3690,6 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			}
 			if match:
 				number, _, unit = match.groups()
-				number = float(number)
 				unit = unit.lower().rstrip("b")
 				if unit.endswith("i"):
 					use_1024_bytes = True
@@ -3707,14 +3706,12 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				power = 2**10
 			else:
 				power = 10**3
+			# in whole numbers, not a float: '4.1G' is 4100000000 bytes ( 1.66: 4099999999 ); a part of a byte is cut off, as before
+			whole, _, fraction = number.partition(".")
+			size_in_bytes = int(whole + fraction) * power**unit_labels[unit] // 10**len(fraction)
 			if to_str:
-				return format_bytes(
-					size=int(number * (power**unit_labels[unit])),
-					use_1024_bytes=use_1024_bytes,
-					to_str=True,
-					str_format=str_format,
-				)
-			return int(number * (power**unit_labels[unit]))
+				return format_bytes(size=size_in_bytes, use_1024_bytes=use_1024_bytes, to_str=True, str_format=str_format)
+			return size_in_bytes
 		else:
 			try:
 				return int(size)
@@ -3741,7 +3738,8 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				7: "Zi",
 				8: "Yi",
 			}
-			while size >= power:
+			# Y is the last unit: a larger size stays in Y ( 1.66 stepped past it to a KeyError, and float('inf') never stopped )
+			while size >= power and n < len(power_labels) - 1:
 				size /= power
 				n += 1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")
@@ -3759,7 +3757,7 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				7: "Z",
 				8: "Y",
 			}
-			while size >= power:
+			while size >= power and n < len(power_labels) - 1:
 				size /= power
 				n += 1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace("  ", " ")
