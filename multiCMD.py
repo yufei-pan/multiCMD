@@ -3283,8 +3283,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# read only as far as select() says there is something, and only up to the end of the line, so what follows it stays for
 	# whoever reads stdin next. A terminal in its line mode gives at most a line per read, and must be read in whole reads:
 	# macOS tells text that a Ctrl-D handed over from the end of the input only so ( read a byte at a time, the Ctrl-D comes
-	# back as an end of its own ); anything else is read a byte at a time, as the shell's read does, a terminal out of its
-	# line mode too ( cbreak, raw: one read there gives all that was typed, the next line with it )
+	# back as an end of its own ); anything else but a file is read a byte at a time, as the shell's read does, a terminal out of
+	# its line mode too ( cbreak, raw: one read there gives all that was typed, the next line with it )
 	tty = False
 	if fd is not None:
 		try:
@@ -3293,12 +3293,12 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		except Exception:
 			# not a terminal, one that is gone, or no termios
 			pass
+	# a file never makes a read wait: its line is Python's own next one, wherever the program's own reading stands
+	regular = False
 	if fd is not None and not tty:
-		# a file the program read part of through sys.stdin: put the descriptor where Python's own reading stands, so the
-		# answer is the line Python would give next ( a pipe cannot be put back )
 		try:
-			sys.stdin.seek(sys.stdin.tell())
-		except (OSError, ValueError, AttributeError):
+			regular = stat.S_ISREG(os.fstat(fd).st_mode)
+		except OSError:
 			pass
 	deadline = time.monotonic() + timeout
 	typed = bytearray()
@@ -3320,7 +3320,7 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				if not no_stdin and msvcrt.kbhit():
 					return input().strip()
 			elif fd is not None and select.select([fd], [], [], wait)[0]:
-				data = os.read(fd, 4096 if tty else 1)
+				data = b'' if regular else os.read(fd, 4096 if tty else 1)
 				typed += data
 				if data and b'\n' not in data:
 					# read on at once: the rest of the line is there. Past the end only as much as a terminal holds for one
@@ -3339,12 +3339,21 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', errors if errors and errors != 'strict' else 'replace').strip()
 				else:
 					# at its end, or a Ctrl-D: no answer this second. What Python itself already read ahead of a stdin
-					# that is not a terminal ( a pipe the program read a line of ) is there to take, as in 1.65
+					# that is not a terminal ( a pipe the program read a line of; a file, always ) is there to take, as in 1.65
 					ended = True
 					if not tty:
 						line = sys.stdin.readline()
+						if regular:
+							# the descriptor goes after the line, for whoever reads it next, where Python can say ( next() hides it )
+							try:
+								sys.stdin.seek(sys.stdin.tell())
+							except (OSError, ValueError):
+								pass
 						if line:
 							return line.strip()
+		except UnicodeDecodeError:
+			# a file's line that stdin cannot decode ( a strict stdin ): Python's reader has dropped it, so it raises, as in 1.65
+			raise
 		except (EOFError, OSError, ValueError):
 			# no answer this second. EOFError: msvcrt's input() at its end ( Ctrl-Z ); OSError: the descriptor closed, or its
 			# terminal gone; ValueError: sys.stdin closed meanwhile

@@ -214,9 +214,15 @@ def pipe_stdin(monkeypatch):
 
 
 def no_input(*args):
-	# the countdown reads the descriptor itself: input() waits for a whole line, in a test for ever ( 1.65 did, and read
-	# /dev/zero until memory ran out ), so a countdown that calls it fails at once
-	raise AssertionError("input() called")
+	# the countdown reads the descriptor itself: input() or a read of sys.stdin waits for a whole line, in a test for ever
+	# ( 1.65 did, and read /dev/zero until memory ran out ), so a countdown that calls one fails at once
+	raise AssertionError("a read that waits for a whole line was called")
+
+
+def no_line_reads(monkeypatch, stdin):
+	monkeypatch.setattr(builtins, "input", no_input)
+	for name in ("readline", "read"):
+		monkeypatch.setattr(stdin, name, no_input)
 
 
 def test_input_with_timeout_and_countdown(pipe_stdin, fake_clock, monkeypatch):
@@ -273,10 +279,11 @@ def test_countdown_returns_at_its_end_with_a_line_not_ended(pipe_stdin, fake_clo
 	# text with no Enter ( typed, then Ctrl-D; a pipe that sent part of a line and stays open ) is no answer: the default
 	# applies at the end ( 1.65 waited in input() for the line to end, past the timeout, and returned the text )
 	os.write(pipe_stdin, b"ye")
-	monkeypatch.setattr(builtins, "input", no_input)
 	real_select = select.select
 	monkeypatch.setattr(select, "select", fake_select(fake_clock, lambda clock: bool(real_select([sys.stdin], [], [], 0)[0])))
-	assert input_with_timeout_and_countdown(3, "Answer") is None
+	with monkeypatch.context() as guarded:
+		no_line_reads(guarded, sys.stdin)
+		assert input_with_timeout_and_countdown(3, "Answer") is None
 	assert fake_clock.now == 1003.0 and fake_clock.slept == []
 	# its text was read: what comes next is a line of its own
 	os.write(pipe_stdin, b"s\n")
@@ -288,6 +295,8 @@ def test_countdown_returns_at_its_end_when_stdin_ends_inside_a_second(pipe_stdin
 	# only, not for a whole second more ( the first 1.66 build returned up to a second late )
 	os.close(pipe_stdin)
 	def ends_inside_the_second(r, w, x, timeout=None):
+		fake_clock.waited.append(timeout)
+		assert len(fake_clock.waited) < 10000, "the countdown does not end"
 		fake_clock.now += min(0.6, timeout)
 		return (list(r), [], [])
 	monkeypatch.setattr(select, "select", ends_inside_the_second)
@@ -301,13 +310,13 @@ def test_countdown_stops_reading_an_endless_stdin_at_its_end(fake_clock, monkeyp
 	# a stdin that never ends a line ( /dev/zero ): read up to the end, and past it only as much as a terminal line holds
 	# ( 1.65 read it in input() until memory ran out )
 	monkeypatch.setitem(sys.modules, "msvcrt", None)
-	monkeypatch.setattr(builtins, "input", no_input)
 	def a_byte_each_quarter_second(clock):
 		clock.now += 0.25
 		return True
 	monkeypatch.setattr(select, "select", fake_select(fake_clock, a_byte_each_quarter_second))
 	with open("/dev/zero") as zero:
 		monkeypatch.setattr(sys, "stdin", zero)
+		no_line_reads(monkeypatch, zero)
 		assert input_with_timeout_and_countdown(1, "Answer") is None
 	assert fake_clock.waited[:4] == [1.0, 0.75, 0.5, 0.25]
 	assert fake_clock.waited[4:] == [0] * 4096
@@ -606,6 +615,19 @@ def test_countdown_leaves_what_follows_the_line_in_stdin(tmp_path):
 
 
 @posix_only
+def test_countdown_leaves_what_follows_the_line_of_a_file_in_stdin(tmp_path):
+	# a file is read through Python's own reader, which reads ahead: the descriptor is then put after the answer, so the next
+	# line is for whoever reads stdin next ( a child that shares the file offset; 1.65 left it at the end of the read-ahead )
+	answers = tmp_path / "answers"
+	answers.write_bytes(b" yes \nnext\n")
+	with open(str(answers), "rb") as stdin:
+		status, out, err = ask(tmp_path, stdin=stdin)
+		left = os.read(stdin.fileno(), 100)
+	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"], (status, out, err)
+	assert left == b"next\n"
+
+
+@posix_only
 def test_countdown_takes_what_the_program_read_ahead_of_an_ended_pipe(tmp_path):
 	# the program read a line of stdin itself, and Python read the rest of the pipe ahead: its next line is the answer, as in 1.65
 	read_end, write_end = os.pipe()
@@ -627,6 +649,32 @@ def test_countdown_takes_the_next_line_of_a_file_the_program_read_part_of(tmp_pa
 	with open(str(answers), "rb") as stdin:
 		status, out, err = ask(tmp_path, before="sys.stdin.readline()\n", stdin=stdin)
 	assert status == 0 and out.split()[:2] == ["GOT", "'line00001'"], (status, out, err)
+
+
+@posix_only
+@pytest.mark.parametrize("before", ["next(sys.stdin)\n", "sys.stdin.buffer.readline()\n"], ids=["next", "buffer"])
+def test_countdown_takes_the_next_line_of_a_file_the_program_iterated_or_read_in_bytes(tmp_path, before):
+	# next() turns tell() off, and sys.stdin.buffer holds bytes the text reader cannot put back: Python's own reader still gives
+	# the next line ( 200 KiB: more than the 128 KiB a 3.14 buffer reads ahead )
+	answers = tmp_path / "answers"
+	answers.write_bytes(b"".join(b"line%05d\n" % number for number in range(20000)))
+	with open(str(answers), "rb") as stdin:
+		status, out, err = ask(tmp_path, before=before, stdin=stdin)
+	assert status == 0 and out.split()[:2] == ["GOT", "'line00001'"], (status, out, err)
+
+
+@posix_only
+def test_countdown_raises_for_a_file_line_a_strict_stdin_cannot_decode(tmp_path):
+	# Python's reader drops the text it could not decode, so taking the next line would be a wrong answer: it raises, as in 1.65
+	answers = tmp_path / "answers"
+	answers.write_bytes(b"\xffy\n" + b"".join(b"line%05d\n" % number for number in range(2000)))
+	program = tmp_path / "strict.py"
+	program.write_text("import io, sys, multiCMD\nsys.stdin = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='strict')\n"
+		"try:\n    multiCMD.input_with_timeout_and_countdown(1, 'Answer')\nexcept UnicodeDecodeError:\n    print('RAISED')\n")
+	with open(str(answers), "rb") as stdin:
+		out = subprocess.run([sys.executable, str(program)], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+			env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))).stdout
+	assert out.split() == [b"RAISED"], out
 
 
 @pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", "\ufffdy")])

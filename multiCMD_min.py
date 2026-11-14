@@ -994,9 +994,10 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	if fd is not None:
 		try:import termios;tty=bool(termios.tcgetattr(fd)[3]&termios.ICANON)
 		except Exception:pass
+	regular=False
 	if fd is not None and not tty:
-		try:sys.stdin.seek(sys.stdin.tell())
-		except(OSError,ValueError,AttributeError):pass
+		try:regular=stat.S_ISREG(os.fstat(fd).st_mode)
+		except OSError:pass
 	deadline=time.monotonic()+timeout;typed=bytearray();shown=None;late=0
 	while True:
 		remaining=deadline-time.monotonic();seconds=max(math.ceil(remaining),0)
@@ -1006,7 +1007,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 			if msvcrt is not None:
 				if not no_stdin and msvcrt.kbhit():return input().strip()
 			elif fd is not None and select.select([fd],[],[],wait)[0]:
-				data=os.read(fd,4096 if tty else 1);typed+=data
+				data=b''if regular else os.read(fd,4096 if tty else 1);typed+=data
 				if data and b'\n'not in data:
 					if remaining<=0:late+=len(data)
 					if late<4096:continue
@@ -1015,7 +1016,11 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 					ended=True
 					if not tty:
 						line=sys.stdin.readline()
+						if regular:
+							try:sys.stdin.seek(sys.stdin.tell())
+							except(OSError,ValueError):pass
 						if line:return line.strip()
+		except UnicodeDecodeError:raise
 		except(EOFError,OSError,ValueError):ended=True
 		if remaining<=0:return
 		if ended:time.sleep(max(deadline-(seconds-1)-time.monotonic(),0))
