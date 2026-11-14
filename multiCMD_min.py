@@ -990,6 +990,8 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	except ImportError:msvcrt=None
 	fd=None
 	if msvcrt is None and sys.stdin is not None and not getattr(sys.stdin,'closed',False):fd=sys.stdin.fileno()
+	try:tty=fd is not None and os.isatty(fd)
+	except OSError:tty=False
 	deadline=time.monotonic()+timeout;typed=bytearray();shown=None;late=0
 	while True:
 		remaining=deadline-time.monotonic();seconds=max(math.ceil(remaining),0)
@@ -1000,14 +1002,14 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 				ended=True
 				if msvcrt.kbhit():return input().strip()
 			elif fd is not None and select.select([fd],[],[],wait)[0]:
-				byte=os.read(fd,1)
-				if byte and byte!=b'\n':
-					typed+=byte;late+=remaining<=0
+				data=os.read(fd,4096 if tty else 1);typed+=data
+				if data and b'\n'not in data:
+					if remaining<=0:late+=len(data)
 					if late<4096:continue
-				elif byte or typed:return typed.decode(getattr(sys.stdin,'encoding',None)or'utf-8','replace').strip()
+				elif typed:line=bytes(typed).split(b'\n',1)[0];return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8','replace').strip()
 				else:
 					ended=True
-					if not os.isatty(fd):
+					if not tty:
 						line=sys.stdin.readline()
 						if line:return line.strip()
 		except(EOFError,OSError,ValueError):ended=True

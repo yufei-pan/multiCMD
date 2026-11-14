@@ -3276,10 +3276,16 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	if msvcrt is None and sys.stdin is not None and not getattr(sys.stdin, 'closed', False):
 		# a stdin select() cannot watch ( no descriptor: a StringIO ) raises here: it was not asked, so it is not "no answer"
 		fd = sys.stdin.fileno()
-	# the count is by the clock, and stdin is read by its descriptor, a byte at a time: input() would wait for a whole line
-	# with no timeout ( text typed and then Ctrl-D, a program that loaded readline, a pipe that sent part of a line ), while
-	# the descriptor is read only as far as select() says there is something, and only up to the end of the line, so what
-	# follows it stays for whoever reads stdin next
+	# the count is by the clock, and stdin is read by its descriptor: input() would wait for a whole line with no timeout
+	# ( text typed and then Ctrl-D, a program that loaded readline, a pipe that sent part of a line ), while the descriptor is
+	# read only as far as select() says there is something, and only up to the end of the line, so what follows it stays for
+	# whoever reads stdin next. A terminal gives at most a line per read ( its line mode ), and must be read in whole reads:
+	# macOS tells text that a Ctrl-D handed over from the end of the input only so ( read a byte at a time, the Ctrl-D comes
+	# back as an end of its own ); anything else is read a byte at a time, as the shell's read does
+	try:
+		tty = fd is not None and os.isatty(fd)
+	except OSError:
+		tty = False
 	deadline = time.monotonic() + timeout
 	typed = bytearray()
 	shown = None
@@ -3300,23 +3306,25 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				if msvcrt.kbhit():
 					return input().strip()
 			elif fd is not None and select.select([fd], [], [], wait)[0]:
-				byte = os.read(fd, 1)
-				if byte and byte != b'\n':
-					typed += byte
+				data = os.read(fd, 4096 if tty else 1)
+				typed += data
+				if data and b'\n' not in data:
 					# read on at once: the rest of the line is there. Past the end only as much as a terminal holds for one
 					# line ( 4096 bytes, Linux's N_TTY_BUF_SIZE ): an answer there by the end is read, and an endless stdin
 					# ( /dev/zero ) cannot hold the call
-					late += remaining <= 0
+					if remaining <= 0:
+						late += len(data)
 					if late < 4096:
 						continue
-				elif byte or typed:
+				elif typed:
 					# Enter, or the end of the input after text ( a pipe whose last line has no newline; Ctrl-D twice )
-					return typed.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', 'replace').strip()
+					line = bytes(typed).split(b'\n', 1)[0]
+					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', 'replace').strip()
 				else:
 					# at its end, or a Ctrl-D: no answer this second. What Python itself already read ahead of a stdin
 					# that is not a terminal ( a pipe or a file the program read a line of ) is there to take, as in 1.65
 					ended = True
-					if not os.isatty(fd):
+					if not tty:
 						line = sys.stdin.readline()
 						if line:
 							return line.strip()
