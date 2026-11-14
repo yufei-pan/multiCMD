@@ -988,8 +988,8 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	_display.flush();_write_error(f"{prompt} [{math.ceil(timeout)}s]: ",end='')
 	try:import msvcrt
 	except ImportError:msvcrt=None
-	fd=None
-	if msvcrt is None and sys.stdin is not None and not getattr(sys.stdin,'closed',False):fd=sys.stdin.fileno()
+	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False);fd=None
+	if msvcrt is None and not no_stdin:fd=sys.stdin.fileno()
 	try:tty=fd is not None and os.isatty(fd)
 	except OSError:tty=False
 	deadline=time.monotonic()+timeout;typed=bytearray();shown=None;late=0
@@ -999,8 +999,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 		wait=remaining-(seconds-1)if seconds else 0;ended=fd is None
 		try:
 			if msvcrt is not None:
-				ended=True
-				if msvcrt.kbhit():return input().strip()
+				if not no_stdin and msvcrt.kbhit():return input().strip()
 			elif fd is not None and select.select([fd],[],[],wait)[0]:
 				data=os.read(fd,4096 if tty else 1);typed+=data
 				if data and b'\n'not in data:

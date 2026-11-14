@@ -3272,8 +3272,10 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		import msvcrt
 	except ImportError:
 		msvcrt = None
+	# a stdin that is missing or closed is not asked: the countdown runs out
+	no_stdin = sys.stdin is None or getattr(sys.stdin, 'closed', False)
 	fd = None
-	if msvcrt is None and sys.stdin is not None and not getattr(sys.stdin, 'closed', False):
+	if msvcrt is None and not no_stdin:
 		# a stdin select() cannot watch ( no descriptor: a StringIO ) raises here: it was not asked, so it is not "no answer"
 		fd = sys.stdin.fileno()
 	# the count is by the clock, and stdin is read by its descriptor: input() would wait for a whole line with no timeout
@@ -3298,12 +3300,12 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 			_write_error(f"\r{prompt} [{seconds}s]: ", end='')
 		# stdin is watched until the next whole second, and asked once more when the countdown ends
 		wait = remaining - (seconds - 1) if seconds else 0
+		# ended: nothing waited for stdin this second ( none to watch, the console, or its end ), so time.sleep() waits
 		ended = fd is None
 		try:
 			if msvcrt is not None:
 				# the console is asked once a second
-				ended = True
-				if msvcrt.kbhit():
+				if not no_stdin and msvcrt.kbhit():
 					return input().strip()
 			elif fd is not None and select.select([fd], [], [], wait)[0]:
 				data = os.read(fd, 4096 if tty else 1)

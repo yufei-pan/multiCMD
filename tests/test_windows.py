@@ -1,8 +1,11 @@
 import ast
 import builtins
+import io
 import subprocess
 import sys
 import types
+
+import pytest
 
 import multiCMD
 from conftest import PACKAGE_ROOT
@@ -107,6 +110,23 @@ def test_input_countdown_on_msvcrt_takes_a_float_timeout(monkeypatch, fake_clock
 	assert multiCMD.input_with_timeout_and_countdown(2.5, 'pick') is None
 	assert asked == [1000.0, 1000.5, 1001.5, 1002.5]
 	assert fake_clock.slept == [0.5, 1, 1]
+
+
+@pytest.mark.parametrize('stdin', ['missing', 'closed'])
+def test_input_countdown_on_msvcrt_does_not_ask_a_missing_stdin(monkeypatch, fake_clock, stdin):
+	# a key waiting at the console, but no stdin to read it from: input() would raise RuntimeError ( "lost sys.stdin" )
+	def no_input():
+		raise AssertionError('input() called')
+	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=lambda: True))
+	monkeypatch.setattr(builtins, 'input', no_input)
+	if stdin == 'missing':
+		monkeypatch.setattr(sys, 'stdin', None)
+	else:
+		closed = io.StringIO()
+		closed.close()
+		monkeypatch.setattr(sys, 'stdin', closed)
+	assert multiCMD.input_with_timeout_and_countdown(2, 'pick') is None
+	assert fake_clock.slept == [1, 1]
 
 
 def test_posix_only_modules_are_imported_lazily():
