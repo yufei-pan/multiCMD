@@ -161,3 +161,40 @@ def pid_gone(pid, wait=3.0):
 def fresh_display(monkeypatch):
 	'''Every test starts with a display that has written nothing yet'''
 	monkeypatch.setattr(multiCMD, '_display', multiCMD._Display())
+
+
+class FakeClock:
+	'''A clock for the countdown ( multiCMD.time ): it stands still but for the waits, so a mocked countdown runs at once and
+	counts its seconds exactly. slept: every time.sleep(); waited: every select() wait, from fake_select'''
+	def __init__(self):
+		self.now = 1000.0
+		self.slept = []
+		self.waited = []
+
+	def monotonic(self):
+		return self.now
+
+	def sleep(self, seconds):
+		self.slept.append(seconds)
+		self.now += seconds
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+	clock = FakeClock()
+	monkeypatch.setattr(multiCMD, 'time', clock)
+	return clock
+
+
+def fake_select(clock, ready):
+	'''A select() for the countdown on fake_clock: ready( clock ) says whether stdin is readable now; one that is not waits
+	out its timeout on the clock'''
+	def select(r, w, x, timeout=None):
+		clock.waited.append(timeout)
+		# a countdown that never ends fails here and does not hang the suite ( the longest one here asks 4,100 times )
+		assert len(clock.waited) < 10000, "the countdown does not end"
+		if ready(clock):
+			return (list(r), [], [])
+		clock.now += timeout
+		return ([], [], [])
+	return select

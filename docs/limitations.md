@@ -301,24 +301,62 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   1.63 re-review's second opinion found it. Widened 2026-11-13 to `mcmd` on a socket stdout: the user chose "Approve the
   sentence (Recommended)".
 
-### Ctrl-D after a half-typed line, or with readline loaded, stops the countdown until the line ends
-- Kind: deferred
-- What the operator sees: at the prompt of `input_with_timeout_and_countdown()`, text typed without Enter and then
-  Ctrl-D stops the countdown: the call waits past the timeout until the line is ended, and returns the typed text, not
-  the default; Ctrl-C still aborts. In a program that has imported `readline`, a Ctrl-D on an empty line does the same,
-  and so does a pipe that sent part of a line and stays open. A `timeout` that is not an `int` (`5.0` too) raises
-  `TypeError`. The same in 1.64 (ran, Python 3.6 and 3.14). hpcp, statblk and statbtrfs do not load `readline`.
-- Why: once `select()` calls stdin readable, the call reads with `input()`, which waits for a whole line and has no
-  timeout. Found by the 1.65 final review and its second opinions.
-- Revisit when: multiCMD 1.66: read the descriptor itself after `select()` and count by the clock, as multiSSH3's
-  countdown does.
+### A program that read part of a line at a terminal itself keeps the rest of it
+- Kind: known limitation
+- What the operator sees: a program reads part of a line at a terminal itself (`sys.stdin.read(1)` of `abc`) and then
+  calls `input_with_timeout_and_countdown()`. The rest (`bc`) stays in Python's buffer for the program, and the answer
+  is the line typed at the prompt (1.65 took `'bc'` when stdout was not the terminal). A program that reads whole
+  lines, or leaves stdin to the prompt, is not affected, nor is a stdin that is not a terminal.
+- Why: at a terminal the call reads the descriptor itself to keep its timeout, and Python cannot be asked what its
+  reader holds without a read that may wait for the rest of a line.
+- Revisit when: someone hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)" for the piped-stdin entry that this sentence was
+  part of. Widened 2026-11-13: the user chose "Say it in the entry (Recommended)". Re-scoped 2026-11-14: the user chose
+  "Terminal only (Recommended)"; the piped part went when a stdin that is not a terminal went back to Python's reader.
 
-### format_bytes() reads a size with text after it
+### A stdin that is not a terminal can hold the countdown past its timeout
+- Kind: known limitation
+- What the operator sees: a stdin that is not a terminal (a pipe, a file, a device) is read through Python's `input()`
+  once it has something, as in 1.64 and 1.65. A pipe that sent part of a line and stays open holds
+  `input_with_timeout_and_countdown()` past its timeout until the line ends or the pipe closes; an endless stdin with
+  no newline (`/dev/zero`) is read until memory runs out; and Python reads ahead, so the lines after the answer are
+  gone for another program that shares the pipe or file. At a terminal the call returns at its timeout whatever was
+  typed.
+- Why: only Python knows what its own reader already holds, and it cannot be asked without a read that may wait.
+  Reading the descriptor beside it, as the first 1.66 builds did, gave a wrong answer in a new place at each review: a
+  later line from a pipe the program had read from, the middle of a line from a file, a lost answer behind a `codecs`
+  reader. hpcp asks only at a terminal.
+- Revisit when: someone hits it.
+- Approved: 2026-11-14, the user chose "Terminal only (Recommended)".
+
+### A program that loaded readline has only the terminal's own editing at the countdown
+- Kind: known limitation
+- What the operator sees: in a program that loaded `readline` (it imported it, or created a `pdb.Pdb()`), the prompt of
+  `input_with_timeout_and_countdown()` at a terminal has only the terminal's own editing (Backspace, Ctrl-U, Ctrl-W):
+  `readline`'s arrow keys and history come in as text. `ab`, Left, `c`, Enter gives `'ab\x1b[Dc'` (1.65: `'acb'`). No cas
+  tool loads `readline`.
+- Why: `readline` edits only inside `input()`, which has no timeout: in 1.65 a half-typed line or a Ctrl-D there held the
+  call past its end, against the user's pick that the default applies when the countdown ends. Python's `readline`
+  module has no read with a timeout.
+- Revisit when: someone hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### On Windows, a key pressed with no Enter holds the countdown
+- Kind: known limitation
+- What the operator sees: on Windows, a key pressed with no Enter at the prompt of `input_with_timeout_and_countdown()`
+  stops the countdown: the call waits past its timeout until Enter. A redirected stdin is not read there: only the
+  console's keys are asked. The same in 1.64 and 1.65. Untested: there is no Windows host.
+- Why: the Windows path asks `msvcrt.kbhit()` and then reads the line with `input()`, which has no timeout. Reading
+  the keys one at a time means a line editor of our own (the echo, Backspace, two-part special keys, Ctrl-C and
+  Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
+- Revisit when: a Windows user hits it.
+- Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### `format_bytes()` with `to_str` raises for a size of 1000 Y or more
 - Kind: deferred
-- What the operator sees: `format_bytes()` reads the start of a string and ignores the rest, silently: `'1e9'` is 1 E
-  (10^18), `'1,5'` and `'1_000'` are 1, `'5Gb/s'` is 5 G, `'5 kB extra'` is 5000; and it reads a lone `i` as bytes:
-  `'5 i'` and `'5 iB'` are 5. The same in 1.64 (ran, Python 3.14). hpcp 9.92 checks the string itself.
-- Why: the pattern has no end. Found by the 1.65 review's second opinion, outside 1.65's two changes; closing it
-  changes which strings are accepted, which is a change of its own.
-- Revisit when: multiCMD 1.66: text after the unit, or an `i` with no prefix, is an invalid size (0 and the line);
-  `'5.'` and blanks at the end stay read.
+- What the operator sees: `format_bytes('1000 Y', to_str=True)` raises `KeyError: 9`, and so does any larger size:
+  from about 1000 Y counted in 1000s, or 1024 Yi in 1024s (a number's default). The same in 1.65. hpcp 9.92 caps its
+  sizes below that itself.
+- Why: the loop that picks the unit steps past Y, the last one in its table. Found by 1.66's second opinion, outside
+  1.66's change.
+- Revisit when: multiCMD 1.67: stop at the last unit.

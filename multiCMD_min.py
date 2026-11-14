@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.65'
+version='1.66'
 __version__=version
-COMMIT_DATE='2026-11-13'
+COMMIT_DATE='2026-11-14'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -985,20 +985,35 @@ def _run_cli():
 	if len(tasks)>1 and args.summary!='none':_display.message(_summary(tasks,show_all=args.summary=='all'))
 	return _exit_status(tasks)
 def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection'):
-	_display.flush();_write_error(f"{prompt} [{timeout}s]: ",end='')
+	_display.flush();_write_error(f"{prompt} [{math.ceil(timeout)}s]: ",end='')
 	try:import msvcrt
 	except ImportError:msvcrt=None
-	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False)
-	for remaining in range(timeout,-1,-1):
-		if not no_stdin:
-			try:
-				if msvcrt is not None:
-					if msvcrt.kbhit():return input().strip()
-				elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
-			except io.UnsupportedOperation:raise
-			except(EOFError,OSError):pass
-		if remaining==0:break
-		_write_error(f"\r{prompt} [{remaining}s]: ",end='');time.sleep(1)
+	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False);fd=None
+	if msvcrt is None and not no_stdin:fd=sys.stdin.fileno()
+	tty=canon=False
+	if fd is not None:
+		try:import termios;canon=bool(termios.tcgetattr(fd)[3]&termios.ICANON);tty=True
+		except Exception:pass
+	deadline=time.monotonic()+timeout;typed=bytearray();shown=None
+	while True:
+		remaining=deadline-time.monotonic();seconds=max(math.ceil(remaining),0)
+		if seconds and seconds!=shown:shown=seconds;_write_error(f"\r{prompt} [{seconds}s]: ",end='')
+		wait=remaining-(seconds-1)if seconds else 0;ended=fd is None
+		try:
+			if msvcrt is not None:
+				if not no_stdin and msvcrt.kbhit():return input().strip()
+			elif fd is not None and select.select([fd],[],[],wait)[0]:
+				if not tty:return input().strip()
+				data=os.read(fd,4096 if canon else 1);typed+=data
+				if data and b'\n'not in data:
+					if remaining<=0 and len(typed)>4096:return
+					continue
+				if typed:line=bytes(typed).split(b'\n',1)[0];return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',getattr(sys.stdin,'errors',None)or'strict').strip()
+				ended=True
+		except io.UnsupportedOperation:raise
+		except(EOFError,OSError):ended=True
+		if remaining<=0:return
+		if ended:time.sleep(max(deadline-(seconds-1)-time.monotonic(),0))
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
 	import re,unicodedata;version=1.21;_=version
 	if not data:return''
@@ -1143,13 +1158,13 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 	if to_int or isinstance(size,str):
 		if isinstance(size,int):return size
 		elif isinstance(size,str):
-			match=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',size);unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
+			match=re.fullmatch('(\\d+(\\.\\d*)?)\\s*((?:[kmgtpezyKMGTPEZY][iI]?)?[bB]?)',size.strip());unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
 			if match:
-				number,_,unit=match.groups();number=float(number);unit=unit.strip().lower().rstrip('b')
+				number,_,unit=match.groups();number=float(number);unit=unit.lower().rstrip('b')
 				if unit.endswith('i'):use_1024_bytes=True
 				elif use_1024_bytes is None:use_1024_bytes=False
 				unit=unit.rstrip('i')
-			if not match or unit not in unit_labels:
+			if not match:
 				if to_str:return size
 				_write_error(f"Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\nGot: {size}");return 0
 			if use_1024_bytes:power=2**10
