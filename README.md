@@ -561,9 +561,9 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   no longer stopped by another write's failure (docs/limitations.md).
 - Changed, library: a shown dry run whose line finds the reader gone raises `BrokenPipeError` if it waits, whenever it began
   (1.63: a dry run made after the reader quit returned).
-- hpcp 9.89 and 9.90 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a delayed `e2fsck` that
+- hpcp 9.89 to 9.91 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a delayed `e2fsck` that
   prints for longer than 1 s is cut, with the `tune2fs` queued after it, and its call raises before the loop devices are
-  detached, where 1.63 ran it unseen; a later hpcp runs its cleanup quiet.
+  detached, where 1.63 ran it unseen; hpcp 9.92 runs its cleanup quiet.
 - Changed: `input_with_timeout_and_countdown()` writes its prompt and countdown to stderr, after flushing stdout, and
   `format_bytes()` its error message (1.63: stdout, where a dead one raised `BrokenPipeError` and `> log` hid the prompt).
 - Fix: a `sys.stdout` the program closed loses the output and every command runs (1.63: `ValueError`, and nothing ran), and

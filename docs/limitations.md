@@ -306,7 +306,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: at the prompt of `input_with_timeout_and_countdown()`, text typed without Enter and then
   Ctrl-D stops the countdown: the call waits past the timeout until the line is ended, and returns the typed text, not
   the default; Ctrl-C still aborts. In a program that has imported `readline`, a Ctrl-D on an empty line does the same,
-  and so does a pipe that sent part of a line and stays open. A `timeout` that is not a whole number raises
+  and so does a pipe that sent part of a line and stays open. A `timeout` that is not an `int` (`5.0` too) raises
   `TypeError`. The same in 1.64 (ran, Python 3.6 and 3.14). hpcp, statblk and statbtrfs do not load `readline`.
 - Why: once `select()` calls stdin readable, the call reads with `input()`, which waits for a whole line and has no
   timeout. Found by the 1.65 final review and its second opinions.
@@ -317,7 +317,7 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Kind: deferred
 - What the operator sees: `format_bytes()` reads the start of a string and ignores the rest, silently: `'1e9'` is 1 E
   (10^18), `'1,5'` and `'1_000'` are 1, `'5Gb/s'` is 5 G, `'5 kB extra'` is 5000; and it reads a lone `i` as bytes:
-  `'5 i'` and `'5 iB'` are 5. The same in 1.64 (ran, Python 3.14). hpcp 9.92 refuses these itself.
+  `'5 i'` and `'5 iB'` are 5. The same in 1.64 (ran, Python 3.14). hpcp 9.92 checks the string itself.
 - Why: the pattern has no end. Found by the 1.65 review's second opinion, outside 1.65's two changes; closing it
   changes which strings are accepted, which is a change of its own.
 - Revisit when: multiCMD 1.66: text after the unit, or an `i` with no prefix, is an invalid size (0 and the line);
