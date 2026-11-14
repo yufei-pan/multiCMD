@@ -73,16 +73,17 @@ def test_spawn_on_windows_has_no_group(monkeypatch):
 	assert pgid is None
 
 
-def test_input_countdown_uses_msvcrt_when_present(monkeypatch):
+def test_input_countdown_uses_msvcrt_when_present(monkeypatch, fake_clock):
 	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=lambda: True))
 	monkeypatch.setattr(builtins, 'input', lambda: ' yes ')
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') == 'yes'
+	assert fake_clock.now == 1000.0
 
 
-def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch):
+def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_waiting(monkeypatch, fake_clock):
 	# Ctrl-Z at a console, or a stdin that ended: input() raises EOFError ( 1.64 let it out ); no answer, so the countdown runs
 	# out, and the console is asked again each second and once more at the end
-	asked, slept = [], []
+	asked = []
 	def at_its_end():
 		asked.append('input')
 		raise EOFError
@@ -91,10 +92,21 @@ def test_input_countdown_runs_out_at_the_end_of_stdin_when_msvcrt_says_a_key_is_
 		return True
 	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=key_waiting))
 	monkeypatch.setattr(builtins, 'input', at_its_end)
-	monkeypatch.setattr(multiCMD.time, 'sleep', slept.append)
 	assert multiCMD.input_with_timeout_and_countdown(3, 'pick') is None
 	assert asked == ['kbhit', 'input'] * 4
-	assert slept == [1, 1, 1]
+	assert fake_clock.slept == [1, 1, 1]
+
+
+def test_input_countdown_on_msvcrt_takes_a_float_timeout(monkeypatch, fake_clock):
+	# by the clock ( 1.65: TypeError ): no key, asked at 0, 0.5 and 1.5 s and at the end
+	asked = []
+	def no_key():
+		asked.append(fake_clock.now)
+		return False
+	monkeypatch.setitem(sys.modules, 'msvcrt', types.SimpleNamespace(kbhit=no_key))
+	assert multiCMD.input_with_timeout_and_countdown(2.5, 'pick') is None
+	assert asked == [1000.0, 1000.5, 1001.5, 1002.5]
+	assert fake_clock.slept == [0.5, 1, 1]
 
 
 def test_posix_only_modules_are_imported_lazily():

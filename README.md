@@ -533,6 +533,20 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.66 from 1.65
+
+- Nothing needs doing for `mcmd`, which is unchanged, nor for hpcp 9.92, which checks its sizes itself. hpcp up to 9.91
+  hands its size options to `format_bytes()` as typed, so `-L 10MB/s` there becomes `0`, no limit: upgrade hpcp to 9.92 first,
+  as for 1.65.
+- Changed, library: `input_with_timeout_and_countdown()` returns when its timeout runs out, whatever stdin holds: text with
+  no Enter (typed, then Ctrl-D; a pipe that sent part of a line) is no answer, and a program that loaded `readline` waits no
+  longer (1.65: it waited for the line to end). A line typed before the end, also after a Ctrl-D, comes back as soon as
+  Enter is pressed (1.65: within a second), and the rest of stdin stays unread. `timeout` may be a float (1.65: `TypeError`).
+- Changed, library: `format_bytes()` takes a string only when all of it is a size: text after the unit (`'5Gb/s'`, `'1e9'`,
+  `'5 kB extra'`) or an `i` with no prefix (`'5 iB'`) gives `0` and the "Invalid size format" line, as an unknown unit does
+  (1.65: it read the start). Blanks around the size are fine, now before it too. With `to_str` such a string comes back as
+  given.
+
 ## Upgrading to 1.65 from 1.64
 
 - Nothing needs doing for `mcmd`, which is unchanged. hpcp users upgrade hpcp to 9.92 before or with multiCMD 1.65: hpcp up

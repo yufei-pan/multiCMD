@@ -29,7 +29,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.65'
+version = '1.66'
 __version__ = version
 COMMIT_DATE = '2026-11-13'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -3250,55 +3250,85 @@ def _run_cli():
 #%% misc functions
 def input_with_timeout_and_countdown(timeout, prompt='Please enter your selection'):
 	"""
-	Read an input from the user with a timeout and a countdown. The prompt and its countdown go to stderr, after what is
+	Read a line from the user, counting down timeout seconds. The prompt and its countdown go to stderr, after what is
 	waiting in stdout's buffer ( the caller's question ); one that cannot be written is dropped, and the timeout still applies.
 
 	@params:
-		timeout: The timeout in seconds
+		timeout: The timeout in seconds, an int or a float ( the countdown shows the seconds left, rounded up )
 		prompt: The prompt to display to the user
 
 	@returns:
-		str: The input from the user or None if no input was received: the timeout ran out. A stdin that has ended, is closed
-			or is missing ( Ctrl-D, /dev/null ) counts as no answer: the countdown goes on asking, and takes a line typed before its end
+		str: The line typed before the timeout ran out, stripped ( Enter ends it, and so does the end of the input after text );
+			or None if no input was received by then: text not ended, and a stdin that has ended, is closed or is missing
+			( Ctrl-D, /dev/null ), count as no answer, and the call returns when the timeout runs out, never sooner nor later
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
 	# stdout's reader: they go to stderr, as read -p's and rm -i's do, and one that cannot be written is dropped
 	_display.flush()
-	_write_error(f"{prompt} [{timeout}s]: ", end='')
+	_write_error(f"{prompt} [{math.ceil(timeout)}s]: ", end='')
 	# select() cannot watch stdin on Windows; msvcrt can tell whether a key is waiting
 	try:
 		import msvcrt
 	except ImportError:
 		msvcrt = None
-	# a stdin with no answer ( none, closed, or at its end: Ctrl-D, /dev/null, a pipe that ended ) is no reason to stop the
-	# countdown early: the default applies when it ends, and a Ctrl-C still aborts. It is asked again every second, as the
-	# countdown is still asking: a terminal can answer after a Ctrl-D ( one select() and one input() a second: no busy loop )
-	no_stdin = sys.stdin is None or getattr(sys.stdin, 'closed', False)
-	# stdin is asked at the start of each second and once more at the end, so a line typed in the last second counts too
-	for remaining in range(timeout, -1, -1):
-		# If there is an input, return it
-		if not no_stdin:
-			try:
-				if msvcrt is not None:
-					if msvcrt.kbhit():
-						return input().strip()
-				elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+	fd = None
+	if msvcrt is None and sys.stdin is not None and not getattr(sys.stdin, 'closed', False):
+		# a stdin select() cannot watch ( no descriptor: a StringIO ) raises here: it was not asked, so it is not "no answer"
+		fd = sys.stdin.fileno()
+	# the count is by the clock, and stdin is read by its descriptor, a byte at a time: input() would wait for a whole line
+	# with no timeout ( text typed and then Ctrl-D, a program that loaded readline, a pipe that sent part of a line ), while
+	# the descriptor is read only as far as select() says there is something, and only up to the end of the line, so what
+	# follows it stays for whoever reads stdin next
+	deadline = time.monotonic() + timeout
+	typed = bytearray()
+	shown = None
+	late = 0
+	while True:
+		remaining = deadline - time.monotonic()
+		seconds = max(math.ceil(remaining), 0)
+		if seconds and seconds != shown:
+			shown = seconds
+			_write_error(f"\r{prompt} [{seconds}s]: ", end='')
+		# stdin is watched until the next whole second, and asked once more when the countdown ends
+		wait = remaining - (seconds - 1) if seconds else 0
+		ended = fd is None
+		try:
+			if msvcrt is not None:
+				# the console is asked once a second
+				ended = True
+				if msvcrt.kbhit():
 					return input().strip()
-			except io.UnsupportedOperation:
-				# a stdin select() cannot watch ( no descriptor: a StringIO ) was not asked: that is not "no answer", as in 1.64
-				raise
-			except (EOFError, OSError):
-				# no answer this second. EOFError: at its end, or a Ctrl-D; OSError: its descriptor closed, or its terminal gone
-				pass
-		if remaining == 0:
-			break
-		# Print the remaining time
-		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
-		# Wait a second
-		time.sleep(1)
-	# If there is no input, return None
-	return None
+			elif fd is not None and select.select([fd], [], [], wait)[0]:
+				byte = os.read(fd, 1)
+				if byte and byte != b'\n':
+					typed += byte
+					# read on at once: the rest of the line is there. Past the end only as much as a terminal holds for one
+					# line ( 4096 bytes, Linux's N_TTY_BUF_SIZE ): an answer there by the end is read, and an endless stdin
+					# ( /dev/zero ) cannot hold the call
+					late += remaining <= 0
+					if late < 4096:
+						continue
+				elif byte or typed:
+					# Enter, or the end of the input after text ( a pipe whose last line has no newline; Ctrl-D twice )
+					return typed.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', 'replace').strip()
+				else:
+					# at its end, or a Ctrl-D: no answer this second. What Python itself already read ahead of a stdin
+					# that is not a terminal ( a pipe or a file the program read a line of ) is there to take, as in 1.65
+					ended = True
+					if not os.isatty(fd):
+						line = sys.stdin.readline()
+						if line:
+							return line.strip()
+		except (EOFError, OSError, ValueError):
+			# no answer this second. EOFError: msvcrt's input() at its end ( Ctrl-Z ); OSError: the descriptor closed, or its
+			# terminal gone; ValueError: sys.stdin closed meanwhile
+			ended = True
+		if remaining <= 0:
+			return None
+		# an ended stdin is asked again at the next second, not in a busy loop: a terminal can answer after a Ctrl-D
+		if ended:
+			time.sleep(wait)
 
 def pretty_format_table(data, delimiter=None, header=None, full=False, remove_empty_columns=False):
 	import re
@@ -3626,7 +3656,10 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 		if isinstance(size, int):
 			return size
 		elif isinstance(size, str):
-			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
+			# the whole string is a size: a number, then a unit or none ( K to Y, an i after it for 1024s, a B at the end ), with
+			# blanks around them; anything else, text after the unit too ( '5Gb/s', '1e9' ), is not one ( 1.65 read its start ).
+			# The blanks around go by strip(): a \s* at each end of the pattern would retry every split of a long run of them
+			match = re.fullmatch(r"(\d+(\.\d*)?)\s*((?:[kmgtpezy]i?)?b?)", size.strip(), re.IGNORECASE)
 			unit_labels = {
 				"": 0,
 				"k": 1,
@@ -3641,14 +3674,14 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			if match:
 				number, _, unit = match.groups()
 				number = float(number)
-				unit = unit.strip().lower().rstrip("b")
+				unit = unit.lower().rstrip("b")
 				if unit.endswith("i"):
 					use_1024_bytes = True
 				elif use_1024_bytes is None:
 					use_1024_bytes = False
 				unit = unit.rstrip("i")
-			# no number, or a unit that is none of these: not a size ( 1.64 returned None for the unit )
-			if not match or unit not in unit_labels:
+			# not a size: no number, a unit it does not know ( 1.64 returned None ), or text after it
+			if not match:
 				if to_str:
 					return size
 				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
