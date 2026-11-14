@@ -1,9 +1,11 @@
 import builtins
 import io
 import os
+import re
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -193,7 +195,8 @@ def test_input_with_timeout_and_countdown(monkeypatch):
 def test_countdown_at_the_end_of_stdin_asks_again_each_second_and_runs_out(monkeypatch, capsys):
 	# select() calls a stdin at its end readable for ever, and input() raises EOFError there ( 1.64 let it out ). Ctrl-D counts
 	# as no answer: the countdown goes on to its end, so the default applies then and a Ctrl-C can still abort, and stdin is
-	# asked again once a second, as a terminal can still answer after a Ctrl-D ( the first 1.65 build stopped asking )
+	# asked again once a second and once more at the end, as a terminal can still answer after a Ctrl-D ( the second 1.65 build
+	# stopped asking )
 	asked, slept = [], []
 	monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
 	def at_its_end(prompt=""):
@@ -206,7 +209,7 @@ def test_countdown_at_the_end_of_stdin_asks_again_each_second_and_runs_out(monke
 	monkeypatch.setattr(select, "select", readable)
 	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
 	assert input_with_timeout_and_countdown(3, "Answer") is None
-	assert asked == ["select", "input"] * 3
+	assert asked == ["select", "input"] * 4
 	assert slept == [1, 1, 1]
 	err = capsys.readouterr().err
 	assert "Answer [3s]: " in err and "Answer [2s]: " in err and "Answer [1s]: " in err
@@ -222,6 +225,21 @@ def test_countdown_at_the_end_of_stdin_lets_a_ctrl_c_abort_it(monkeypatch):
 	monkeypatch.setattr(multiCMD.time, "sleep", interrupted)
 	with pytest.raises(KeyboardInterrupt):
 		input_with_timeout_and_countdown(60)
+
+
+def test_countdown_takes_an_answer_typed_in_its_last_second(monkeypatch):
+	# stdin is asked once more when the countdown ends: a line typed after the last second began is the answer ( 1.64 and the
+	# first three 1.65 builds returned None )
+	asked, slept = [], []
+	monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
+	def readable_at_the_end(r, w, x, timeout=None):
+		asked.append("select")
+		return ([sys.stdin], [], []) if len(slept) == 3 else ([], [], [])
+	monkeypatch.setattr(select, "select", readable_at_the_end)
+	monkeypatch.setattr(builtins, "input", lambda prompt="": " n ")
+	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
+	assert input_with_timeout_and_countdown(3, "Answer") == "n"
+	assert asked == ["select"] * 4 and slept == [1, 1, 1]
 
 
 def test_countdown_says_so_when_select_cannot_watch_stdin(monkeypatch):
@@ -258,7 +276,7 @@ def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=N
 		env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])))
 	try:
 		if feed is not None:
-			feed()
+			feed(proc)
 		out, err = proc.communicate(timeout=30)
 	finally:
 		if proc.poll() is None:
@@ -316,7 +334,7 @@ def test_countdown_runs_out_after_ctrl_d_at_a_terminal(tmp_path):
 	master, slave = pty.openpty()
 	try:
 		# Ctrl-D ( the terminal's EOF character ) typed at the prompt
-		got = ask(tmp_path, stdin=slave, feed=lambda: os.write(master, b"\x04"))
+		got = ask(tmp_path, stdin=slave, feed=lambda proc: os.write(master, b"\x04"))
 	finally:
 		os.close(slave)
 		os.close(master)
@@ -326,16 +344,71 @@ def test_countdown_runs_out_after_ctrl_d_at_a_terminal(tmp_path):
 @posix_only
 def test_countdown_takes_an_answer_typed_after_ctrl_d_at_a_terminal(tmp_path):
 	# a terminal's Ctrl-D ends nothing: the countdown is still asking, and "n" typed after it is the answer, at the next second,
-	# not the default at the end ( the first 1.65 build stopped reading: None after the 3 s, and the "n" left for the shell )
+	# not the default at the end ( the second 1.65 build stopped reading: None after the 3 s, and the "n" left for the shell )
 	import pty
 	master, slave = pty.openpty()
 	try:
-		status, out, err = ask(tmp_path, stdin=slave, timeout=3, feed=lambda: os.write(master, b"\x04n\n"))
+		status, out, err = ask(tmp_path, stdin=slave, timeout=3, feed=lambda proc: os.write(master, b"\x04n\n"))
 	finally:
 		os.close(slave)
 		os.close(master)
 	assert status == 0 and out.split()[:2] == ["GOT", "'n'"], (status, out, err)
 	assert 1.0 <= float(out.split()[2]) < 3.0, out
+
+
+def read_until(fd, marker, seconds=20):
+	# reads fd until marker has come ( the countdown has printed its last second ), or until it stays quiet once marker is None
+	seen, deadline = b"", time.monotonic() + seconds
+	while time.monotonic() < deadline and (marker is None or marker not in seen):
+		if select.select([fd], [], [], 0.2)[0]:
+			seen += os.read(fd, 4096)
+		elif marker is None:
+			break
+	assert marker is None or marker in seen, seen
+	return seen
+
+
+@posix_only
+def test_countdown_takes_a_line_sent_in_its_last_second(tmp_path):
+	# a pipe that stays open: "n" sent once the last second has begun is the answer, at the end ( 1.64 and 981bbc2: None )
+	read_end, write_end = os.pipe()
+	def in_the_last_second(proc):
+		read_until(proc.stderr.fileno(), b"Answer [1s]: ")
+		os.write(write_end, b"n\n")
+	try:
+		status, out, err = ask(tmp_path, stdin=read_end, timeout=2, feed=in_the_last_second)
+	finally:
+		os.close(read_end)
+		os.close(write_end)
+	assert status == 0 and out.split()[:2] == ["GOT", "'n'"], (status, out, err)
+	assert 1.0 <= float(out.split()[2]) < 6.0, out
+
+
+@posix_only
+def test_countdown_at_a_terminal_takes_an_answer_typed_after_ctrl_d_in_its_last_second(tmp_path):
+	# stdin, stdout and stderr all on the terminal, as at a shell, where input() reads through C stdio: Ctrl-D, then "n" typed
+	# once the last second has begun, is the answer
+	import pty
+	master, slave = pty.openpty()
+	program = tmp_path / "ask.py"
+	program.write_text(ASK % ("", 2))
+	proc = subprocess.Popen([sys.executable, str(program)], stdin=slave, stdout=slave, stderr=slave,
+		env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])))
+	try:
+		os.write(master, b"\x04")
+		read_until(master, b"Answer [1s]: ")
+		os.write(master, b"n\n")
+		proc.wait(30)
+		# its answer line is on the terminal: the program has ended, so what it wrote is all there to read
+		got = re.search(rb"GOT (\S+) ([0-9.]+)", read_until(master, None))
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.wait()
+		os.close(slave)
+		os.close(master)
+	assert got and got.group(1) == b"'n'", got
+	assert 1.0 <= float(got.group(2)) < 6.0, got
 
 
 @posix_only

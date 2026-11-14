@@ -989,7 +989,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	try:import msvcrt
 	except ImportError:msvcrt=None
 	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False)
-	for remaining in range(timeout,0,-1):
+	for remaining in range(timeout,-1,-1):
 		if not no_stdin:
 			try:
 				if msvcrt is not None:
@@ -997,6 +997,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 				elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
 			except io.UnsupportedOperation:raise
 			except(EOFError,OSError):pass
+		if remaining==0:break
 		_write_error(f"\r{prompt} [{remaining}s]: ",end='');time.sleep(1)
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
 	import re,unicodedata;version=1.21;_=version

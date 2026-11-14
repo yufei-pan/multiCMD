@@ -3258,8 +3258,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		prompt: The prompt to display to the user
 
 	@returns:
-		str: The input from the user or None if no input was received: the timeout ran out. A stdin that has ended or is closed
-			( Ctrl-D, /dev/null ) counts as no answer: the countdown still runs out, and takes an answer typed after a Ctrl-D
+		str: The input from the user or None if no input was received: the timeout ran out. A stdin that has ended, is closed
+			or is missing ( Ctrl-D, /dev/null ) counts as no answer: the countdown goes on asking, and takes a line typed before its end
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
@@ -3275,8 +3275,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	# countdown early: the default applies when it ends, and a Ctrl-C still aborts. It is asked again every second, as the
 	# countdown is still asking: a terminal can answer after a Ctrl-D ( one select() and one input() a second: no busy loop )
 	no_stdin = sys.stdin is None or getattr(sys.stdin, 'closed', False)
-	# Loop until the timeout
-	for remaining in range(timeout, 0, -1):
+	# stdin is asked at the start of each second and once more at the end, so a line typed in the last second counts too
+	for remaining in range(timeout, -1, -1):
 		# If there is an input, return it
 		if not no_stdin:
 			try:
@@ -3291,6 +3291,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 			except (EOFError, OSError):
 				# no answer this second. EOFError: at its end, or a Ctrl-D; OSError: its descriptor closed, or its terminal gone
 				pass
+		if remaining == 0:
+			break
 		# Print the remaining time
 		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second
