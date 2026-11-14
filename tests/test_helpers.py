@@ -1,9 +1,11 @@
 import builtins
 import io
 import os
+import re
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -62,6 +64,34 @@ def test_slugify_ascii_and_unicode():
 def test_format_bytes_roundtrip():
 	assert format_bytes(1024, use_1024_bytes=True, to_str=True) == "1.00 Ki"
 	assert format_bytes("1 KiB", to_int=True) == 1024
+
+
+@pytest.mark.parametrize("size", ["5 foo", "5foo", "5 fooi", "5 KiBx", "1.5 gigs", "5 bytes"])
+@pytest.mark.parametrize("kwargs", [{"to_int": True}, {}, {"use_1024_bytes": True}, {"to_int": True, "use_1024_bytes": False}],
+	ids=["to_int", "no flags", "1024", "to_int 1000"])
+def test_format_bytes_a_unit_it_does_not_know_is_an_invalid_size(capsys, size, kwargs):
+	# 1.64 returned None, silently, and int() of it raised TypeError; a size it cannot read at all already gave 0 and a line
+	got = format_bytes(size, **kwargs)
+	assert got == 0 and isinstance(got, int)
+	out, err = capsys.readouterr()
+	assert out == ""
+	assert "Invalid size format" in err and "Got: " + size in err
+
+
+@pytest.mark.parametrize("kwargs", [{"to_str": True}, {"to_str": True, "to_int": True}], ids=["to_str", "to_str to_int"])
+def test_format_bytes_to_str_hands_back_a_size_it_does_not_know_the_unit_of(capsys, kwargs):
+	# unchanged: the string asked to be shown comes back as it came, with nothing said
+	assert format_bytes("5 foo", **kwargs) == "5 foo"
+	assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("size, kwargs, expected", [
+	("5", {}, 5), ("5 B", {"to_int": True}, 5), ("2.5 kb", {"to_int": True}, 2500), ("2.5 KiB", {}, 2560),
+	("1 M", {"use_1024_bytes": True}, 1048576), ("3gib", {"to_int": True}, 3 * 1024 ** 3), ("1 T", {}, 10 ** 12),
+	(7, {"to_int": True}, 7), (7.9, {"to_int": True}, 7)], ids=str)
+def test_format_bytes_reads_every_unit_it_knows(capsys, size, kwargs, expected):
+	assert format_bytes(size, **kwargs) == expected
+	assert capsys.readouterr() == ("", "")
 
 
 def test_int_to_color_deterministic_and_in_range():
@@ -160,3 +190,234 @@ def test_input_with_timeout_and_countdown(monkeypatch):
 	assert input_with_timeout_and_countdown(5) == "user input"
 	monkeypatch.setattr(select, "select", lambda r, w, x, timeout=None: ([], [], []))
 	assert input_with_timeout_and_countdown(1) is None
+
+
+def test_countdown_at_the_end_of_stdin_asks_again_each_second_and_runs_out(monkeypatch, capsys):
+	# select() calls a stdin at its end readable for ever, and input() raises EOFError there ( 1.64 let it out ). Ctrl-D counts
+	# as no answer: the countdown goes on to its end, so the default applies then and a Ctrl-C can still abort, and stdin is
+	# asked again once a second and once more at the end, as a terminal can still answer after a Ctrl-D ( the second 1.65 build
+	# stopped asking )
+	asked, slept = [], []
+	monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
+	def at_its_end(prompt=""):
+		asked.append("input")
+		raise EOFError
+	def readable(r, w, x, timeout=None):
+		asked.append("select")
+		return ([sys.stdin], [], [])
+	monkeypatch.setattr(builtins, "input", at_its_end)
+	monkeypatch.setattr(select, "select", readable)
+	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
+	assert input_with_timeout_and_countdown(3, "Answer") is None
+	assert asked == ["select", "input"] * 4
+	assert slept == [1, 1, 1]
+	err = capsys.readouterr().err
+	assert "Answer [3s]: " in err and "Answer [2s]: " in err and "Answer [1s]: " in err
+
+
+def test_countdown_at_the_end_of_stdin_lets_a_ctrl_c_abort_it(monkeypatch):
+	def at_its_end(prompt=""):
+		raise EOFError
+	def interrupted(seconds):
+		raise KeyboardInterrupt
+	monkeypatch.setattr(builtins, "input", at_its_end)
+	monkeypatch.setattr(select, "select", lambda r, w, x, timeout=None: ([sys.stdin], [], []))
+	monkeypatch.setattr(multiCMD.time, "sleep", interrupted)
+	with pytest.raises(KeyboardInterrupt):
+		input_with_timeout_and_countdown(60)
+
+
+def test_countdown_takes_an_answer_typed_in_its_last_second(monkeypatch):
+	# stdin is asked once more when the countdown ends: a line typed after the last second began is the answer ( 1.64 and the
+	# first three 1.65 builds returned None )
+	asked, slept = [], []
+	monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
+	def readable_at_the_end(r, w, x, timeout=None):
+		asked.append("select")
+		return ([sys.stdin], [], []) if len(slept) == 3 else ([], [], [])
+	monkeypatch.setattr(select, "select", readable_at_the_end)
+	monkeypatch.setattr(builtins, "input", lambda prompt="": " n ")
+	monkeypatch.setattr(multiCMD.time, "sleep", slept.append)
+	assert input_with_timeout_and_countdown(3, "Answer") == "n"
+	assert asked == ["select"] * 4 and slept == [1, 1, 1]
+
+
+def test_countdown_says_so_when_select_cannot_watch_stdin(monkeypatch):
+	# a stdin with no descriptor ( a StringIO ) was not asked: not "no answer", and its line is not dropped in silence ( as 1.64 )
+	monkeypatch.setitem(sys.modules, "msvcrt", None)
+	monkeypatch.setattr(sys, "stdin", io.StringIO("yes\n"))
+	monkeypatch.setattr(multiCMD.time, "sleep", lambda seconds: None)
+	with pytest.raises(io.UnsupportedOperation):
+		input_with_timeout_and_countdown(3)
+
+
+posix_only = pytest.mark.skipif(os.name != "posix", reason="POSIX only")
+
+# the countdown ( of 1 s unless said ), in a program of its own: what it returned, and how long it took
+ASK = (
+	"import os, sys, time, multiCMD\n"
+	"%s"
+	"t = time.monotonic()\n"
+	"got = multiCMD.input_with_timeout_and_countdown(%d, 'Answer')\n"
+	"sys.stdout.write('GOT %%r %%.2f\\n' %% (got, time.monotonic() - t))\n"
+	"sys.stdout.flush()\n"
+	"os._exit(0)\n")
+
+
+def ask(tmp_path, before="", stdin=subprocess.DEVNULL, shell_prefix=None, feed=None, timeout=1):
+	# runs the countdown in a program of its own, with real descriptors; returns its exit status, what it said on stdout (the
+	# answer and the seconds it took) and what it wrote on stderr
+	program = tmp_path / "ask.py"
+	program.write_text(ASK % (before, timeout))
+	argv = [sys.executable, str(program)]
+	if shell_prefix:
+		argv = ["sh", "-c", 'exec "$0" "$@" ' + shell_prefix] + argv
+	proc = subprocess.Popen(argv, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])))
+	try:
+		if feed is not None:
+			feed(proc)
+		out, err = proc.communicate(timeout=30)
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.wait()
+	return proc.returncode, out.decode(), err.decode()
+
+
+def answered_none_after_the_timeout(got):
+	# None, and not sooner than the countdown of 1 s ( never at once ); the upper bound only catches a wait that is not the countdown
+	status, out, err = got
+	words = out.split()
+	assert status == 0 and words[:2] == ["GOT", "None"], got
+	assert 1.0 <= float(words[2]) < 6.0, got
+	assert "Answer [1s]: " in err, got
+	return True
+
+
+@posix_only
+def test_countdown_at_the_end_of_stdin_runs_out_for_dev_null(tmp_path):
+	assert answered_none_after_the_timeout(ask(tmp_path))
+
+
+@posix_only
+def test_countdown_at_the_end_of_stdin_runs_out_for_a_pipe_that_ended(tmp_path):
+	read_end, write_end = os.pipe()
+	os.close(write_end)
+	try:
+		assert answered_none_after_the_timeout(ask(tmp_path, stdin=read_end))
+	finally:
+		os.close(read_end)
+
+
+@posix_only
+def test_countdown_with_a_closed_stdin_runs_out(tmp_path):
+	# `prog <&-`: Python has no sys.stdin at all
+	assert answered_none_after_the_timeout(ask(tmp_path, shell_prefix="<&-"))
+
+
+@posix_only
+@pytest.mark.parametrize("before", ["sys.stdin.close()\n", "os.close(0)\n"], ids=["sys.stdin closed", "descriptor 0 closed"])
+def test_countdown_whose_stdin_the_program_closed_runs_out(tmp_path, before):
+	# a pipe that stays open, so that nothing but the close ends it
+	read_end, write_end = os.pipe()
+	try:
+		assert answered_none_after_the_timeout(ask(tmp_path, before=before, stdin=read_end))
+	finally:
+		os.close(read_end)
+		os.close(write_end)
+
+
+@posix_only
+def test_countdown_runs_out_after_ctrl_d_at_a_terminal(tmp_path):
+	import pty
+	master, slave = pty.openpty()
+	try:
+		# Ctrl-D ( the terminal's EOF character ) typed at the prompt
+		got = ask(tmp_path, stdin=slave, feed=lambda proc: os.write(master, b"\x04"))
+	finally:
+		os.close(slave)
+		os.close(master)
+	assert answered_none_after_the_timeout(got)
+
+
+@posix_only
+def test_countdown_takes_an_answer_typed_after_ctrl_d_at_a_terminal(tmp_path):
+	# a terminal's Ctrl-D ends nothing: the countdown is still asking, and "n" typed after it is the answer, at the next second,
+	# not the default at the end ( the second 1.65 build stopped reading: None after the 3 s, and the "n" left for the shell )
+	import pty
+	master, slave = pty.openpty()
+	try:
+		status, out, err = ask(tmp_path, stdin=slave, timeout=3, feed=lambda proc: os.write(master, b"\x04n\n"))
+	finally:
+		os.close(slave)
+		os.close(master)
+	assert status == 0 and out.split()[:2] == ["GOT", "'n'"], (status, out, err)
+	assert 1.0 <= float(out.split()[2]) < 3.0, out
+
+
+def read_until(fd, marker, seconds=20):
+	# reads fd until marker has come ( the countdown has printed its last second ), or until it stays quiet once marker is None
+	seen, deadline = b"", time.monotonic() + seconds
+	while time.monotonic() < deadline and (marker is None or marker not in seen):
+		if select.select([fd], [], [], 0.2)[0]:
+			seen += os.read(fd, 4096)
+		elif marker is None:
+			break
+	assert marker is None or marker in seen, seen
+	return seen
+
+
+@posix_only
+def test_countdown_takes_a_line_sent_in_its_last_second(tmp_path):
+	# a pipe that stays open: "n" sent once the last second has begun is the answer, at the end ( 1.64 and 981bbc2: None )
+	read_end, write_end = os.pipe()
+	def in_the_last_second(proc):
+		read_until(proc.stderr.fileno(), b"Answer [1s]: ")
+		os.write(write_end, b"n\n")
+	try:
+		status, out, err = ask(tmp_path, stdin=read_end, timeout=2, feed=in_the_last_second)
+	finally:
+		os.close(read_end)
+		os.close(write_end)
+	assert status == 0 and out.split()[:2] == ["GOT", "'n'"], (status, out, err)
+	assert 1.0 <= float(out.split()[2]) < 6.0, out
+
+
+@posix_only
+def test_countdown_at_a_terminal_takes_an_answer_typed_after_ctrl_d_in_its_last_second(tmp_path):
+	# stdin, stdout and stderr all on the terminal, as at a shell, where input() reads through C stdio: Ctrl-D, then "n" typed
+	# once the last second has begun, is the answer
+	import pty
+	master, slave = pty.openpty()
+	program = tmp_path / "ask.py"
+	program.write_text(ASK % ("", 2))
+	proc = subprocess.Popen([sys.executable, str(program)], stdin=slave, stdout=slave, stderr=slave,
+		env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])))
+	try:
+		os.write(master, b"\x04")
+		read_until(master, b"Answer [1s]: ")
+		os.write(master, b"n\n")
+		proc.wait(30)
+		# its answer line is on the terminal: the program has ended, so what it wrote is all there to read
+		got = re.search(rb"GOT (\S+) ([0-9.]+)", read_until(master, None))
+	finally:
+		if proc.poll() is None:
+			proc.kill()
+			proc.wait()
+		os.close(slave)
+		os.close(master)
+	assert got and got.group(1) == b"'n'", got
+	assert 1.0 <= float(got.group(2)) < 6.0, got
+
+
+@posix_only
+def test_countdown_still_returns_what_was_typed_at_once(tmp_path):
+	read_end, write_end = os.pipe()
+	try:
+		os.write(write_end, b" yes \n")
+		status, out, err = ask(tmp_path, stdin=read_end)
+	finally:
+		os.close(read_end)
+		os.close(write_end)
+	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"] and float(out.split()[2]) < 1.0

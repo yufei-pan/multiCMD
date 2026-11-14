@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.64'
+version='1.65'
 __version__=version
 COMMIT_DATE='2026-11-13'
 __running_threads=set()
@@ -988,10 +988,16 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	_display.flush();_write_error(f"{prompt} [{timeout}s]: ",end='')
 	try:import msvcrt
 	except ImportError:msvcrt=None
-	for remaining in range(timeout,0,-1):
-		if msvcrt is not None:
-			if msvcrt.kbhit():return input().strip()
-		elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
+	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False)
+	for remaining in range(timeout,-1,-1):
+		if not no_stdin:
+			try:
+				if msvcrt is not None:
+					if msvcrt.kbhit():return input().strip()
+				elif sys.stdin in select.select([sys.stdin],[],[],0)[0]:return input().strip()
+			except io.UnsupportedOperation:raise
+			except(EOFError,OSError):pass
+		if remaining==0:break
 		_write_error(f"\r{prompt} [{remaining}s]: ",end='');time.sleep(1)
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
 	import re,unicodedata;version=1.21;_=version
@@ -1137,22 +1143,19 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 	if to_int or isinstance(size,str):
 		if isinstance(size,int):return size
 		elif isinstance(size,str):
-			match=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',size)
-			if not match:
+			match=re.match('(\\d+(\\.\\d+)?)\\s*([a-zA-Z]*)',size);unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
+			if match:
+				number,_,unit=match.groups();number=float(number);unit=unit.strip().lower().rstrip('b')
+				if unit.endswith('i'):use_1024_bytes=True
+				elif use_1024_bytes is None:use_1024_bytes=False
+				unit=unit.rstrip('i')
+			if not match or unit not in unit_labels:
 				if to_str:return size
 				_write_error(f"Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\nGot: {size}");return 0
-			number,_,unit=match.groups();number=float(number);unit=unit.strip().lower().rstrip('b')
-			if unit.endswith('i'):use_1024_bytes=True
-			elif use_1024_bytes is None:use_1024_bytes=False
-			unit=unit.rstrip('i')
 			if use_1024_bytes:power=2**10
 			else:power=10**3
-			unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
-			if unit not in unit_labels:
-				if to_str:return size
-			else:
-				if to_str:return format_bytes(size=int(number*power**unit_labels[unit]),use_1024_bytes=use_1024_bytes,to_str=True,str_format=str_format)
-				return int(number*power**unit_labels[unit])
+			if to_str:return format_bytes(size=int(number*power**unit_labels[unit]),use_1024_bytes=use_1024_bytes,to_str=True,str_format=str_format)
+			return int(number*power**unit_labels[unit])
 		else:
 			try:return int(size)
 			except Exception:return 0

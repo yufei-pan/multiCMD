@@ -533,6 +533,21 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.65 from 1.64
+
+- Nothing needs doing for `mcmd`, which is unchanged. hpcp users upgrade hpcp to 9.92 before or with multiCMD 1.65: hpcp up
+  to 9.91 takes the `0` below as a size where 1.64 stopped with a `TypeError`, and 9.92 refuses a size with a unit it cannot
+  read before anything is touched.
+- Changed, library: `format_bytes()` given a string with a unit it does not know (`'5 foo'`) returns `0` and writes the
+  "Invalid size format" line to stderr, as for a string with no number (1.64: `None`). A program that cannot tell this `0`
+  from a real one checks the string itself.
+- Changed, library: `input_with_timeout_and_countdown()` counts an ended stdin (Ctrl-D, `/dev/null`), a closed one or none
+  as no answer: it returns `None` when the countdown ends, never sooner (1.64: an exception). It goes on asking meanwhile,
+  so Ctrl-C still aborts and a line typed before the end is taken. A program that caught `EOFError` to skip the prompt now
+  waits the countdown out.
+- Known, planned for 1.66 ([docs/limitations.md](docs/limitations.md)): Ctrl-D after a half-typed line stops the countdown
+  until the line is ended, and `format_bytes()` ignores text after the size (`'5Gb/s'` is 5 G).
+
 ## Upgrading to 1.64 from 1.63
 
 - Changed, library: once the reader of stdout quit, a shown command whose output keeps coming stops its call: the call's
@@ -546,9 +561,9 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   no longer stopped by another write's failure (docs/limitations.md).
 - Changed, library: a shown dry run whose line finds the reader gone raises `BrokenPipeError` if it waits, whenever it began
   (1.63: a dry run made after the reader quit returned).
-- hpcp 9.89 and 9.90 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a delayed `e2fsck` that
+- hpcp 9.89 to 9.91 cloning a disk (`-dd`) with 1.64 installed beside them: when the reader quits, a delayed `e2fsck` that
   prints for longer than 1 s is cut, with the `tune2fs` queued after it, and its call raises before the loop devices are
-  detached, where 1.63 ran it unseen; a later hpcp runs its cleanup quiet.
+  detached, where 1.63 ran it unseen; hpcp 9.92 runs its cleanup quiet.
 - Changed: `input_with_timeout_and_countdown()` writes its prompt and countdown to stderr, after flushing stdout, and
   `format_bytes()` its error message (1.63: stdout, where a dead one raised `BrokenPipeError` and `> log` hid the prompt).
 - Fix: a `sys.stdout` the program closed loses the output and every command runs (1.63: `ValueError`, and nothing ran), and

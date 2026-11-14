@@ -29,7 +29,7 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.64'
+version = '1.65'
 __version__ = version
 COMMIT_DATE = '2026-11-13'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
@@ -3258,7 +3258,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		prompt: The prompt to display to the user
 
 	@returns:
-		str: The input from the user or None if no input was received
+		str: The input from the user or None if no input was received: the timeout ran out. A stdin that has ended, is closed
+			or is missing ( Ctrl-D, /dev/null ) counts as no answer: the countdown goes on asking, and takes a line typed before its end
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
@@ -3270,14 +3271,28 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		import msvcrt
 	except ImportError:
 		msvcrt = None
-	# Loop until the timeout
-	for remaining in range(timeout, 0, -1):
+	# a stdin with no answer ( none, closed, or at its end: Ctrl-D, /dev/null, a pipe that ended ) is no reason to stop the
+	# countdown early: the default applies when it ends, and a Ctrl-C still aborts. It is asked again every second, as the
+	# countdown is still asking: a terminal can answer after a Ctrl-D ( one select() and one input() a second: no busy loop )
+	no_stdin = sys.stdin is None or getattr(sys.stdin, 'closed', False)
+	# stdin is asked at the start of each second and once more at the end, so a line typed in the last second counts too
+	for remaining in range(timeout, -1, -1):
 		# If there is an input, return it
-		if msvcrt is not None:
-			if msvcrt.kbhit():
-				return input().strip()
-		elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
-			return input().strip()
+		if not no_stdin:
+			try:
+				if msvcrt is not None:
+					if msvcrt.kbhit():
+						return input().strip()
+				elif sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+					return input().strip()
+			except io.UnsupportedOperation:
+				# a stdin select() cannot watch ( no descriptor: a StringIO ) was not asked: that is not "no answer", as in 1.64
+				raise
+			except (EOFError, OSError):
+				# no answer this second. EOFError: at its end, or a Ctrl-D; OSError: its descriptor closed, or its terminal gone
+				pass
+		if remaining == 0:
+			break
 		# Print the remaining time
 		_write_error(f"\r{prompt} [{remaining}s]: ", end='')
 		# Wait a second
@@ -3612,23 +3627,6 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 			return size
 		elif isinstance(size, str):
 			match = re.match(r"(\d+(\.\d+)?)\s*([a-zA-Z]*)", size)
-			if not match:
-				if to_str:
-					return size
-				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
-				return 0
-			number, _, unit = match.groups()
-			number = float(number)
-			unit = unit.strip().lower().rstrip("b")
-			if unit.endswith("i"):
-				use_1024_bytes = True
-			elif use_1024_bytes is None:
-				use_1024_bytes = False
-			unit = unit.rstrip("i")
-			if use_1024_bytes:
-				power = 2**10
-			else:
-				power = 10**3
 			unit_labels = {
 				"": 0,
 				"k": 1,
@@ -3640,18 +3638,33 @@ def format_bytes(size, use_1024_bytes=None, to_int=False, to_str=False, str_form
 				"z": 7,
 				"y": 8,
 			}
-			if unit not in unit_labels:
+			if match:
+				number, _, unit = match.groups()
+				number = float(number)
+				unit = unit.strip().lower().rstrip("b")
+				if unit.endswith("i"):
+					use_1024_bytes = True
+				elif use_1024_bytes is None:
+					use_1024_bytes = False
+				unit = unit.rstrip("i")
+			# no number, or a unit that is none of these: not a size ( 1.64 returned None for the unit )
+			if not match or unit not in unit_labels:
 				if to_str:
 					return size
+				_write_error("Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\n" f"Got: {size}")
+				return 0
+			if use_1024_bytes:
+				power = 2**10
 			else:
-				if to_str:
-					return format_bytes(
-						size=int(number * (power**unit_labels[unit])),
-						use_1024_bytes=use_1024_bytes,
-						to_str=True,
-						str_format=str_format,
-					)
-				return int(number * (power**unit_labels[unit]))
+				power = 10**3
+			if to_str:
+				return format_bytes(
+					size=int(number * (power**unit_labels[unit])),
+					use_1024_bytes=use_1024_bytes,
+					to_str=True,
+					str_format=str_format,
+				)
+			return int(number * (power**unit_labels[unit]))
 		else:
 			try:
 				return int(size)
