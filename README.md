@@ -535,18 +535,18 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 ## Upgrading to 1.65 from 1.64
 
-- Nothing needs doing for `mcmd`, which is unchanged. hpcp users upgrade hpcp to 9.92 before or with multiCMD 1.65: hpcp
-  9.92 and later refuse a size they cannot read (`-ddr`, `-L`, `-F`, `-dis`) before anything is touched, and hpcp up to 9.91
-  takes the 0 where 1.64 stopped with a `TypeError` (with `-ddr` that `TypeError` came before the destination was touched; the 0
-  goes on to rewrite its partition table).
-- Changed, library: `format_bytes()` given a string with a unit it does not know (`'5 foo'`, `'1.5 gigs'`) returns `0` and
-  writes the "Invalid size format" line to stderr, as for a string with no number (1.64: `None`, silently). A program that
-  reads a size from its user and cannot tell this 0 from a real one checks the string itself.
-- Changed, library: `input_with_timeout_and_countdown()` returns `None`, as its docstring says, when stdin has ended
-  (Ctrl-D, `/dev/null`), is closed or is missing (1.64: `EOFError`, `ValueError`, `TypeError` or `OSError`). It counts as no
-  answer: the countdown runs out first, never sooner than the timeout, so the caller's default applies then, Ctrl-C still
-  aborts, and an answer typed after a Ctrl-D is still taken. A program that caught `EOFError` to skip the prompt now gets
-  `None` after the full countdown.
+- Nothing needs doing for `mcmd`, which is unchanged. hpcp users upgrade hpcp to 9.92 before or with multiCMD 1.65: hpcp up
+  to 9.91 takes the `0` below as a size where 1.64 stopped with a `TypeError`, and 9.92 refuses a size with a unit it cannot
+  read before anything is touched.
+- Changed, library: `format_bytes()` given a string with a unit it does not know (`'5 foo'`) returns `0` and writes the
+  "Invalid size format" line to stderr, as for a string with no number (1.64: `None`). A program that cannot tell this `0`
+  from a real one checks the string itself.
+- Changed, library: `input_with_timeout_and_countdown()` counts an ended stdin (Ctrl-D, `/dev/null`), a closed one or none
+  as no answer: it returns `None` when the countdown ends, never sooner (1.64: an exception). It goes on asking meanwhile,
+  so Ctrl-C still aborts and a line typed before the end is taken. A program that caught `EOFError` to skip the prompt now
+  waits the countdown out.
+- Known, planned for 1.66 ([docs/limitations.md](docs/limitations.md)): Ctrl-D after a half-typed line stops the countdown
+  until the line is ended, and `format_bytes()` ignores text after the size (`'5Gb/s'` is 5 G).
 
 ## Upgrading to 1.64 from 1.63
 
