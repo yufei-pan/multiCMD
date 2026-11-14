@@ -990,15 +990,11 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 	except ImportError:msvcrt=None
 	no_stdin=sys.stdin is None or getattr(sys.stdin,'closed',False);fd=None
 	if msvcrt is None and not no_stdin:fd=sys.stdin.fileno()
-	tty=False
+	tty=canon=False
 	if fd is not None:
-		try:import termios;tty=bool(termios.tcgetattr(fd)[3]&termios.ICANON)
+		try:import termios;canon=bool(termios.tcgetattr(fd)[3]&termios.ICANON);tty=True
 		except Exception:pass
-	regular=False
-	if fd is not None and not tty:
-		try:regular=stat.S_ISREG(os.fstat(fd).st_mode)
-		except OSError:pass
-	deadline=time.monotonic()+timeout;typed=bytearray();shown=None;late=0
+	deadline=time.monotonic()+timeout;typed=bytearray();shown=None
 	while True:
 		remaining=deadline-time.monotonic();seconds=max(math.ceil(remaining),0)
 		if seconds and seconds!=shown:shown=seconds;_write_error(f"\r{prompt} [{seconds}s]: ",end='')
@@ -1007,19 +1003,11 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 			if msvcrt is not None:
 				if not no_stdin and msvcrt.kbhit():return input().strip()
 			elif fd is not None and select.select([fd],[],[],wait)[0]:
-				data=b''if regular else os.read(fd,4096 if tty else 1);typed+=data
-				if data and b'\n'not in data:
-					if remaining<=0:late+=len(data)
-					if late<4096:continue
-				elif typed:line=bytes(typed).split(b'\n',1)[0];errors=getattr(sys.stdin,'errors',None);return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',errors if errors and errors!='strict'else'replace').strip()
-				else:
-					ended=True
-					if not tty:
-						line=sys.stdin.readline()
-						if regular:
-							try:sys.stdin.seek(sys.stdin.tell())
-							except(OSError,ValueError):pass
-						if line:return line.strip()
+				if not tty:return input().strip()
+				data=os.read(fd,4096 if canon else 1);typed+=data
+				if data and b'\n'not in data:continue
+				if typed:line=bytes(typed).split(b'\n',1)[0];errors=getattr(sys.stdin,'errors',None);return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',errors if errors and errors!='strict'else'replace').strip()
+				ended=True
 		except UnicodeDecodeError:raise
 		except(EOFError,OSError,ValueError):ended=True
 		if remaining<=0:return

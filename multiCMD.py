@@ -3260,7 +3260,8 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	@returns:
 		str: The line typed before the timeout ran out, stripped ( Enter ends it, and so does the end of the input after text );
 			or None if no input was received by then: text not ended, and a stdin that has ended, is closed or is missing
-			( Ctrl-D, /dev/null ), count as no answer, and the call returns when the timeout runs out, never sooner nor later
+			( Ctrl-D, /dev/null ), count as no answer, and the call returns when the timeout runs out, never sooner, and at a
+			terminal never later ( a stdin that is not a terminal, and Windows: docs/limitations.md )
 
 	"""
 	# the question the caller printed goes out first; the prompt and its countdown are for the person at the terminal, not for
@@ -3278,32 +3279,24 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 	if msvcrt is None and not no_stdin:
 		# a stdin select() cannot watch ( no descriptor: a StringIO ) raises here: it was not asked, so it is not "no answer"
 		fd = sys.stdin.fileno()
-	# the count is by the clock, and stdin is read by its descriptor: input() would wait for a whole line with no timeout
-	# ( text typed and then Ctrl-D, a program that loaded readline, a pipe that sent part of a line ), while the descriptor is
-	# read only as far as select() says there is something, and only up to the end of the line, so what follows it stays for
-	# whoever reads stdin next. A terminal in its line mode gives at most a line per read, and must be read in whole reads:
-	# macOS tells text that a Ctrl-D handed over from the end of the input only so ( read a byte at a time, the Ctrl-D comes
-	# back as an end of its own ); anything else but a file is read a byte at a time, as the shell's read does, a terminal out of
-	# its line mode too ( cbreak, raw: one read there gives all that was typed, the next line with it )
-	tty = False
+	# the count is by the clock. A terminal is read by its descriptor, and only as far as select() says there is something:
+	# input() would wait for a whole line with no timeout ( text typed and then Ctrl-D, a program that loaded readline ). In
+	# its line mode it gives at most a line per read, and must be read in whole reads: macOS tells text that a Ctrl-D handed
+	# over from the end of the input only so; out of its line mode ( cbreak, raw ) one read gives all that was typed, the
+	# next line with it, so it is read a byte at a time. Anything else ( a pipe, a file ) is read by Python itself, as in
+	# 1.65: nobody is typing there, and only Python knows what the program's own reading already holds
+	tty = canon = False
 	if fd is not None:
 		try:
 			import termios
-			tty = bool(termios.tcgetattr(fd)[3] & termios.ICANON)
+			canon = bool(termios.tcgetattr(fd)[3] & termios.ICANON)
+			tty = True
 		except Exception:
 			# not a terminal, one that is gone, or no termios
-			pass
-	# a file never makes a read wait: its line is Python's own next one, wherever the program's own reading stands
-	regular = False
-	if fd is not None and not tty:
-		try:
-			regular = stat.S_ISREG(os.fstat(fd).st_mode)
-		except OSError:
 			pass
 	deadline = time.monotonic() + timeout
 	typed = bytearray()
 	shown = None
-	late = 0
 	while True:
 		remaining = deadline - time.monotonic()
 		seconds = max(math.ceil(remaining), 0)
@@ -3320,43 +3313,28 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				if not no_stdin and msvcrt.kbhit():
 					return input().strip()
 			elif fd is not None and select.select([fd], [], [], wait)[0]:
-				data = b'' if regular else os.read(fd, 4096 if tty else 1)
+				if not tty:
+					return input().strip()
+				data = os.read(fd, 4096 if canon else 1)
 				typed += data
 				if data and b'\n' not in data:
-					# read on at once: the rest of the line is there. Past the end only as much as a terminal holds for one
-					# line ( 4096 bytes, Linux's N_TTY_BUF_SIZE ): an answer there by the end is read, and an endless stdin
-					# ( /dev/zero ) cannot hold the call
-					if remaining <= 0:
-						late += len(data)
-					if late < 4096:
-						continue
-				elif typed:
-					# Enter, or the end of the input after text ( a pipe whose last line has no newline; Ctrl-D twice )
+					# read on at once: the rest of the line is there, or comes
+					continue
+				if typed:
+					# Enter, or the end of the input after text ( Ctrl-D twice )
 					line = bytes(typed).split(b'\n', 1)[0]
 					# bytes that are not text are kept as stdin itself keeps them ( surrogateescape under the C locale ), and
 					# replaced where stdin would raise
 					errors = getattr(sys.stdin, 'errors', None)
 					return line.decode(getattr(sys.stdin, 'encoding', None) or 'utf-8', errors if errors and errors != 'strict' else 'replace').strip()
-				else:
-					# at its end, or a Ctrl-D: no answer this second. What Python itself already read ahead of a stdin
-					# that is not a terminal ( a pipe the program read a line of; a file, always ) is there to take, as in 1.65
-					ended = True
-					if not tty:
-						line = sys.stdin.readline()
-						if regular:
-							# the descriptor goes after the line, for whoever reads it next, where Python can say ( next() hides it )
-							try:
-								sys.stdin.seek(sys.stdin.tell())
-							except (OSError, ValueError):
-								pass
-						if line:
-							return line.strip()
+				# a Ctrl-D: no answer this second
+				ended = True
 		except UnicodeDecodeError:
-			# a file's line that stdin cannot decode ( a strict stdin ): Python's reader has dropped it, so it raises, as in 1.65
+			# a line that stdin cannot decode ( a strict stdin that is not a terminal ) raises, as in 1.65
 			raise
 		except (EOFError, OSError, ValueError):
-			# no answer this second. EOFError: msvcrt's input() at its end ( Ctrl-Z ); OSError: the descriptor closed, or its
-			# terminal gone; ValueError: sys.stdin closed meanwhile
+			# no answer this second. EOFError: input() at the end of the input ( msvcrt's Ctrl-Z too ); OSError: the descriptor
+			# closed, or its terminal gone; ValueError: sys.stdin closed meanwhile
 			ended = True
 		if remaining <= 0:
 			return None

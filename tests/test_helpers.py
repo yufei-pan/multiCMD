@@ -213,9 +213,30 @@ def pipe_stdin(monkeypatch):
 		pass
 
 
+@pytest.fixture
+def terminal(monkeypatch):
+	# a pseudo-terminal, in its line mode, as sys.stdin ( text; keyword arguments go to io.open ): terminal() returns its master
+	# end, which the "user" types on. Both ends are closed after the test
+	import pty
+	opened = []
+	def make(**kwargs):
+		master, slave = pty.openpty()
+		stdin = io.open(slave, "r", **kwargs)
+		opened.extend([stdin, master])
+		monkeypatch.setattr(sys, "stdin", stdin)
+		monkeypatch.setitem(sys.modules, "msvcrt", None)  # the select() path, on any platform
+		return master
+	yield make
+	for each in opened:
+		try:
+			each.close() if hasattr(each, "close") else os.close(each)
+		except OSError:
+			pass
+
+
 def no_input(*args):
-	# the countdown reads the descriptor itself: input() or a read of sys.stdin waits for a whole line, in a test for ever
-	# ( 1.65 did, and read /dev/zero until memory ran out ), so a countdown that calls one fails at once
+	# at a terminal the countdown reads the descriptor itself: input() or a read of sys.stdin waits for a whole line, in a test
+	# for ever ( 1.65 did ), so a countdown that calls one there fails at once
 	raise AssertionError("a read that waits for a whole line was called")
 
 
@@ -272,22 +293,7 @@ def test_countdown_takes_an_answer_typed_in_its_last_second(pipe_stdin, fake_clo
 	os.write(pipe_stdin, b" n \n")
 	monkeypatch.setattr(select, "select", fake_select(fake_clock, lambda clock: clock.now >= 1003.0))
 	assert input_with_timeout_and_countdown(3, "Answer") == "n"
-	assert fake_clock.waited == [1, 1, 1] + [0] * 4 and fake_clock.slept == []
-
-
-def test_countdown_returns_at_its_end_with_a_line_not_ended(pipe_stdin, fake_clock, monkeypatch):
-	# text with no Enter ( typed, then Ctrl-D; a pipe that sent part of a line and stays open ) is no answer: the default
-	# applies at the end ( 1.65 waited in input() for the line to end, past the timeout, and returned the text )
-	os.write(pipe_stdin, b"ye")
-	real_select = select.select
-	monkeypatch.setattr(select, "select", fake_select(fake_clock, lambda clock: bool(real_select([sys.stdin], [], [], 0)[0])))
-	with monkeypatch.context() as guarded:
-		no_line_reads(guarded, sys.stdin)
-		assert input_with_timeout_and_countdown(3, "Answer") is None
-	assert fake_clock.now == 1003.0 and fake_clock.slept == []
-	# its text was read: what comes next is a line of its own
-	os.write(pipe_stdin, b"s\n")
-	assert sys.stdin.readline() == "s\n"
+	assert fake_clock.waited == [1, 1, 1, 0] and fake_clock.slept == []
 
 
 def test_countdown_returns_at_its_end_when_stdin_ends_inside_a_second(pipe_stdin, fake_clock, monkeypatch, capsys):
@@ -303,23 +309,6 @@ def test_countdown_returns_at_its_end_when_stdin_ends_inside_a_second(pipe_stdin
 	assert input_with_timeout_and_countdown(2, "Answer") is None
 	assert fake_clock.now == pytest.approx(1002.0)
 	assert capsys.readouterr().err == "Answer [2s]: \rAnswer [2s]: \rAnswer [1s]: "
-
-
-@pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="needs /dev/zero")
-def test_countdown_stops_reading_an_endless_stdin_at_its_end(fake_clock, monkeypatch):
-	# a stdin that never ends a line ( /dev/zero ): read up to the end, and past it only as much as a terminal line holds
-	# ( 1.65 read it in input() until memory ran out )
-	monkeypatch.setitem(sys.modules, "msvcrt", None)
-	def a_byte_each_quarter_second(clock):
-		clock.now += 0.25
-		return True
-	monkeypatch.setattr(select, "select", fake_select(fake_clock, a_byte_each_quarter_second))
-	with open("/dev/zero") as zero:
-		monkeypatch.setattr(sys, "stdin", zero)
-		no_line_reads(monkeypatch, zero)
-		assert input_with_timeout_and_countdown(1, "Answer") is None
-	assert fake_clock.waited[:4] == [1.0, 0.75, 0.5, 0.25]
-	assert fake_clock.waited[4:] == [0] * 4096
 
 
 @pytest.mark.parametrize("timeout, frames", [(2.5, ["3", "3", "2", "1"]), (0.5, ["1", "1"]), (3.0, ["3", "3", "2", "1"])],
@@ -514,7 +503,7 @@ def test_countdown_still_returns_what_was_typed_at_once(tmp_path):
 	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"] and float(out.split()[2]) < 1.0
 
 
-# --- 1.66: the countdown returns at its timeout whatever stdin holds ( 1.65 waited in input() for a line to end )
+# --- 1.66: at a terminal the countdown returns at its timeout whatever was typed ( 1.65 waited in input() for a line to end )
 
 def answer_after(proc, write, seconds=8):
 	# the program's answer is due at its timeout ( 1 s ): give it 8 s, past the 6 s that answered_none_after_the_timeout allows,
@@ -570,61 +559,104 @@ def test_countdown_at_a_terminal_with_readline_loaded_returns_at_its_end_after_c
 
 
 @posix_only
-def test_countdown_returns_at_its_end_when_a_pipe_sent_part_of_a_line(tmp_path):
+def test_countdown_at_a_terminal_returns_at_its_end_with_a_line_not_ended(terminal, fake_clock, monkeypatch):
+	# "ye" typed, then Ctrl-D: the terminal hands over the text with no Enter, and the line is not ended, so it is no answer: the
+	# default applies at the end ( 1.65 waited in input() for the line to end, past the timeout ), with no whole-line read
+	master = terminal()
+	os.write(master, b"ye\x04")
+	real_select = select.select
+	monkeypatch.setattr(select, "select", fake_select(fake_clock, lambda clock: bool(real_select([sys.stdin], [], [], 0)[0])))
+	with monkeypatch.context() as guarded:
+		no_line_reads(guarded, sys.stdin)
+		assert input_with_timeout_and_countdown(3, "Answer") is None
+	assert fake_clock.now == 1003.0 and fake_clock.slept == []
+	# its text was read: what comes next is a line of its own
+	os.write(master, b"s\n")
+	assert sys.stdin.readline() == "s\n"
+
+
+@posix_only
+@pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", "\ufffdy")])
+def test_countdown_at_a_terminal_keeps_bytes_that_are_not_text_as_stdin_keeps_them(terminal, errors, expected):
+	# under the C locale stdin keeps such a byte ( surrogateescape ), so a file name typed with it still opens, as in 1.65; a
+	# strict stdin would raise, and gets a replacement character
+	master = terminal(encoding="utf-8", errors=errors)
+	os.write(master, b"\xffy\n")
+	assert input_with_timeout_and_countdown(5) == expected
+
+
+@pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", UnicodeDecodeError)])
+def test_countdown_takes_bytes_that_are_not_text_of_a_pipe_as_input_does(monkeypatch, errors, expected):
+	# a stdin that is not a terminal is read through input(), as in 1.65: a strict stdin raises
+	read_end, write_end = os.pipe()
+	stdin = io.open(read_end, "r", encoding="utf-8", errors=errors)
+	monkeypatch.setattr(sys, "stdin", stdin)
+	monkeypatch.setitem(sys.modules, "msvcrt", None)
+	try:
+		os.write(write_end, b"\xffy\n")
+		if expected is UnicodeDecodeError:
+			with pytest.raises(UnicodeDecodeError):
+				input_with_timeout_and_countdown(5)
+		else:
+			assert input_with_timeout_and_countdown(5) == expected
+	finally:
+		stdin.close()
+		os.close(write_end)
+
+
+@posix_only
+def test_countdown_takes_each_line_of_a_file_behind_a_codecs_reader(tmp_path):
+	# a program whose stdin is a codecs reader ( no seek, no tell ), asking twice over "n", "y": Python's reader keeps its place
+	# and the descriptor is not read beside it ( a second 1.66 build lost the second line: None )
+	answers = tmp_path / "answers"
+	answers.write_bytes(b"n\ny\n")
+	program = tmp_path / "twice.py"
+	program.write_text("import codecs, sys, multiCMD\nsys.stdin = codecs.getreader('utf-8')(sys.stdin.detach())\n"
+		"print([multiCMD.input_with_timeout_and_countdown(1, 'Answer') for _ in range(2)])\n")
+	with open(str(answers), "rb") as stdin:
+		out = subprocess.run([sys.executable, str(program)], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+			env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))).stdout
+	assert out.decode().strip() == "['n', 'y']", out
+
+
+@posix_only
+def test_countdown_takes_a_line_of_a_stdin_that_has_a_descriptor_and_readline_only(tmp_path):
+	# a stdin of the program's own that answers fileno() and readline() and nothing else ( no seek, tell, encoding or errors )
+	answers = tmp_path / "answers"
+	answers.write_bytes(b"first\nsecond\n")
+	program = tmp_path / "own.py"
+	program.write_text("import sys, multiCMD\n"
+		"class Own:\n    def __init__(self, f): self.f = f\n    def fileno(self): return self.f.fileno()\n"
+		"    def readline(self, *a): return self.f.readline(*a)\n"
+		"sys.stdin = Own(sys.stdin)\n"
+		"print(repr(multiCMD.input_with_timeout_and_countdown(1, 'Answer')))\n")
+	with open(str(answers), "rb") as stdin:
+		proc = subprocess.run([sys.executable, str(program)], stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+			env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1])))
+	assert proc.stdout.decode().strip() == "'first'", proc
+
+
+@posix_only
+def test_countdown_takes_the_line_after_the_one_the_program_read_of_a_pipe_fed_ahead(tmp_path):
+	# the program read "a" itself, and Python read the "y" after it ahead into its buffer; "z" comes once the countdown is
+	# asking: the answer is the "y", as Python reads it and as 1.65 gave it ( the first 1.66 builds read the descriptor beside
+	# Python's reader and gave "z" )
 	read_end, write_end = os.pipe()
 	def feed(proc):
-		os.write(write_end, b"ye")
-		answer_after(proc, lambda: os.write(write_end, b"s\n"))
+		read_until(proc.stderr.fileno(), b"Answer [3s]: ")
+		os.write(write_end, b"z\n")
 	try:
-		got = ask(tmp_path, stdin=read_end, feed=feed)
+		os.write(write_end, b"a\ny\n")
+		status, out, err = ask(tmp_path, before="sys.stdin.readline()\n", stdin=read_end, timeout=3, feed=feed)
 	finally:
 		os.close(read_end)
 		os.close(write_end)
-	assert answered_none_after_the_timeout(got)
+	assert status == 0 and out.split()[:2] == ["GOT", "'y'"], (status, out, err)
 
 
 @posix_only
 def test_countdown_takes_a_float_timeout_on_real_descriptors(tmp_path):
 	assert answered_none_after_the_timeout(ask(tmp_path, timeout=1.5), timeout=1.5)
-
-
-@posix_only
-@pytest.mark.skipif(not os.path.exists("/dev/zero"), reason="needs /dev/zero")
-def test_countdown_returns_at_its_end_from_an_endless_stdin(tmp_path):
-	# /dev/zero never ends a line. The memory limit makes a countdown that reads it whole ( 1.65 ) fail fast, not fill memory
-	limit = ("import resource\ntry:\n\tresource.setrlimit(resource.RLIMIT_AS, (1 << 31, 1 << 31))\n"
-		"except (ValueError, OSError):\n\tpass\n")
-	with open("/dev/zero", "rb") as zero:
-		assert answered_none_after_the_timeout(ask(tmp_path, before=limit, stdin=zero))
-
-
-@posix_only
-def test_countdown_leaves_what_follows_the_line_in_stdin(tmp_path):
-	# it reads stdin up to the end of the answer and no further: the next line is for whoever reads stdin next ( a shell's
-	# `while read`; 1.65's input() read ahead into the program's own buffer )
-	read_end, write_end = os.pipe()
-	try:
-		os.write(write_end, b" yes \nnext\n")
-		os.close(write_end)
-		status, out, err = ask(tmp_path, stdin=read_end)
-		left = os.read(read_end, 100)
-	finally:
-		os.close(read_end)
-	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"], (status, out, err)
-	assert left == b"next\n"
-
-
-@posix_only
-def test_countdown_leaves_what_follows_the_line_of_a_file_in_stdin(tmp_path):
-	# a file is read through Python's own reader, which reads ahead: the descriptor is then put after the answer, so the next
-	# line is for whoever reads stdin next ( a child that shares the file offset; 1.65 left it at the end of the read-ahead )
-	answers = tmp_path / "answers"
-	answers.write_bytes(b" yes \nnext\n")
-	with open(str(answers), "rb") as stdin:
-		status, out, err = ask(tmp_path, stdin=stdin)
-		left = os.read(stdin.fileno(), 100)
-	assert status == 0 and out.split()[:2] == ["GOT", "'yes'"], (status, out, err)
-	assert left == b"next\n"
 
 
 @posix_only
@@ -642,8 +674,8 @@ def test_countdown_takes_what_the_program_read_ahead_of_an_ended_pipe(tmp_path):
 
 @posix_only
 def test_countdown_takes_the_next_line_of_a_file_the_program_read_part_of(tmp_path):
-	# Python read 8 KiB of the file ahead for the program's own readline(): the answer is the line after that one, not the
-	# text that follows the read-ahead ( the first 1.66 build returned 'ne00819' )
+	# Python read 8 KiB of the file ahead for the program's own readline(): the answer is the line after that one, as Python
+	# reads it and as 1.65 did, not the text that follows the read-ahead ( the first 1.66 build returned 'ne00819' )
 	answers = tmp_path / "answers"
 	answers.write_bytes(b"".join(b"line%05d\n" % number for number in range(2000)))
 	with open(str(answers), "rb") as stdin:
@@ -654,8 +686,8 @@ def test_countdown_takes_the_next_line_of_a_file_the_program_read_part_of(tmp_pa
 @posix_only
 @pytest.mark.parametrize("before", ["next(sys.stdin)\n", "sys.stdin.buffer.readline()\n"], ids=["next", "buffer"])
 def test_countdown_takes_the_next_line_of_a_file_the_program_iterated_or_read_in_bytes(tmp_path, before):
-	# next() turns tell() off, and sys.stdin.buffer holds bytes the text reader cannot put back: Python's own reader still gives
-	# the next line ( 200 KiB: more than the 128 KiB a 3.14 buffer reads ahead )
+	# Python's own reader gives the next line wherever the program's reading stands, after next() and after sys.stdin.buffer too
+	# ( 200 KiB: more than the 128 KiB a 3.14 buffer reads ahead; the first 1.66 builds gave the middle of a line )
 	answers = tmp_path / "answers"
 	answers.write_bytes(b"".join(b"line%05d\n" % number for number in range(20000)))
 	with open(str(answers), "rb") as stdin:
@@ -665,7 +697,7 @@ def test_countdown_takes_the_next_line_of_a_file_the_program_iterated_or_read_in
 
 @posix_only
 def test_countdown_raises_for_a_file_line_a_strict_stdin_cannot_decode(tmp_path):
-	# Python's reader drops the text it could not decode, so taking the next line would be a wrong answer: it raises, as in 1.65
+	# a line that a strict stdin cannot decode raises, as in 1.65: Python's reader has dropped it
 	answers = tmp_path / "answers"
 	answers.write_bytes(b"\xffy\n" + b"".join(b"line%05d\n" % number for number in range(2000)))
 	program = tmp_path / "strict.py"
@@ -677,26 +709,10 @@ def test_countdown_raises_for_a_file_line_a_strict_stdin_cannot_decode(tmp_path)
 	assert out.split() == [b"RAISED"], out
 
 
-@pytest.mark.parametrize("errors, expected", [("surrogateescape", "\udcffy"), ("strict", "\ufffdy")])
-def test_countdown_keeps_bytes_that_are_not_text_as_stdin_keeps_them(monkeypatch, errors, expected):
-	# under the C locale stdin keeps such a byte ( surrogateescape ), so a file name typed with it still opens, as in 1.65; a
-	# strict stdin would raise, and gets a replacement character
-	read_end, write_end = os.pipe()
-	stdin = io.open(read_end, "r", encoding="utf-8", errors=errors)
-	monkeypatch.setattr(sys, "stdin", stdin)
-	monkeypatch.setitem(sys.modules, "msvcrt", None)
-	try:
-		os.write(write_end, b"\xffy\n")
-		assert input_with_timeout_and_countdown(5) == expected
-	finally:
-		stdin.close()
-		os.close(write_end)
-
-
 @posix_only
 def test_countdown_at_a_terminal_out_of_its_line_mode_leaves_the_next_line(tmp_path):
-	# cbreak ( no ICANON ): one read gives everything typed so far, so such a terminal is read a byte at a time, as a pipe is,
-	# and the line after the answer is still there for the next reader ( the first 1.66 build dropped it )
+	# cbreak ( no ICANON ): one read gives everything typed so far, so such a terminal is read a byte at a time, and the line
+	# after the answer is still there for the next reader ( the first 1.66 build dropped it )
 	import pty
 	master, slave = pty.openpty()
 	program = tmp_path / "ask.py"
