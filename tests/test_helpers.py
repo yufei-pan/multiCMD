@@ -762,7 +762,8 @@ def test_countdown_at_a_terminal_returns_at_its_end_while_text_keeps_coming(term
 	pieces = []
 	real_select = select.select
 	def a_piece_each_quarter_second(clock):
-		clock.now += 0.25
+		# the clock stands still once the countdown only asks ( a wait of 0: past its end )
+		clock.now += min(0.25, clock.waited[-1])
 		if len(pieces) < 2 * 4096:
 			pieces.append(os.write(master, b"x" if mode == "cbreak" else b"x\x04"))
 		return bool(real_select([sys.stdin], [], [], 0)[0])
@@ -770,19 +771,21 @@ def test_countdown_at_a_terminal_returns_at_its_end_while_text_keeps_coming(term
 	with monkeypatch.context() as guarded:
 		no_line_reads(guarded, sys.stdin)
 		assert input_with_timeout_and_countdown(1, "Answer") is None
-	assert len(pieces) < 2 * 4096
+	assert len(pieces) < 2 * 4096 and fake_clock.now == 1001.0
 
 
 @posix_only
-@pytest.mark.parametrize("mode, typed", [("cbreak", b"yes\nnext\n"), ("line mode", b"ye\x04s\nnext\n")])
+@pytest.mark.parametrize("mode, typed", [("cbreak", b"yes\nnext\n"), ("line mode", b"ye\x04s\nnext\n"),
+	# a long answer, but one a macOS terminal holds out of its line mode ( 1022 bytes ), so the write does not wait for a reader
+	pytest.param("cbreak", b"y" * 1000 + b"\nnext\n", id="cbreak-1000 bytes")])
 def test_countdown_at_a_terminal_takes_a_line_typed_ahead_that_it_reads_after_its_end(terminal, mode, typed):
 	# a countdown of 0 asks once, at its end: a line typed ahead is the answer, also when it takes more than one read ( out of the
 	# line mode a read is a byte; a Ctrl-D splits a line ), and the line after it stays for the program, as in 1.65 ( a 1.66 build
-	# stopped at the first read: None, then "es" as the program's next line )
+	# stopped at the first read: None, and the rest of the line as the program's next one )
 	master = terminal()
 	out_of_line_mode_or_not(mode)
 	os.write(master, typed)
-	assert input_with_timeout_and_countdown(0, "Answer") == "yes"
+	assert input_with_timeout_and_countdown(0, "Answer") == typed.replace(b"\x04", b"").split(b"\n")[0].decode()
 	# asked first, so that a countdown that took the next line too fails here and does not wait for one
 	assert select.select([sys.stdin], [], [], 0)[0]
 	assert sys.stdin.readline() == "next\n"
