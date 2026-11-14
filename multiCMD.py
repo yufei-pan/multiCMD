@@ -3318,8 +3318,11 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 				data = os.read(fd, 4096 if canon else 1)
 				typed += data
 				if data and b'\n' not in data:
-					# read on at once: the rest of the line is there, or comes. Once the countdown has ended, it is no answer
-					if remaining <= 0:
+					# read on at once: the rest of the line is there, or comes. Once the countdown has ended, only as far as the longest line
+					# a terminal's line mode hands over ( 4096 bytes on Linux: 4095 and the newline; 1024 on macOS; both measured ): a line
+					# typed before the end is still read to its end, which takes many reads out of the line mode ( a read is a byte ) and
+					# with a Ctrl-D in the line, and text that keeps coming cannot hold the call
+					if remaining <= 0 and len(typed) > 4096:
 						return None
 					continue
 				if typed:

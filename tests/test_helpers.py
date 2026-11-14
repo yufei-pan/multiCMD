@@ -739,27 +739,72 @@ def test_countdown_at_a_terminal_out_of_its_line_mode_leaves_the_next_line(tmp_p
 	assert out.decode().split() == ["GOT", "'a'", "'b\\n'"], (out, err)
 
 
+def out_of_line_mode_or_not(mode):
+	# the terminal fixture's sys.stdin, with no echo ( nobody reads it here ), and in cbreak when asked
+	import termios
+	import tty
+	if mode == "cbreak":
+		tty.setcbreak(sys.stdin.fileno(), termios.TCSANOW)
+	else:
+		attrs = termios.tcgetattr(sys.stdin.fileno())
+		attrs[3] &= ~termios.ECHO
+		termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+
+
 @posix_only
 @pytest.mark.parametrize("mode", ["line mode", "cbreak"])
 def test_countdown_at_a_terminal_returns_at_its_end_while_text_keeps_coming(terminal, fake_clock, monkeypatch, mode):
-	# text with no Enter that keeps coming ( Ctrl-D after each piece in line mode; keys out of it ) is read only to the end of
-	# the countdown, which returns then, not when the text stops ( a 1.66 build read on: None at 5.97 s for a timeout of 1 )
+	# text with no Enter that keeps coming ( Ctrl-D after each piece in line mode; keys out of it ): a new piece is there at every
+	# look. Past its end the countdown reads on only as far as a terminal's longest line ( 4096 bytes ), not until the text stops
+	# ( a 1.66 build read on: None at 5.97 s for a timeout of 1 )
 	master = terminal()
-	if mode == "cbreak":
-		import tty
-		tty.setcbreak(sys.stdin.fileno())
-		os.write(master, b"x" * 40)
-	else:
-		os.write(master, b"x\x04" * 40)
+	out_of_line_mode_or_not(mode)
+	pieces = []
 	real_select = select.select
 	def a_piece_each_quarter_second(clock):
 		clock.now += 0.25
+		if len(pieces) < 2 * 4096:
+			pieces.append(os.write(master, b"x" if mode == "cbreak" else b"x\x04"))
 		return bool(real_select([sys.stdin], [], [], 0)[0])
 	monkeypatch.setattr(select, "select", fake_select(fake_clock, a_piece_each_quarter_second))
 	with monkeypatch.context() as guarded:
 		no_line_reads(guarded, sys.stdin)
 		assert input_with_timeout_and_countdown(1, "Answer") is None
-	assert fake_clock.now == 1001.25
+	assert len(pieces) < 2 * 4096
+
+
+@posix_only
+@pytest.mark.parametrize("mode, typed", [("cbreak", b"yes\nnext\n"), ("line mode", b"ye\x04s\nnext\n")])
+def test_countdown_at_a_terminal_takes_a_line_typed_ahead_that_it_reads_after_its_end(terminal, mode, typed):
+	# a countdown of 0 asks once, at its end: a line typed ahead is the answer, also when it takes more than one read ( out of the
+	# line mode a read is a byte; a Ctrl-D splits a line ), and the line after it stays for the program, as in 1.65 ( a 1.66 build
+	# stopped at the first read: None, then "es" as the program's next line )
+	master = terminal()
+	out_of_line_mode_or_not(mode)
+	os.write(master, typed)
+	assert input_with_timeout_and_countdown(0, "Answer") == "yes"
+	# asked first, so that a countdown that took the next line too fails here and does not wait for one
+	assert select.select([sys.stdin], [], [], 0)[0]
+	assert sys.stdin.readline() == "next\n"
+
+
+@posix_only
+@pytest.mark.parametrize("mode, typed", [("cbreak", b"yes\n"), ("line mode", b"y\x04e\x04s\n")])
+def test_countdown_at_a_terminal_stopped_across_its_end_takes_the_line_typed_meanwhile(terminal, fake_clock, monkeypatch, mode, typed):
+	# the process is stopped in the countdown's first wait ( SIGSTOP, a debugger, a starved host ) and goes on 3 s after its end:
+	# the line typed meanwhile is the answer, as in 1.65
+	master = terminal()
+	out_of_line_mode_or_not(mode)
+	os.write(master, typed)
+	real_select = select.select
+	def stopped_in_the_first_wait(clock):
+		if len(clock.waited) == 1:
+			clock.now += 5
+		return bool(real_select([sys.stdin], [], [], 0)[0])
+	monkeypatch.setattr(select, "select", fake_select(fake_clock, stopped_in_the_first_wait))
+	with monkeypatch.context() as guarded:
+		no_line_reads(guarded, sys.stdin)
+		assert input_with_timeout_and_countdown(2, "Answer") == "yes"
 
 
 def test_countdown_raises_for_a_stdin_the_program_opened_for_writing(tmp_path, monkeypatch):

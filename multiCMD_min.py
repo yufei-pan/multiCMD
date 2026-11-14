@@ -1006,7 +1006,7 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 				if not tty:return input().strip()
 				data=os.read(fd,4096 if canon else 1);typed+=data
 				if data and b'\n'not in data:
-					if remaining<=0:return
+					if remaining<=0 and len(typed)>4096:return
 					continue
 				if typed:line=bytes(typed).split(b'\n',1)[0];return line.decode(getattr(sys.stdin,'encoding',None)or'utf-8',getattr(sys.stdin,'errors',None)or'strict').strip()
 				ended=True
