@@ -351,12 +351,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
-
-### `format_bytes()` with `to_str` raises for a size of 1000 Y or more
-- Kind: deferred
-- What the operator sees: `format_bytes('1000 Y', to_str=True)` raises `KeyError: 9`, and so does any larger size:
-  from about 1000 Y counted in 1000s, or 1024 Yi in 1024s (a number's default). The same in 1.65. hpcp 9.92 caps its
-  sizes below that itself.
-- Why: the loop that picks the unit steps past Y, the last one in its table. Found by 1.66's second opinion, outside
-  1.66's change.
-- Revisit when: multiCMD 1.67: stop at the last unit.
