@@ -533,6 +533,15 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.67 from 1.66
+
+- Nothing needs doing. `mcmd` is unchanged.
+- Fix, library: `format_bytes()` counts a size string in whole bytes: `'4.1G'` is 4100000000 (1.66: 4099999999, from a
+  float). hpcp's size options (`-L`, `-F`, `-dis`, `-ddr`) take these values with 1.67.
+- Fix, library: `format_bytes()` shows a size of 1000 Y or more in Y, as `'1000.00 Y'` or `'1024.00 Yi'` (1.66: `KeyError`),
+  and `float('inf')` as `'inf Yi'` (1.66: it never returned).
+- Packaging: built with setuptools 77 or later, the metadata names the license as `License-Expression: GPL-3.0-or-later`.
+
 ## Upgrading to 1.66 from 1.65
 
 - Nothing needs doing for `mcmd`, which is unchanged, nor for hpcp 9.92, which checks its sizes itself. hpcp up to 9.91

@@ -110,6 +110,52 @@ def test_format_bytes_reads_every_unit_it_knows(capsys, size, kwargs, expected):
 	assert capsys.readouterr() == ("", "")
 
 
+# 1.67: a size is counted in whole numbers, and a part of a byte cut off ( 1.66 multiplied a float: '4.1G' was 4099999999 )
+@pytest.mark.parametrize("size, expected", [
+	("4.1G", 4100000000), ("2.01 K", 2010), ("32.3K", 32300), ("4.1 TB", 4100000000000), ("4.1P", 4100000000000000),
+	("0.1 GiB", 107374182), ("1.5 KiB", 1536), ("12345678901234567891", 12345678901234567891), ("999 Y", 999 * 10 ** 24)], ids=str)
+def test_format_bytes_counts_a_size_in_whole_bytes(size, expected):
+	got = format_bytes(size, to_int=True)
+	assert got == expected and isinstance(got, int)
+
+
+def test_format_bytes_counts_every_size_of_two_decimals_exactly():
+	# ( 1.66 gave one byte less for 601 of these 50,000 )
+	wrong = []
+	for unit, power in (("K", 1000), ("G", 1000 ** 3), ("T", 1000 ** 4), ("Ki", 1024), ("Gi", 1024 ** 3)):
+		for hundredths in range(10000):
+			size = "%d.%02d%s" % (hundredths // 100, hundredths % 100, unit)
+			if format_bytes(size, to_int=True) != hundredths * power // 100:
+				wrong.append(size)
+	assert not wrong, (len(wrong), wrong[:10])
+
+
+# 1.67: Y is the last unit, and a larger size stays in it ( 1.66 raised KeyError: 9 from 1000 Y, or 1024 Yi, up )
+@pytest.mark.parametrize("size, kwargs, expected", [
+	(999 * 10 ** 24, {"use_1024_bytes": False}, "999.00 Y"), (10 ** 27, {"use_1024_bytes": False}, "1000.00 Y"),
+	(1023 * 2 ** 80, {}, "1023.00 Yi"), (2 ** 90, {}, "1024.00 Yi"), (2 ** 90, {"use_1024_bytes": True, "to_str": True}, "1024.00 Yi"),
+	("1000 Y", {"to_str": True}, "1000.00 Y"), ("1024 Yi", {"to_str": True}, "1024.00 Yi")], ids=str)
+def test_format_bytes_at_the_end_of_the_last_unit(size, kwargs, expected):
+	assert format_bytes(size, **kwargs) == expected
+
+
+@pytest.mark.parametrize("size, kwargs, unit, number", [
+	(10 ** 40, {"use_1024_bytes": False}, "Y", 1e16), (1e30, {"use_1024_bytes": False}, "Y", 1e6), (2 ** 200, {}, "Yi", 2.0 ** 120),
+	("5000000 YB", {"to_str": True}, "Y", 5e6), ("1048576 YiB", {"to_str": True}, "Yi", 2.0 ** 20)], ids=str)
+def test_format_bytes_shows_a_size_far_past_the_last_unit_in_it(size, kwargs, unit, number):
+	# ( eight divisions in floats: 10 ** 40 shows as 9999999999999998.00 Y )
+	got_number, got_unit = format_bytes(size, **kwargs).split(" ")
+	assert got_unit == unit and float(got_number) == pytest.approx(number)
+
+
+def test_format_bytes_shows_an_endless_size_in_the_last_unit():
+	# ( 1.66's unit loop never ended: inf divided by 1024 is inf; in a child, so a loop that does not end fails, not hangs )
+	shown = subprocess.run([sys.executable, "-c", "import multiCMD; print(multiCMD.format_bytes(float('inf')))"],
+		cwd=str(Path(multiCMD.__file__).resolve().parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		universal_newlines=True, timeout=60)
+	assert (shown.returncode, shown.stdout, shown.stderr) == (0, "inf Yi\n", "")
+
+
 def test_int_to_color_deterministic_and_in_range():
 	assert int_to_color(0x123456) == (36, 103, 171)
 	assert int_to_color(0) == (160, 160, 160)

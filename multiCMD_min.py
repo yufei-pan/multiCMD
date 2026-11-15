@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.66'
+version='1.67'
 __version__=version
 COMMIT_DATE='2026-11-14'
 __running_threads=set()
@@ -1160,7 +1160,7 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 		elif isinstance(size,str):
 			match=re.fullmatch('(\\d+(\\.\\d*)?)\\s*((?:[kmgtpezyKMGTPEZY][iI]?)?[bB]?)',size.strip());unit_labels={'':0,'k':1,'m':2,'g':3,'t':4,'p':5,'e':6,'z':7,'y':8}
 			if match:
-				number,_,unit=match.groups();number=float(number);unit=unit.lower().rstrip('b')
+				number,_,unit=match.groups();unit=unit.lower().rstrip('b')
 				if unit.endswith('i'):use_1024_bytes=True
 				elif use_1024_bytes is None:use_1024_bytes=False
 				unit=unit.rstrip('i')
@@ -1169,8 +1169,9 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 				_write_error(f"Invalid size format. Expected format: 'number [unit]', e.g., '1.5 GiB' or '1.5GiB'\nGot: {size}");return 0
 			if use_1024_bytes:power=2**10
 			else:power=10**3
-			if to_str:return format_bytes(size=int(number*power**unit_labels[unit]),use_1024_bytes=use_1024_bytes,to_str=True,str_format=str_format)
-			return int(number*power**unit_labels[unit])
+			whole,_,fraction=number.partition('.');size_in_bytes=int(whole+fraction)*power**unit_labels[unit]//10**len(fraction)
+			if to_str:return format_bytes(size=size_in_bytes,use_1024_bytes=use_1024_bytes,to_str=True,str_format=str_format)
+			return size_in_bytes
 		else:
 			try:return int(size)
 			except Exception:return 0
@@ -1180,11 +1181,11 @@ def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='
 			except Exception:return size
 		if use_1024_bytes or use_1024_bytes is None:
 			power=2**10;n=0;power_labels={0:'',1:'Ki',2:'Mi',3:'Gi',4:'Ti',5:'Pi',6:'Ei',7:'Zi',8:'Yi'}
-			while size>=power:size/=power;n+=1
+			while size>=power and n<len(power_labels)-1:size/=power;n+=1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace('  ',' ')
 		else:
 			power=10**3;n=0;power_labels={0:'',1:'K',2:'M',3:'G',4:'T',5:'P',6:'E',7:'Z',8:'Y'}
-			while size>=power:size/=power;n+=1
+			while size>=power and n<len(power_labels)-1:size/=power;n+=1
 			return f"{size:{str_format}} {' '}{power_labels[n]}".replace('  ',' ')
 	else:
 		try:return format_bytes(float(size),use_1024_bytes)
