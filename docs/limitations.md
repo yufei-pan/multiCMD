@@ -360,5 +360,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Why: `get_terminal_size()` returns `os.get_terminal_size()`'s answer as it is, and a size of 0 is taken for a width,
   so `_genrate_progress_bar` falls back to its multi-line form. Found in hpcp 9.95's build (2026-11-16); not new.
 - Revisit when: multiCMD 1.68. The plan: a width or height of 0 counts as unknown, as `shutil.get_terminal_size`
-  already treats it (try that first, with the same 240x50 fallback), and a test at a 0-column pty.
+  already treats it (try that first, with the same 240x50 fallback), and a test at a 0-column pty. Also a frame wider
+  than the terminal: `_genrate_progress_bar` pads a frame to the width but never cuts it, so a long prefix (hpcp's
+  removal and listing lines, 88 to 123 characters with `-F`) wraps at 80 columns and each frame scrolls a row; cut a
+  frame to one less than the width (hpcp 9.95's review, 2026-11-16).
 - Noted: 2026-11-16, the main session's call (a deferral, not asked).

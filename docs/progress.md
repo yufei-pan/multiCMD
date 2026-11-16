@@ -11,7 +11,7 @@ State at 2026-11-16: v1.67 is the latest release (the merge of feat/167); 1.68 h
 ## Open work
 
 ### multiCMD 1.68 (no written plan: the "deferred (1.68)" entry in docs/limitations.md)
-- **A terminal of no size counts as unknown in `get_terminal_size()`,** so a progress bar of a known total stays on one line at a 0-column pty. State: not started. Where: docs/limitations.md "At a terminal of no size, a progress bar of a known total draws over several lines". Then hpcp, statblk and statbtrfs take the new embed in their next versions. From: hpcp 9.95's build (2026-11-16), the main session's call (a deferral).
+- **A terminal of no size counts as unknown in `get_terminal_size()`,** so a progress bar of a known total stays on one line at a 0-column pty; and a frame wider than the terminal is cut to it. State: not started. Where: docs/limitations.md "At a terminal of no size, a progress bar of a known total draws over several lines". Then hpcp, statblk and statbtrfs take the new embed in their next versions. From: hpcp 9.95's build (2026-11-16), the main session's call (a deferral).
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
