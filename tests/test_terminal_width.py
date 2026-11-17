@@ -90,23 +90,38 @@ def test_the_lines_are_as_hpcp_writes_them():
 
 
 @pytest.mark.parametrize('reported, environ, expected', [
-	((0, 0), {}, (240, 50)),
+	# a terminal that does not say: 80x24, what other programs take it for, so a line that fits never wraps on its screen
+	((0, 0), {}, (80, 24)),
 	((0, 0), {'COLUMNS': '100', 'LINES': '40'}, (100, 40)),
-	((0, 40), {}, (240, 40)),
+	((0, 40), {}, (80, 40)),
+	((200, 0), {}, (200, 24)),
 	((200, 0), {'LINES': '30'}, (200, 30)),
-	((0, 0), {'COLUMNS': '0', 'LINES': '-3'}, (240, 50)),
-	((0, 0), {'COLUMNS': 'wide', 'LINES': ''}, (240, 50)),
+	((0, 0), {'COLUMNS': '0', 'LINES': '-3'}, (80, 24)),
+	((0, 0), {'COLUMNS': 'wide', 'LINES': ''}, (80, 24)),
 	# a size the terminal knows wins, as before
 	((200, 40), {'COLUMNS': '100', 'LINES': '10'}, (200, 40)),
 ])
 def test_get_terminal_size_takes_a_reported_zero_as_unknown(monkeypatch, reported, environ, expected):
-	# a pty nobody set a size on (script without a terminal, some CI runners) reports 0x0; 1.67 returned it
+	# a pty nobody set a size on (script without a terminal, a serial console, some CI runners) reports 0x0; 1.67 returned it
 	monkeypatch.setattr(os, 'get_terminal_size', lambda *args: os.terminal_size(reported))
 	monkeypatch.delenv('COLUMNS', raising=False)
 	monkeypatch.delenv('LINES', raising=False)
 	for name, value in environ.items():
 		monkeypatch.setenv(name, value)
-	assert tuple(get_terminal_size()) == expected
+	size = get_terminal_size()
+	assert isinstance(size, os.terminal_size) and tuple(size) == expected
+
+
+@pytest.mark.parametrize('environ, expected', [
+	({}, ['240', '50']),
+	({'COLUMNS': '100', 'LINES': '30'}, ['100', '30']),
+])
+def test_get_terminal_size_without_a_terminal_is_240x50_or_what_the_environment_says(environ, expected):
+	# no terminal at all is a pipe or a log: nothing wraps, so the wide fallback stays ( a terminal that answered 0 is 80x24 )
+	code = 'import sys, multiCMD; sys.stderr.write(" ".join(map(str, multiCMD.get_terminal_size()[:2])))'
+	result = subprocess.run([sys.executable, '-c', code], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		cwd=ROOT, env=dict(env_without_a_size(), **environ), universal_newlines=True, timeout=60)
+	assert result.stderr.split() == expected
 
 
 @posix_only
@@ -122,7 +137,7 @@ def test_get_terminal_size_of_a_pty_without_a_size(stdout_is_the_pty):
 	finally:
 		os.close(slave)
 		os.close(master)
-	assert result.stderr.split() == ['240', '50']
+	assert result.stderr.split() == ['80', '24']
 
 
 @posix_only
@@ -130,8 +145,18 @@ def test_a_bar_of_a_known_total_stays_on_one_line_at_a_terminal_of_no_size():
 	# 1.67 took the 0 columns for a width, and each frame came out over six lines
 	shown = at_a_pty('import multiCMD\nfor i in range(11): multiCMD.print_progress_bar(i, 10, "p", "s")', 0, 0)
 	assert shown.count('\n') == 1 and shown.endswith('\n'), shown
-	assert len(frames(shown)) == 11 and all(cells(frame) <= 239 for frame in frames(shown)), shown
+	assert len(frames(shown)) == 11 and all(cells(frame) <= 79 for frame in frames(shown)), shown
 	assert frames(shown)[5].startswith('p |') and frames(shown)[5].endswith('|50.0% | s'), shown
+
+
+@posix_only
+def test_a_short_line_stays_on_one_row_at_a_terminal_of_no_size():
+	# a serial console or `qm terminal` gives 0x0 until someone runs resize, with a real 80-column screen behind it: the first 1.68
+	# build padded every frame to 239 columns, three rows that scrolled twice a second ( 1.67 wrote 75 and did not pad )
+	shown = at_a_pty('import multiCMD\nfor i in range(3): multiCMD.print_progress_bar(i, 0, "/scratch/old-runs/job-1234", "Removed: 1.23 K")', 0, 0)
+	assert '\n' not in shown and len(frames(shown)) == 3, shown
+	assert [len(frame) for frame in frames(shown)] == [79] * 3 and frames(shown)[2].rstrip() == (
+		'/scratch/old-runs/job-1234 | iteration:2 | Removed: 1.23 K'), shown
 
 
 @posix_only

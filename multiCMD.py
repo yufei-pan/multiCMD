@@ -3536,11 +3536,11 @@ def slugify(value, allow_unicode=False):
 
 def get_terminal_size():
 	'''
-	Get the terminal size: stdout's terminal, else stdin's (cmd | less), else COLUMNS / LINES, else 240x50.
+	Get the terminal size: stdout's terminal, else stdin's (cmd | less), else COLUMNS / LINES, else 240x50 (no terminal).
 
 	A terminal that reports 0 columns or rows does not know its size (a pty nobody set one on: script
-	without a terminal, some CI runners). As shutil.get_terminal_size does, what it does not know comes
-	from COLUMNS / LINES or the fallback.
+	without a terminal of its own, a serial console, some CI runners). What it does not know comes from
+	COLUMNS / LINES, else 80x24, what other programs take such a terminal for.
 
 	@params:
 		None
@@ -3548,7 +3548,9 @@ def get_terminal_size():
 	@returns:
 		(int,int): the number of columns and rows of the terminal
 	'''
-	# ( shutil.get_terminal_size is not enough: before Python 3.11 it returns a terminal's zeros, and it does not read stdin's size )
+	# ( shutil.get_terminal_size is not enough: before Python 3.11 it returns a terminal's zeros, it does not read stdin's size,
+	# and COLUMNS overrides a real size )
+	answered = True  # a terminal answered, maybe with zeros: a real screen is behind it
 	try:
 		columns, rows = os.get_terminal_size()
 	except Exception:
@@ -3560,16 +3562,19 @@ def get_terminal_size():
 			rows, columns = struct.unpack('HHHH', packed)[:2]
 		except Exception:
 			columns = rows = 0
+			answered = False
 	def from_environment(name, fallback):
 		try:
 			value = int(os.environ.get(name, ''))
 		except ValueError:
 			return fallback
 		return value if value > 0 else fallback
+	# 80x24 is what terminfo, curses, ls and shutil take a terminal for when it does not say, so a line that fits never wraps on
+	# its screen; no terminal at all is a log or a pipe, where a wide line costs nothing
 	if columns <= 0:
-		columns = from_environment('COLUMNS', 240)
+		columns = from_environment('COLUMNS', 80 if answered else 240)
 	if rows <= 0:
-		rows = from_environment('LINES', 50)
+		rows = from_environment('LINES', 24 if answered else 50)
 	return os.terminal_size((columns, rows))
 
 # the bar's blocks, and what a stdout whose encoding has no such characters gets for them ( see _writable )
