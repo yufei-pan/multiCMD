@@ -15,6 +15,8 @@ State at 2026-11-16: v1.67 is the latest release (the merge of feat/167); 1.68 h
 
 ### multiCMD 1.69 (no written plan yet)
 - **The stop-probe test reaps its own stray children,** so `test_stops_in_serial_commands_never_jam_thread_starts` passes under a process limit (it fails on 1.67 and 1.68 alike at 1,024: the zombies of the approved limitation "A Ctrl-C inside Popen during a serial start ..." reach it; suites run at 4,096 meanwhile). State: not started. From: the 1.68 build and review (2026-11-16), a deferral (test only).
+- **A bar past its total ends its line,** so output after `print_progress_bar(11, 10)` starts a line of its own (1.67 and 1.68 join it to the bar). State: not started. From: 1.68's second opinions (2026-11-16), a deferral.
+- **A tab or newline in a progress frame's text no longer breaks the frame** (replace control characters in the prefix and suffix; a file name with one draws over several lines in 1.67 and 1.68). State: not started. From: 1.68's build and second opinions (2026-11-16), a deferral.
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
