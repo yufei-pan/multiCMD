@@ -234,14 +234,14 @@ def test_get_terminal_size_reads_columns_from_stdin_when_stdout_is_piped():
 	try:
 		fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 200, 0, 0))
 		out = subprocess.run(
-			[sys.executable, "-c", "import multiCMD; print(*multiCMD.get_terminal_size()[:2])"],
+			[sys.executable, "-c", "import os, multiCMD; size = multiCMD.get_terminal_size(); print(*size[:2], isinstance(size, os.terminal_size))"],
 			stdin=slave, stdout=subprocess.PIPE, cwd=str(Path(__file__).resolve().parents[1]),
 			universal_newlines=True, check=True,
 		).stdout
 	finally:
 		os.close(slave)
 		os.close(master)
-	assert out.split() == ["200", "40"]
+	assert out.split() == ["200", "40", "True"]
 
 
 @pytest.fixture

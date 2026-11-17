@@ -125,19 +125,47 @@ def test_get_terminal_size_without_a_terminal_is_240x50_or_what_the_environment_
 
 
 @posix_only
-@pytest.mark.parametrize('stdout_is_the_pty', [True, False], ids=['stdout', 'stdin'])
-def test_get_terminal_size_of_a_pty_without_a_size(stdout_is_the_pty):
-	# stdout the pty: os.get_terminal_size(); stdout a pipe (cmd | less): the TIOCGWINSZ of stdin
+@pytest.mark.parametrize('stdout_is_the_pty, size, expected', [
+	(True, (0, 0), ['80', '24']),
+	# stdout a pipe ( cmd | less ): stdin's terminal answers, with zeros too, so it is a terminal of no size and not no terminal ( 240x50 )
+	(False, (0, 0), ['80', '24']),
+	(False, (30, 100), ['100', '30']),
+], ids=['stdout', 'stdin', 'stdin-sized'])
+def test_get_terminal_size_of_a_pty(stdout_is_the_pty, size, expected):
+	import fcntl
 	import pty
+	import struct
+	import termios
 	master, slave = pty.openpty()
 	code = 'import sys, multiCMD; sys.stderr.write(" ".join(map(str, multiCMD.get_terminal_size()[:2])))'
 	try:
+		fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', size[0], size[1], 0, 0))
 		result = subprocess.run([sys.executable, '-c', code], stdin=slave, stdout=slave if stdout_is_the_pty else subprocess.PIPE,
 			stderr=subprocess.PIPE, cwd=ROOT, env=env_without_a_size(), universal_newlines=True, timeout=60)
 	finally:
 		os.close(slave)
 		os.close(master)
-	assert result.stderr.split() == ['80', '24']
+	assert result.stderr.split() == expected
+
+
+@posix_only
+def test_a_pty_command_gets_a_window_of_80x24_less_the_prefix_at_a_terminal_of_no_size():
+	# 1.67 gave the command a window of 20 columns by 0 rows ( the terminal's zeros ), a pager or a table in it no room
+	code = ('import fcntl, struct, termios, multiCMD\n'
+		'master, slave = multiCMD._open_pty(4)\n'
+		'rows, columns = struct.unpack("HHHH", fcntl.ioctl(slave, termios.TIOCGWINSZ, b"\\0" * 8))[:2]\n'
+		'print(rows, columns)')
+	assert at_a_pty(code, 0, 0).split() == ['24', '76']
+
+
+@posix_only
+def test_a_table_gets_80_columns_at_a_terminal_of_no_size():
+	# 1.67 cut every column to its heading's width ( 'a   |xxxxx' became 'a   |x' ): the zero was the width
+	code = ('import sys, multiCMD\n'
+		'sys.stdout.write(multiCMD.pretty_format_table([["name", "value"], ["a", "x" * 100], ["b", "y" * 30]]))')
+	lines = at_a_pty(code, 0, 0).split('\n')
+	assert [len(line) for line in lines[:4]] == [80] * 4 and lines[2].startswith('a   |xxx') and lines[2].endswith('xxx..'), lines
+	assert lines[3] == 'b   |' + 'y' * 30 + ' ' * 45, lines
 
 
 @posix_only
@@ -161,8 +189,8 @@ def test_a_short_line_stays_on_one_row_at_a_terminal_of_no_size():
 
 @posix_only
 def test_a_long_prefix_does_not_wrap_at_80_columns():
-	# hpcp's removal and listing lines are 88 to 123 columns ( a path of 50 columns, the rest 70 to 97 ): 1.67 wrapped them, and
-	# each frame scrolled a row
+	# hpcp's removal and listing lines are 97 to 151 columns with a path of 50 columns ( this test's: 122 and 149 ): 1.67 wrapped
+	# them, and each frame scrolled a row
 	code = ('import multiCMD\n'
 		'for i in range(3):\n'
 		'	multiCMD.print_progress_bar(i, 0, %r, %r)\n'
@@ -182,7 +210,7 @@ def test_a_long_prefix_does_not_wrap_at_80_columns():
 
 
 def test_a_pipe_gets_the_same_bar_of_a_known_total():
-	# no terminal: COLUMNS, else 240 columns, as in 1.67
+	# no terminal, and no COLUMNS ( the environment has none ): 240 columns, as in 1.67
 	code = ('import multiCMD\n'
 		'multiCMD.print_progress_bar(5, 10, "p", "s")\n'
 		'multiCMD.print_progress_bar(10, 10, "p", "s")\n'
@@ -234,7 +262,7 @@ def test_a_frame_never_ends_on_a_number_without_its_unit():
 		assert not re.search(r'[\d:]$', kept) or kept == whole.rstrip(), (columns, shown)
 
 
-def test_a_frame_counts_wide_characters_as_two_columns():
+def test_a_frame_counts_a_wide_character_as_two_columns_and_a_combining_mark_as_none():
 	frame = _genrate_progress_bar(7, 0, WIDE_PATH[-50:] + ' |', '| ' + REMOVAL, 109)
 	# ( padded with a blank where a wide character did not fit in the last column )
 	assert cells(frame) == 108 and frame.startswith('一千二百步/') and frame.endswith(REMOVAL + ' '), frame
@@ -255,6 +283,16 @@ def test_a_bar_of_a_known_total_at_a_terminal_too_narrow_for_it():
 	# 1.67 wrote the frame over six lines at 3 columns or fewer
 	assert [_genrate_progress_bar(5, 10, 'p |', '| s', columns) for columns in (1, 2, 3)] == ['', '', '']
 	assert _genrate_progress_bar(5, 10, 'p |', '| s', 5) == '\N{FULL BLOCK}\N{LOWER ONE EIGHTH BLOCK}_'
+
+
+def test_a_bar_of_a_known_total_drops_its_percent_before_it_shrinks():
+	# 15 columns: no room for the percent, so the bar takes its place and the prefix and suffix stay
+	assert _genrate_progress_bar(5, 10, 'p |', '| s', 15) == 'p |' + '\N{FULL BLOCK}' * 3 + '\N{LOWER ONE EIGHTH BLOCK}' + '_' * 3 + '| s'
+
+
+def test_a_bar_of_a_known_total_drops_a_long_prefix_and_its_percent():
+	# 20 columns: the prefix, which the bar of a known total drops whole ( the no-total frame cuts it from its start ), and the percent
+	assert _genrate_progress_bar(5, 10, 'x' * 30 + ' |', '| s', 20) == '\N{FULL BLOCK}' * 7 + '\N{LOWER ONE EIGHTH BLOCK}' + '_' * 7 + '| s'
 
 
 def test_a_bar_past_its_total_is_full_not_longer():
