@@ -43,7 +43,8 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   On every Python, a program that catches such a stop and goes on also keeps, until it exits, a zombie for each
   stop that lands as the fork returns (3.6 to 3.10: the exec wrapper, exit 125), and one or two descriptors for
   each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`, each aimed at a random moment of the
-  call: 150 zombies and 37 descriptors on 3.6, 812 and 242 on 3.14 (measured on 1.61's module during the 1.62 work;
+  call: 150 zombies and 37 descriptors on 3.6, and on 3.14 242 descriptors and 128 to 1,895 zombies (measured on 1.61's
+  module during the 1.62 work, and the zombies again with 1.68's tests, 2026-11-16, where they vary with the load;
   1.59's code for a start is the same on 3.11+, and on 3.6 it left 143 and 23). Pools are not affected (no
   leftovers in 2,000 stops): their starts run off the main thread. At the measured rates, reaching the usual limit
   of 1,024 descriptors takes about 21,000 such stops on 3.14 and 140,000 on 3.6.
@@ -351,3 +352,25 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### A bar past its total never ends its line
+- Kind: deferred (1.69)
+- What the operator sees: when the iteration passes the total (a total that was an estimate), `print_progress_bar` draws a
+  full bar (`110.0%`) but writes no newline, because it ends the line only for an iteration equal to the total. The
+  program's next output lands on the bar's line (`...|110.0% | snext`). A bar that reaches its total exactly is not
+  affected.
+- Why: the line ends in `print_progress_bar` at `iteration == total`, and nothing else ends it. The same in 1.67; found by
+  1.68's second opinion (2026-11-16).
+- Revisit when: multiCMD 1.69. The plan: end the line on the first frame at or past the total, and a test that the
+  program's next output starts on its own line.
+- Noted: 2026-11-16, the main session's call (a deferral, not asked).
+
+### A tab or newline in a progress frame's prefix or suffix breaks the frame over several lines
+- Kind: deferred (1.69)
+- What the operator sees: a tab or newline in the prefix or suffix of `print_progress_bar` (a file name in hpcp's removal
+  and listing lines can have one): a newline starts a new row, so each redraw scrolls; a tab takes the columns up to the
+  next tab stop, so the frame can reach the last column and wrap. The same in 1.67 (which cut no frame at all).
+- Why: a frame is measured at one column a character and its text goes out as given.
+- Revisit when: multiCMD 1.69. The plan: replace the control characters in the frame's text before it is measured, and a
+  test with a name that has a tab and one that has a newline.
+- Noted: 2026-11-16, the main session's call (a deferral, not asked).

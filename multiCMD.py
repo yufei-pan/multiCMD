@@ -3539,7 +3539,7 @@ def get_terminal_size():
 	Get the terminal size: stdout's terminal, else stdin's (cmd | less), else COLUMNS / LINES, else 240x50 (no terminal).
 
 	A terminal that reports 0 columns or rows does not know its size (a pty nobody set one on: script
-	without a terminal of its own, a serial console, some CI runners). What it does not know comes from
+	without a terminal of its own, some CI runners). What it does not know comes from
 	COLUMNS / LINES, else 80x24, what other programs take such a terminal for.
 
 	@params:

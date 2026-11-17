@@ -537,14 +537,19 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 - Nothing needs doing.
 - Fix: a terminal that reports no size (0 columns: a pty nobody sized, as `script` makes without a terminal of its own,
-  some CI runners) counts as no terminal. `get_terminal_size()` gives `COLUMNS` / `LINES`, else 240x50, so a progress bar
-  stays on one line, `mcmd`'s summary table has room, and a pty-mode command's window is 240x50, less the `[#]` prefix
-  (1.67: each frame of a bar with a total took six lines, the table was cut to its headings' widths, and the window was
-  20 columns by 0 rows).
-- Changed, library: a `print_progress_bar()` frame fits in one column less than the terminal, counted in terminal columns
-  (a wide character takes two), so it never wraps and scrolls a row per frame. Without a total, the prefix gives way
-  first, from its start, then the end of the line, at a blank, so a count is never cut short. That frame is padded to one
-  column less than the width (1.67: the full width, and never cut).
+  some CI runners) does not know its size. `get_terminal_size()` gives `COLUMNS` / `LINES`, else 80x24,
+  what other programs take such a terminal for (no terminal at all: 240x50, as before). A progress bar stays on one line,
+  `mcmd`'s summary table has room, and a pty-mode command's window is 80x24, less the `[#]` prefix when commands run at
+  once (1.67: each frame of a bar with a total took six lines, the table was cut to its headings' widths, and the window
+  was 20 columns by 0 rows).
+- Changed, library: a `print_progress_bar()` frame fits in one column less than the terminal, counted in display columns
+  (a wide character takes two, an East Asian ambiguous character one), so it does not wrap and scroll a row per frame.
+  Without a total, the prefix gives way first, from its start, then the end of the line, a whole field at a time, so a
+  number keeps its label and its unit (`Size: 1.15 GiB` stays or goes whole). That frame is padded to one column less
+  than the width (1.67: the full width, and never cut).
+- Changed, library: the frame at the total is as wide as the frames before it (a full bar is one block wider), so the
+  line keeps no character of the frame before it (`| 00:00:001` for `| 00:00:00`). On a pipe the 100% frame has 224
+  blocks at 240 columns, not 223.
 
 ## Upgrading to 1.67 from 1.66
 

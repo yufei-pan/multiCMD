@@ -179,8 +179,9 @@ def test_a_bar_of_a_known_total_stays_on_one_line_at_a_terminal_of_no_size():
 
 @posix_only
 def test_a_short_line_stays_on_one_row_at_a_terminal_of_no_size():
-	# a serial console or `qm terminal` gives 0x0 until someone runs resize, with a real 80-column screen behind it: the first 1.68
-	# build padded every frame to 239 columns, three rows that scrolled twice a second ( 1.67 wrote 75 and did not pad )
+	# a serial console or `qm terminal` gives 0x0 until someone runs resize ( known from the platform, not tested ), with a real
+	# 80-column screen behind it: the first 1.68 build padded every frame to 239 columns, three rows that scrolled twice a
+	# second ( 1.67 wrote 75 and did not pad )
 	shown = at_a_pty('import multiCMD\nfor i in range(3): multiCMD.print_progress_bar(i, 0, "/scratch/old-runs/job-1234", "Removed: 1.23 K")', 0, 0)
 	assert '\n' not in shown and len(frames(shown)) == 3, shown
 	assert [len(frame) for frame in frames(shown)] == [79] * 3 and frames(shown)[2].rstrip() == (
