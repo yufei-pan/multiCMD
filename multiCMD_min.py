@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.67'
+version='1.68'
 __version__=version
-COMMIT_DATE='2026-11-14'
+COMMIT_DATE='2026-11-16'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -1014,8 +1014,13 @@ def input_with_timeout_and_countdown(timeout,prompt='Please enter your selection
 		except(EOFError,OSError):ended=True
 		if remaining<=0:return
 		if ended:time.sleep(max(deadline-(seconds-1)-time.monotonic(),0))
+def _char_width(ch):
+	if ch<'̀':return 1
+	import unicodedata
+	if unicodedata.combining(ch)or unicodedata.category(ch)in('Mn','Me','Cf')or'ᅠ'<=ch<='ᇿ':return 0
+	return 2 if unicodedata.east_asian_width(ch)in('W','F')else 1
 def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_columns=False):
-	import re,unicodedata;version=1.21;_=version
+	import re;version=1.21;_=version
 	if not data:return''
 	if isinstance(data,str):data=data.strip('\n').split('\n');data=[line.split(delimiter)for line in data]
 	elif isinstance(data,dict):
@@ -1031,11 +1036,7 @@ def pretty_format_table(data,delimiter=None,header=None,full=False,remove_empty_
 	data=[[str(item)for item in row]for row in data]
 	if isinstance(header,str):header=header.split(delimiter)
 	if not header or not any(header):header=data[0];data=data[1:]
-	num_cols=len(header);ansi=re.compile('(\\x1b\\[[0-?]*[ -/]*[@-~])')
-	def char_width(ch):
-		if ch<'̀':return 1
-		if unicodedata.combining(ch)or unicodedata.category(ch)in('Mn','Me','Cf')or'ᅠ'<=ch<='ᇿ':return 0
-		return 2 if unicodedata.east_asian_width(ch)in('W','F')else 1
+	num_cols=len(header);ansi=re.compile('(\\x1b\\[[0-?]*[ -/]*[@-~])');char_width=_char_width
 	def visible_len(s):
 		if'\x1b'in s:s=ansi.sub('',s)
 		if not s or max(s)<'̀':return len(s)
@@ -1105,30 +1106,44 @@ def slugify(value,allow_unicode=False):
 	else:value=unicodedata.normalize('NFKD',value).encode('ascii','ignore').decode('ascii')
 	value=re.sub('[^\\w\\s-]','',value.lower());return re.sub('[-\\s]+','-',value).strip('-_')
 def get_terminal_size():
-	try:import os;_tsize=os.get_terminal_size()
+	answered=True
+	try:columns,rows=os.get_terminal_size()
 	except Exception:
-		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));rows,columns=struct.unpack('HHHH',packed)[:2];_tsize=columns,rows
-		except Exception:import shutil;_tsize=shutil.get_terminal_size(fallback=(240,50))
-	return _tsize
+		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));rows,columns=struct.unpack('HHHH',packed)[:2]
+		except Exception:columns=rows=0;answered=False
+	def from_environment(name,fallback):
+		try:value=int(os.environ.get(name,''))
+		except ValueError:return fallback
+		return value if value>0 else fallback
+	if columns<=0:columns=from_environment('COLUMNS',80 if answered else 240)
+	if rows<=0:rows=from_environment('LINES',24 if answered else 50)
+	return os.terminal_size((columns,rows))
 _BAR_BLOCKS='▁▂▃▄▅▆▇█'
 _ASCII_BAR=str.maketrans(_BAR_BLOCKS,'.:-=+*%#')
+def _cells(text):
+	if not text or max(text)<'̀':return len(text)
+	return sum(map(_char_width,text))
+def _fit(text,width,from_start=False):
+	used=0
+	for i in range(len(text)-1,-1,-1)if from_start else range(len(text)):
+		used+=_char_width(text[i])
+		if used>width:
+			if from_start:return text[i+1:]
+			blank=i
+			while blank>0 and(text[blank]!=' 'or text[blank-1].isdigit()or text[blank-1]==':'):blank-=1
+			return text[:blank]if blank>0 else text[:i]
+	return text
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
-	noPrefix=False;noSuffix=False;noPercent=False;noBar=False
-	if total==0:return f"{prefix} iteration:{iteration} {suffix}".ljust(columns)
-	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";length=columns-len(prefix)-len(suffix)-len(percent)-3
-	if length<=0:length=columns-len(prefix)-len(suffix)-3;noPercent=True
-	if length<=0:length=columns-len(suffix)-3;noPrefix=True
+	noPrefix=False;noSuffix=False;noPercent=False;noBar=False;width=columns-1
+	if total==0:rest=f" iteration:{iteration} {suffix}";line=_fit(_fit(prefix,width-_cells(rest),from_start=True)+rest,width);return line+' '*(width-_cells(line))
+	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";prefix_cells,suffix_cells=_cells(prefix),_cells(suffix);length=columns-prefix_cells-suffix_cells-len(percent)-3
+	if length<=0:length=columns-prefix_cells-suffix_cells-3;noPercent=True
+	if length<=0:length=columns-suffix_cells-3;noPrefix=True
 	if length<=0:length=columns-3;noSuffix=True
-	if length<=0:return f"""{prefix}
-iteration:
- {iteration}
-total:
- {total}
-| {suffix}
-"""
+	if length<=0:return''
 	if iteration==0:noBar=True
 	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
-	if filled_length==length:bar=progress_chars[-1]*length
+	if filled_length>=length:bar=progress_chars[-1]*(length+1)
 	else:bar=progress_chars[-1]*filled_length+bar_char+'_'*(length-filled_length)
 	lineOut=''
 	if not noPrefix:lineOut+=prefix
@@ -1150,7 +1165,7 @@ def _writable(text,stream):
 def print_progress_bar(iteration,total,prefix='',suffix=''):
 	prefix+=' |'if not prefix.endswith(' |')else'';suffix=f"| {suffix}"if not suffix.startswith('| ')else suffix
 	try:
-		columns,_=get_terminal_size();_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
+		columns,_=get_terminal_size();prefix,suffix=_writable(prefix,sys.stdout),_writable(suffix,sys.stdout);_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
 		if iteration==total and total>0:_display._write('\n')
 	except Exception:
 		if iteration%5==0:_display._write(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout)+'\n')

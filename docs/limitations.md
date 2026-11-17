@@ -43,10 +43,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   On every Python, a program that catches such a stop and goes on also keeps, until it exits, a zombie for each
   stop that lands as the fork returns (3.6 to 3.10: the exec wrapper, exit 125), and one or two descriptors for
   each stop that lands in Popen's own setup. In 5,000 stops of a serial `true`, each aimed at a random moment of the
-  call: 150 zombies and 37 descriptors on 3.6, 812 and 242 on 3.14 (measured on 1.61's module during the 1.62 work;
-  1.59's code for a start is the same on 3.11+, and on 3.6 it left 143 and 23). Pools are not affected (no
-  leftovers in 2,000 stops): their starts run off the main thread. At the measured rates, reaching the usual limit
-  of 1,024 descriptors takes about 21,000 such stops on 3.14 and 140,000 on 3.6.
+  call: 150 zombies and 37 descriptors on 3.6, and on 3.14 242 descriptors; the zombies on 3.11 and 3.14 128 to 1,954
+  (measured on 1.61's module during the 1.62 work, and the zombies again with 1.68's tests, 2026-11-16 and 11-17, where
+  they vary with the load; 1.59's code for a start is the same on 3.11+, and on 3.6 it left 143 and 23). Pools are not
+  affected (no leftovers in 2,000 stops): their starts run off the main thread. At the measured rates, reaching the usual
+  limit of 1,024 descriptors takes about 21,000 such stops on 3.14 and 140,000 on 3.6.
 - Why: from 3.11 Popen runs the command itself, with no wrapper to wait in, and the fork's own window cannot be
   closed from Python: blocking the stops in the calling thread does not hold them while another thread exists
   (Python runs the handler on the main thread whichever thread the kernel picks), and holding the handlers
@@ -352,16 +353,34 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
 
-### At a terminal of no size, a progress bar of a known total draws over several lines
-- Kind: deferred (1.68)
-- What the operator sees: at a pty that reports 0 columns (`script -qec ...` run from a script with no terminal of its
-  own, some CI runners), `print_progress_bar` with a known total draws each update over several lines instead of
-  redrawing one; a sized terminal and a pipe show one line. hpcp's copy and `-rwloff` bars show it.
-- Why: `get_terminal_size()` returns `os.get_terminal_size()`'s answer as it is, and a size of 0 is taken for a width,
-  so `_genrate_progress_bar` falls back to its multi-line form. Found in hpcp 9.95's build (2026-11-16); not new.
-- Revisit when: multiCMD 1.68. The plan: a width or height of 0 counts as unknown, as `shutil.get_terminal_size`
-  already treats it (try that first, with the same 240x50 fallback), and a test at a 0-column pty. Also a frame wider
-  than the terminal: `_genrate_progress_bar` pads a frame to the width but never cuts it, so a long prefix (hpcp's
-  removal and listing lines, 88 to 123 characters with `-F`) wraps at 80 columns and each frame scrolls a row; cut a
-  frame to one less than the width (hpcp 9.95's review, 2026-11-16).
+### A bar past its total never ends its line
+- Kind: deferred (1.69)
+- What the operator sees: when the iteration passes the total (a total that was an estimate), `print_progress_bar` draws a
+  full bar (`110.0%`) but writes no newline, because it ends the line only for an iteration equal to the total. The
+  program's next output lands on the bar's line (`...|110.0% | snext`). A bar that stops at its total is not affected.
+- Why: the line ends in `print_progress_bar` at `iteration == total`, and nothing else ends it. The same in 1.67; found by
+  1.68's second opinion (2026-11-16).
+- Revisit when: multiCMD 1.69. The plan: end the line on the first frame at or past the total, and a test that the
+  program's next output starts on its own line.
 - Noted: 2026-11-16, the main session's call (a deferral, not asked).
+
+### A tab or newline in a progress frame's prefix or suffix breaks the frame over several lines
+- Kind: deferred (1.69)
+- What the operator sees: a tab or newline in the prefix or suffix of `print_progress_bar` (a file name in hpcp's removal
+  and listing lines can have one): a newline starts a new row, so each redraw scrolls; a tab takes the columns up to the
+  next tab stop, so the frame can reach the last column and wrap. The same in 1.67 (which cut no frame at all).
+- Why: a frame is measured at one column a character and its text goes out as given.
+- Revisit when: multiCMD 1.69. The plan: replace the control characters in the frame's text before it is measured, and a
+  test with a name that has a tab and one that has a newline.
+- Noted: 2026-11-16, the main session's call (a deferral, not asked).
+
+### A bar with a total drops its percent and prefix before it has a least width
+- Kind: deferred (1.69)
+- What the operator sees: the bar is fitted last, into what the prefix, percent and suffix leave. When that is nothing, it
+  drops the percent, then the prefix, and takes what remains. At 80 columns hpcp's copy bar shows its bar and its rates and
+  time, with no count, size or percent (the count and size are its prefix); with a rate limit set the suffix is longer, and
+  at 120 columns the bar can be a few cells. The same in 1.67.
+- Why: `_genrate_progress_bar` fits the suffix first and the bar last, and sets no least width for the bar.
+- Revisit when: multiCMD 1.69. The plan: the bar shrinks to a least width before the prefix and the percent are cut, and a
+  test with hpcp's copy-bar strings at 80 and 100 columns.
+- Noted: 2026-11-17, the main session's triage of the 1.68 re-review, from its second opinion (a deferral, not asked).

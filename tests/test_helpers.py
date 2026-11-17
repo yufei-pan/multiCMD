@@ -194,7 +194,7 @@ def test_progress_bar_on_a_stdout_that_cannot_write_its_blocks(monkeypatch):
 	out.flush()
 	assert out.buffer.getvalue().decode('ascii') == (
 		"\rProgress: |" + "#" * 24 + "=" + "_" * 25 + "|50.0% | Complete"
-		"\rProgress: |" + "#" * 48 + "|100.0% | Complete\n"
+		"\rProgress: |" + "#" * 49 + "|100.0% | Complete\n"
 	)
 
 
@@ -203,7 +203,22 @@ def test_progress_bar_with_a_name_its_stdout_cannot_write(monkeypatch):
 	out = ascii_stdout(monkeypatch, 'utf-8', 'strict')
 	print_progress_bar(3, 0, prefix='dir/caf\udce9', suffix='s')
 	out.flush()
-	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(80)
+	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(79)
+
+
+def test_progress_bar_is_measured_as_its_stdout_writes_it(monkeypatch):
+	# an ASCII stdout ( Python 3.6 in a C locale ) writes a combining mark, which takes no column, as a '?' that takes one, and a wide
+	# character, which takes two, as one: a frame measured before that wrapped ( 80 columns and more ) or came out short, leaving the
+	# end of the frame before it showing
+	out = ascii_stdout(monkeypatch, 'ascii', 'strict')
+	print_progress_bar(7, 0, prefix='e\u0301' * 60, suffix='s')
+	print_progress_bar(7, 0, prefix='\u4e2d' * 30, suffix='s')
+	print_progress_bar(5, 10, prefix='e\u0301' * 12, suffix='\u4e2d' * 3)
+	print_progress_bar(5, 10, prefix='dir', suffix='s')
+	out.flush()
+	frames = out.buffer.getvalue().decode('ascii').split('\r')[1:]
+	assert [len(frame) for frame in frames] == [79, 79, 78, 78]
+	assert frames[0].endswith('e? | iteration:7 | s') and frames[2].startswith('e?' * 12 + ' |') and frames[2].endswith('|50.0% | ???')
 
 
 def test_progress_bar_in_a_c_locale_python():
@@ -234,14 +249,14 @@ def test_get_terminal_size_reads_columns_from_stdin_when_stdout_is_piped():
 	try:
 		fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 200, 0, 0))
 		out = subprocess.run(
-			[sys.executable, "-c", "import multiCMD; print(*multiCMD.get_terminal_size()[:2])"],
+			[sys.executable, "-c", "import os, multiCMD; size = multiCMD.get_terminal_size(); print(*size[:2], isinstance(size, os.terminal_size))"],
 			stdin=slave, stdout=subprocess.PIPE, cwd=str(Path(__file__).resolve().parents[1]),
 			universal_newlines=True, check=True,
 		).stdout
 	finally:
 		os.close(slave)
 		os.close(master)
-	assert out.split() == ["200", "40"]
+	assert out.split() == ["200", "40", "True"]
 
 
 @pytest.fixture
