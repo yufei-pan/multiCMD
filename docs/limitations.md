@@ -351,17 +351,3 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
-
-### At a terminal of no size, a progress bar of a known total draws over several lines
-- Kind: deferred (1.68)
-- What the operator sees: at a pty that reports 0 columns (`script -qec ...` run from a script with no terminal of its
-  own, some CI runners), `print_progress_bar` with a known total draws each update over several lines instead of
-  redrawing one; a sized terminal and a pipe show one line. hpcp's copy and `-rwloff` bars show it.
-- Why: `get_terminal_size()` returns `os.get_terminal_size()`'s answer as it is, and a size of 0 is taken for a width,
-  so `_genrate_progress_bar` falls back to its multi-line form. Found in hpcp 9.95's build (2026-11-16); not new.
-- Revisit when: multiCMD 1.68. The plan: a width or height of 0 counts as unknown, as `shutil.get_terminal_size`
-  already treats it (try that first, with the same 240x50 fallback), and a test at a 0-column pty. Also a frame wider
-  than the terminal: `_genrate_progress_bar` pads a frame to the width but never cuts it, so a long prefix (hpcp's
-  removal and listing lines, 88 to 123 characters with `-F`) wraps at 80 columns and each frame scrolls a row; cut a
-  frame to one less than the width (hpcp 9.95's review, 2026-11-16).
-- Noted: 2026-11-16, the main session's call (a deferral, not asked).

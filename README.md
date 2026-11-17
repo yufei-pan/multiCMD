@@ -533,6 +533,19 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.68 from 1.67
+
+- Nothing needs doing.
+- Fix: a terminal that reports no size (0 columns: a pty nobody sized, as `script` makes without a terminal of its own,
+  some CI runners) counts as no terminal. `get_terminal_size()` gives `COLUMNS` / `LINES`, else 240x50, so a progress bar
+  stays on one line, `mcmd`'s summary table has room, and a pty-mode command's window is 240x50, less the `[#]` prefix
+  (1.67: each frame of a bar with a total took six lines, the table was cut to its headings' widths, and the window was
+  20 columns by 0 rows).
+- Changed, library: a `print_progress_bar()` frame fits in one column less than the terminal, counted in terminal columns
+  (a wide character takes two), so it never wraps and scrolls a row per frame. Without a total, the prefix gives way
+  first, from its start, then the end of the line, at a blank, so a count is never cut short. That frame is padded to one
+  column less than the width (1.67: the full width, and never cut).
+
 ## Upgrading to 1.67 from 1.66
 
 - Nothing needs doing. `mcmd` is unchanged.
