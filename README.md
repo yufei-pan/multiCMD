@@ -548,8 +548,11 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   number keeps its label and its unit (`Size: 1.15 GiB` stays or goes whole). That frame is padded to one column less
   than the width (1.67: the full width, and never cut).
 - Changed, library: the frame at the total is as wide as the frames before it (a full bar is one block wider), so the
-  line keeps no character of the frame before it (`| 00:00:001` for `| 00:00:00`). On a pipe the 100% frame has 224
-  blocks at 240 columns, not 223.
+  line keeps no character of the frame before it (`| 00:00:001` for `| 00:00:00`). On a pipe the 100% frame has one block
+  more than 1.67's.
+- Known, planned for 1.69 ([docs/limitations.md](docs/limitations.md)): a bar past its total never ends its line; a tab or
+  newline in a frame's prefix or suffix breaks the frame over several lines; and a bar with a total drops its percent and
+  prefix before it has a least width, so at 80 columns hpcp's copy bar shows no count (all three as in 1.67).
 
 ## Upgrading to 1.67 from 1.66
 

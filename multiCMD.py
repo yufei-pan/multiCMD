@@ -3719,8 +3719,9 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 	# the lock held ( docs/limitations.md ) would hang every later frame; it never took the lock before.
 	try:
 		columns, _ = get_terminal_size()
-		# measured as stdout will write them: a character it cannot write comes out as one '?', whatever its width ( a combining
-		# mark takes none, a wide character two ), and a frame measured before that wraps or leaves the one before it showing
+		# measured as stdout will write them: a stdout whose errors handler raises ( the default ) writes a character it cannot
+		# write as one '?', whatever its width ( a combining mark takes none, a wide character two ), and a frame measured before
+		# that wraps or leaves the one before it showing
 		prefix, suffix = _writable(prefix, sys.stdout), _writable(suffix, sys.stdout)
 		_display._write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
 		if iteration == total and total > 0:
