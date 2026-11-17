@@ -3550,7 +3550,7 @@ def get_terminal_size():
 	'''
 	# ( shutil.get_terminal_size is not enough: before Python 3.11 it returns a terminal's zeros, it does not read stdin's size,
 	# and COLUMNS overrides a real size )
-	answered = True  # a terminal answered, maybe with zeros: a real screen is behind it
+	answered = True  # a terminal answered, maybe with zeros: it is taken for a screen of 80x24 ( so is the log that script writes )
 	try:
 		columns, rows = os.get_terminal_size()
 	except Exception:
@@ -3637,7 +3637,7 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		return line + ' ' * (width - _cells(line))
 	percent = f'|{("{0:.1f}").format(100 * (iteration / float(total)))}% '
 	prefix_cells, suffix_cells = _cells(prefix), _cells(suffix)
-	# a frame is at most columns - 2 wide: what it holds, and a bar one wider than length until it is full
+	# a bar is length + 1 wide, full or not ( see below ), so a frame is at most columns - 2 wide
 	length = columns - prefix_cells - suffix_cells - len(percent) - 3
 	if length <= 0:
 		length = columns - prefix_cells - suffix_cells - 3

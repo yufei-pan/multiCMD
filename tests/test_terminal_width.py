@@ -83,8 +83,10 @@ def at_a_pty(code, rows, columns):
 	return output[:-3].decode('utf-8', 'replace').replace('\r\n', '\n')
 
 
-def test_the_lines_are_as_hpcp_writes_them():
-	# a number and its unit are two words ( the first 1.68 build tested '1.23K' and cut 'Size: 123.45 GiB' after its number )
+def test_the_test_strings_are_what_format_bytes_writes():
+	# REMOVAL and LISTING are the suffixes of hpcp 9.95's removal line ( _RemoveProgress.show ) and its listing line, with this
+	# module's own format_bytes: hpcp's code is not read. A number and its unit are two words ( the first 1.68 build tested
+	# '1.23K' and cut 'Size: 123.45 GiB' after its number )
 	assert REMOVAL == 'Removed: 1.23 K Folders: 45.00  | Overall: 1.23 M Files'
 	assert LISTING == 'Files: 1.23 K Links: 12.00  Folders: 45.00  Size: 1.15 GiB | Overall: 1.23 M Files'
 
@@ -160,7 +162,7 @@ def test_a_pty_command_gets_a_window_of_80x24_less_the_prefix_at_a_terminal_of_n
 
 @posix_only
 def test_a_table_gets_80_columns_at_a_terminal_of_no_size():
-	# 1.67 cut every column to its heading's width ( 'a   |xxxxx' became 'a   |x' ): the zero was the width
+	# 1.67 cut every column to its heading's width ( 'a   |xxx..', 10 columns a row ): the zero was the width
 	code = ('import sys, multiCMD\n'
 		'sys.stdout.write(multiCMD.pretty_format_table([["name", "value"], ["a", "x" * 100], ["b", "y" * 30]]))')
 	lines = at_a_pty(code, 0, 0).split('\n')
@@ -181,7 +183,7 @@ def test_a_bar_of_a_known_total_stays_on_one_line_at_a_terminal_of_no_size():
 def test_a_short_line_stays_on_one_row_at_a_terminal_of_no_size():
 	# a serial console or `qm terminal` gives 0x0 until someone runs resize ( known from the platform, not tested ), with a real
 	# 80-column screen behind it: the first 1.68 build padded every frame to 239 columns, three rows that scrolled twice a
-	# second ( 1.67 wrote 75 and did not pad )
+	# second ( 1.67 wrote 58 and did not pad )
 	shown = at_a_pty('import multiCMD\nfor i in range(3): multiCMD.print_progress_bar(i, 0, "/scratch/old-runs/job-1234", "Removed: 1.23 K")', 0, 0)
 	assert '\n' not in shown and len(frames(shown)) == 3, shown
 	assert [len(frame) for frame in frames(shown)] == [79] * 3 and frames(shown)[2].rstrip() == (
@@ -190,13 +192,13 @@ def test_a_short_line_stays_on_one_row_at_a_terminal_of_no_size():
 
 @posix_only
 def test_a_long_prefix_does_not_wrap_at_80_columns():
-	# hpcp's removal and listing lines are 97 to 151 columns with a path of 50 columns ( this test's: 122 and 149 ): 1.67 wrapped
-	# them, and each frame scrolled a row
+	# hpcp's removal and listing lines pass 80 columns with a path of 50 ( this test's: 122 and 149 ): 1.67 wrapped them, and
+	# each frame scrolled a row. %a, not %r: the child's code stays ASCII, so it starts under a C locale ( Python 3.6 ) too
 	code = ('import multiCMD\n'
 		'for i in range(3):\n'
-		'	multiCMD.print_progress_bar(i, 0, %r, %r)\n'
-		'	multiCMD.print_progress_bar(i, 0, %r, %r)\n'
-		'	multiCMD.print_progress_bar(i, 0, %r, %r)\n'
+		'	multiCMD.print_progress_bar(i, 0, %a, %a)\n'
+		'	multiCMD.print_progress_bar(i, 0, %a, %a)\n'
+		'	multiCMD.print_progress_bar(i, 0, %a, %a)\n'
 		% (PATH[-50:], REMOVAL, PATH[-50:], LISTING, WIDE_PATH[-50:], REMOVAL))
 	shown = at_a_pty(code, 24, 80)
 	assert '\n' not in shown, shown
@@ -210,7 +212,23 @@ def test_a_long_prefix_does_not_wrap_at_80_columns():
 	assert listing.rstrip() == ' iteration:2 | Files: 1.23 K Links: 12.00  Folders: 45.00  Size: 1.15 GiB |', listing
 
 
-def test_a_pipe_gets_the_same_bar_of_a_known_total():
+def test_a_frame_is_measured_as_an_ascii_stdout_writes_it():
+	# a combining mark counts none, and an ASCII stdout ( PYTHONIOENCODING, or Python 3.6 in a C locale ) writes it as one '?': a
+	# decomposed name ( macOS writes them ), measured before it is written, came out 109 columns at 80, and wrapped. Only a
+	# combining mark shows it: a wide character is two columns and written as one '?', so the frame comes out narrower
+	prefix = 'e\u0301' * 30
+	code = ('import multiCMD\n'
+		'for i in range(3): multiCMD.print_progress_bar(i, 0, %a, "| Removed: 1.23 K")\n' % prefix)
+	result = subprocess.run([sys.executable, '-c', code], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+		cwd=ROOT, env=dict(env_without_a_size(), PYTHONIOENCODING='ascii', COLUMNS='80'), timeout=60)
+	assert result.returncode == 0 and result.stderr == b'', result.stderr
+	shown = frames(result.stdout.decode('ascii'))
+	# the prefix as the stream writes it is 62 columns, and what is left of the 79 after the rest of the line is its end
+	written, rests = 'e?' * 30 + ' |', [' iteration:%d | Removed: 1.23 K' % i for i in range(3)]
+	assert shown == [written[len(rest) - 79:] + rest for rest in rests], shown
+
+
+def test_a_pipe_draws_its_frames_at_240_columns():
 	# no terminal, and no COLUMNS ( the environment has none ): 240 columns, as in 1.67
 	code = ('import multiCMD\n'
 		'multiCMD.print_progress_bar(5, 10, "p", "s")\n'
@@ -232,7 +250,7 @@ def test_a_pipe_gets_the_same_bar_of_a_known_total():
 	(80, 'tensors | iteration:7 | ' + REMOVAL),
 	(73, ' | iteration:7 | ' + REMOVAL),
 	(71, ' iteration:7 | ' + REMOVAL),
-	# the end gives way a field at a time: the unit goes whole ( ' Files' )
+	# the end gives way a word at a time: ' Files', the word after a number's unit, goes on its own; the number keeps its unit
 	(70, ' iteration:7 | Removed: 1.23 K Folders: 45.00  | Overall: 1.23 M'),
 	# a label goes with its number ( 'Overall: 1.23 M' did not fit; 'Overall:' alone is not left )
 	(64, ' iteration:7 | Removed: 1.23 K Folders: 45.00  |'),
@@ -250,19 +268,42 @@ def test_a_frame_of_no_total_gives_way_from_the_prefix_then_the_end(columns, sho
 	assert frame == shown.ljust(columns - 1)
 
 
-def test_a_frame_never_ends_on_a_number_without_its_unit():
+def test_a_number_is_not_cut_from_its_unit_at_80_columns():
 	# hpcp's listing at 80 columns, five minutes in: 1.68's first build cut it at the blank before the unit, 'Size: 123.45' of 123.45 GiB
 	suffix = '| Files: 123.45 K Links: 1.20 K Folders: 12.34 K Size: 123.45 GiB '
 	frame = _genrate_progress_bar(300, 0, PATH[-50:] + ' |', suffix, 80)
 	assert frame == ' iteration:300 | Files: 123.45 K Links: 1.20 K Folders: 12.34 K'.ljust(79)
-	# the same at every width: a frame ends on a whole field ( a number with its unit, or a word that is not a label ), never
-	# on a number whose unit was cut off or a label whose number was
-	whole = ' iteration:300 ' + suffix
-	for columns in range(30, 140):
-		shown = _genrate_progress_bar(300, 0, PATH[-50:] + ' |', suffix, columns).rstrip()
+
+
+def a_broken_end(kept, whole):
+	'''Why a frame of the line whole ends badly, at kept ( what is left of whole from ' iteration:' on ), else None: inside a
+	word, on a label without its number, or on a number without its unit. A plain count ( '45.00' ) is complete: the word after
+	it is a label or a bar, not a unit.'''
+	if not whole.startswith(kept):
+		return 'is not the start of the line'
+	if kept != whole.rstrip() and whole[len(kept)] != ' ':
+		return 'ends inside a word'
+	if kept.endswith(':'):
+		return 'ends on a label without its number'
+	after = whole[len(kept):].split()
+	if re.fullmatch(r'\d+(\.\d+)?', kept.split(' ')[-1]) and after and after[0][:1].isalpha() and not after[0].endswith(':'):
+		return 'ends on a number without its unit'
+	return None
+
+
+@pytest.mark.parametrize('prefix', [PATH[-50:], WIDE_PATH[-50:]], ids=['path', 'wide-path'])
+@pytest.mark.parametrize('suffix', [REMOVAL, LISTING, 'Files: 123.45 K Links: 1.20 K Folders: 12.34 K Size: 123.45 GiB '],
+	ids=['removal', 'listing', 'large-counts'])
+def test_a_frame_never_ends_inside_a_field_at_any_width(prefix, suffix):
+	# hpcp's lines at 20 to 200 columns: the end gives way a field at a time, after what is left of the prefix. 61cedd0 cut at
+	# any blank, and ended on a label without its number ( 'Removed:' ) and on a number without its unit
+	suffix = '| ' + suffix
+	whole = ' iteration:7 ' + suffix
+	for columns in range(20, 201):
+		frame = _genrate_progress_bar(7, 0, prefix + ' |', suffix, columns)
+		shown = frame.rstrip()
 		kept = shown[shown.index(' iteration:'):]
-		assert whole.startswith(kept) and (kept == whole.rstrip() or whole[len(kept)] == ' '), (columns, shown)
-		assert not re.search(r'[\d:]$', kept) or kept == whole.rstrip(), (columns, shown)
+		assert cells(frame) == columns - 1 and a_broken_end(kept, whole) is None, (columns, a_broken_end(kept, whole), shown)
 
 
 @pytest.mark.parametrize('text, expected', [
@@ -272,8 +313,10 @@ def test_a_frame_never_ends_on_a_number_without_its_unit():
 	('\u0300', 0), ('e\u0301', 1), ('a\u200bb', 2), ('\u1160', 0), ('\u4e2d\u6587', 4), ('ab\u4e2d', 4), ('\uff21', 2), ('\U0001f600x', 3),
 	('x' * 300 + '\u4e2d', 302),
 ])
-def test_cells_is_the_columns_the_terminal_draws(text, expected):
-	# ASCII and Latin-1, the usual text, is counted by length: a fast path that must give what the count by character gives
+def test_cells_counts_a_character_by_its_unicode_width(text, expected):
+	# the module's own count, by Unicode's width of each character: no terminal measures it ( a tab or a newline counts one:
+	# docs/limitations.md, deferred to 1.69 ). ASCII and Latin-1, the usual text, is counted by length: a fast path that must give
+	# what the count by character gives
 	assert multiCMD._cells(text) == expected
 
 
