@@ -206,6 +206,21 @@ def test_progress_bar_with_a_name_its_stdout_cannot_write(monkeypatch):
 	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(79)
 
 
+def test_progress_bar_is_measured_as_its_stdout_writes_it(monkeypatch):
+	# an ASCII stdout ( Python 3.6 in a C locale ) writes a combining mark, which takes no column, as a '?' that takes one, and a wide
+	# character, which takes two, as one: a frame measured before that wrapped ( 80 columns and more ) or came out short, leaving the
+	# end of the frame before it showing
+	out = ascii_stdout(monkeypatch, 'ascii', 'strict')
+	print_progress_bar(7, 0, prefix='e\u0301' * 60, suffix='s')
+	print_progress_bar(7, 0, prefix='\u4e2d' * 30, suffix='s')
+	print_progress_bar(5, 10, prefix='e\u0301' * 12, suffix='\u4e2d' * 3)
+	print_progress_bar(5, 10, prefix='dir', suffix='s')
+	out.flush()
+	frames = out.buffer.getvalue().decode('ascii').split('\r')[1:]
+	assert [len(frame) for frame in frames] == [79, 79, 78, 78]
+	assert frames[0].endswith('e? | iteration:7 | s') and frames[2].startswith('e?' * 12 + ' |') and frames[2].endswith('|50.0% | ???')
+
+
 def test_progress_bar_in_a_c_locale_python():
 	# the real stdout of a Python whose locale has no encoding for the bar ( on 3.7+ only PYTHONIOENCODING makes it ASCII )
 	code = ('import sys; sys.path.insert(0, %r); import multiCMD; multiCMD.print_progress_bar(5, 10, "p", "s")'
