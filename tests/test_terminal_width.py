@@ -17,10 +17,17 @@ from multiCMD import _genrate_progress_bar, get_terminal_size, print_progress_ba
 ROOT = str(Path(__file__).resolve().parents[1])
 posix_only = pytest.mark.skipif(os.name != 'posix', reason='needs a pseudo-terminal')
 
-# hpcp's removal and listing lines ( hpcp 9.95: prefix=path[-50:], the suffix after it )
+# hpcp's removal and listing lines ( hpcp 9.95: prefix=path[-50:], the suffix after it, its numbers from format_bytes(), which
+# writes a blank between a number and its unit: '1.23 K', '1.15 Gi', and '45.00 ' with none )
 PATH = '/srv/data/projects/2026/run-0042/outputs/checkpoints/step-001200/model.safetensors'
-REMOVAL = 'Removed: 1.23K Folders: 45 | Overall: 1.23M Files'
-LISTING = 'Files: 1.23K Links: 12 Folders: 45 Size: 1.23GB | Overall: 1.23M Files'
+
+
+def fb(count):
+	return multiCMD.format_bytes(count, use_1024_bytes=False, to_str=True)
+
+
+REMOVAL = f'Removed: {fb(1230)} Folders: {fb(45)} | Overall: {fb(1230000)} Files'
+LISTING = f'Files: {fb(1230)} Links: {fb(12)} Folders: {fb(45)} Size: {multiCMD.format_bytes(1.15 * 2 ** 30)}B | Overall: {fb(1230000)} Files'
 WIDE_PATH = '/数据/项目/二〇二六/运行记录/输出结果/检查点/第一千二百步/模型权重文件.safetensors'
 
 
@@ -76,6 +83,12 @@ def at_a_pty(code, rows, columns):
 	return output[:-3].decode('utf-8', 'replace').replace('\r\n', '\n')
 
 
+def test_the_lines_are_as_hpcp_writes_them():
+	# a number and its unit are two words ( the first 1.68 build tested '1.23K' and cut 'Size: 123.45 GiB' after its number )
+	assert REMOVAL == 'Removed: 1.23 K Folders: 45.00  | Overall: 1.23 M Files'
+	assert LISTING == 'Files: 1.23 K Links: 12.00  Folders: 45.00  Size: 1.15 GiB | Overall: 1.23 M Files'
+
+
 @pytest.mark.parametrize('reported, environ, expected', [
 	((0, 0), {}, (240, 50)),
 	((0, 0), {'COLUMNS': '100', 'LINES': '40'}, (100, 40)),
@@ -123,7 +136,8 @@ def test_a_bar_of_a_known_total_stays_on_one_line_at_a_terminal_of_no_size():
 
 @posix_only
 def test_a_long_prefix_does_not_wrap_at_80_columns():
-	# hpcp's removal and listing lines are 88 to 123 columns: 1.67 wrapped them, and each frame scrolled a row
+	# hpcp's removal and listing lines are 88 to 123 columns ( a path of 50 columns, the rest 70 to 97 ): 1.67 wrapped them, and
+	# each frame scrolled a row
 	code = ('import multiCMD\n'
 		'for i in range(3):\n'
 		'	multiCMD.print_progress_bar(i, 0, %r, %r)\n'
@@ -135,11 +149,11 @@ def test_a_long_prefix_does_not_wrap_at_80_columns():
 	assert len(frames(shown)) == 9 and all(cells(frame) <= 79 for frame in frames(shown)), shown
 	removal, listing, wide = frames(shown)[-3:]
 	# the prefix gives way first, from its start: the end of the path stays, and the counts stay whole
-	assert removal.rstrip() == 'l.safetensors | iteration:2 | ' + REMOVAL, removal
-	assert wide.rstrip().endswith('.safetensors | iteration:2 | ' + REMOVAL), wide
-	# wider than the terminal without the path: the end gives way at a blank, never inside a number
-	rest = ' iteration:2 | ' + LISTING
-	assert rest.startswith(listing.rstrip()) and rest[len(listing.rstrip())] == ' ', listing
+	assert removal.rstrip() == 'tensors | iteration:2 | ' + REMOVAL, removal
+	assert wide.rstrip() == 'tensors | iteration:2 | ' + REMOVAL, wide
+	# wider than the terminal without the path: the end gives way a whole field at a time ( 1.15 GiB stays whole, then the
+	# label of a number that does not fit goes with it )
+	assert listing.rstrip() == ' iteration:2 | Files: 1.23 K Links: 12.00  Folders: 45.00  Size: 1.15 GiB |', listing
 
 
 def test_a_pipe_gets_the_same_bar_of_a_known_total():
@@ -161,12 +175,17 @@ def test_a_pipe_gets_the_same_bar_of_a_known_total():
 
 @pytest.mark.parametrize('columns, shown', [
 	(240, '/outputs/checkpoints/step-001200/model.safetensors | iteration:7 | ' + REMOVAL),
-	(80, 'l.safetensors | iteration:7 | ' + REMOVAL),
-	(68, 's | iteration:7 | ' + REMOVAL),
-	(67, ' | iteration:7 | ' + REMOVAL),
-	(60, ' iteration:7 | Removed: 1.23K Folders: 45 | Overall: 1.23M'),
-	(30, ' iteration:7 | Removed: 1.23K'),
-	(29, ' iteration:7 | Removed:'),
+	(80, 'tensors | iteration:7 | ' + REMOVAL),
+	(73, ' | iteration:7 | ' + REMOVAL),
+	(71, ' iteration:7 | ' + REMOVAL),
+	# the end gives way a field at a time: the unit goes whole ( ' Files' )
+	(70, ' iteration:7 | Removed: 1.23 K Folders: 45.00  | Overall: 1.23 M'),
+	# a label goes with its number ( 'Overall: 1.23 M' did not fit; 'Overall:' alone is not left )
+	(64, ' iteration:7 | Removed: 1.23 K Folders: 45.00  |'),
+	# 'Folders:' fits in the 39 columns, its number does not
+	(40, ' iteration:7 | Removed: 1.23 K'),
+	# '1.23' fits in the 29 columns, its unit does not
+	(30, ' iteration:7 |'),
 	(8, ' iterat'),
 	(1, ''),
 ])
@@ -175,10 +194,30 @@ def test_a_frame_of_no_total_gives_way_from_the_prefix_then_the_end(columns, sho
 	assert frame == shown.ljust(columns - 1)
 
 
+def test_a_frame_never_ends_on_a_number_without_its_unit():
+	# hpcp's listing at 80 columns, five minutes in: 1.68's first build cut it at the blank before the unit, 'Size: 123.45' of 123.45 GiB
+	suffix = '| Files: 123.45 K Links: 1.20 K Folders: 12.34 K Size: 123.45 GiB '
+	frame = _genrate_progress_bar(300, 0, PATH[-50:] + ' |', suffix, 80)
+	assert frame == ' iteration:300 | Files: 123.45 K Links: 1.20 K Folders: 12.34 K'.ljust(79)
+	# the same at every width: a frame ends on a whole field ( a number with its unit, or a word that is not a label ), never
+	# on a number whose unit was cut off or a label whose number was
+	whole = ' iteration:300 ' + suffix
+	for columns in range(30, 140):
+		shown = _genrate_progress_bar(300, 0, PATH[-50:] + ' |', suffix, columns).rstrip()
+		kept = shown[shown.index(' iteration:'):]
+		assert whole.startswith(kept) and (kept == whole.rstrip() or whole[len(kept)] == ' '), (columns, shown)
+		assert not re.search(r'[\d:]$', kept) or kept == whole.rstrip(), (columns, shown)
+
+
 def test_a_frame_counts_wide_characters_as_two_columns():
-	frame = _genrate_progress_bar(7, 0, WIDE_PATH[-50:] + ' |', '| ' + REMOVAL, 80)
+	frame = _genrate_progress_bar(7, 0, WIDE_PATH[-50:] + ' |', '| ' + REMOVAL, 109)
 	# ( padded with a blank where a wide character did not fit in the last column )
-	assert cells(frame) == 79 and frame.rstrip().endswith('.safetensors | iteration:7 | ' + REMOVAL), frame
+	assert cells(frame) == 108 and frame.startswith('一千二百步/') and frame.endswith(REMOVAL + ' '), frame
+	assert _genrate_progress_bar(7, 0, WIDE_PATH[-50:] + ' |', '| ' + REMOVAL, 110).startswith('第一千二百步/'), frame
+	# the suffix's wide characters count too: what is left of the prefix is cut to fit them
+	rest = ' iteration:7 | 已删除: 1.23 K 文件夹: 45.00 '
+	frame = _genrate_progress_bar(7, 0, PATH[-50:] + ' |', '| 已删除: 1.23 K 文件夹: 45.00 ', 80)
+	assert cells(frame) == 79 and frame.rstrip() == (PATH[-50:] + ' |')[-(79 - cells(rest)):] + rest.rstrip(), frame
 	# with a known total, the bar is what gives way
 	frame = _genrate_progress_bar(5, 10, '中文前缀 |', '| 后缀', 40)
 	assert cells(frame) == 38 and frame.startswith('中文前缀 |') and frame.endswith('|50.0% | 后缀'), frame
@@ -202,4 +241,4 @@ def test_a_bar_past_its_total_is_full_not_longer():
 def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypatch, capsys):
 	monkeypatch.setattr(multiCMD, 'get_terminal_size', lambda: os.terminal_size((80, 24)))
 	print_progress_bar(7, 0, PATH[-50:], REMOVAL)
-	assert capsys.readouterr().out == '\r' + ('l.safetensors | iteration:7 | ' + REMOVAL).ljust(79)
+	assert capsys.readouterr().out == '\r' + ('tensors | iteration:7 | ' + REMOVAL).ljust(79)

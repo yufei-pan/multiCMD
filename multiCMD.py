@@ -3582,8 +3582,9 @@ def _cells(text):
 
 def _fit(text, width, from_start=False):
 	'''
-	text cut to width terminal columns ( internal ): its end, back to the last blank that fits, so a number is never cut
-	short ( 'Removed: 1.2' of 1.23M ); from_start, its start, at the column
+	text cut to width terminal columns ( internal ): its end, back to the last blank that fits and follows neither a digit
+	nor a colon, so a number keeps its label and its unit ( format_bytes writes '1.23 K' ); from_start, its start, at the
+	column
 	'''
 	used = 0
 	for i in (range(len(text) - 1, -1, -1) if from_start else range(len(text))):
@@ -3591,7 +3592,11 @@ def _fit(text, width, from_start=False):
 		if used > width:
 			if from_start:
 				return text[i + 1:]
-			blank = text.rfind(' ', 0, i + 1)
+			# a blank after a digit may sit between a number and its unit ( '1.23 K' ), one after a colon between a label and
+			# its number: neither is a place to cut
+			blank = i
+			while blank > 0 and (text[blank] != ' ' or text[blank - 1].isdigit() or text[blank - 1] == ':'):
+				blank -= 1
 			return text[:blank] if blank > 0 else text[:i]
 	return text
 
