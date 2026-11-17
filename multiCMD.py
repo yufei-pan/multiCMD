@@ -3583,6 +3583,10 @@ _ASCII_BAR = str.maketrans(_BAR_BLOCKS, '.:-=+*%#')
 
 def _cells(text):
 	'''The terminal columns text takes ( internal ): a wide character two, a combining mark none'''
+	# ASCII and Latin-1, the usual text, is a column a character ( as pretty_format_table's visible_len ): a frame is measured twice
+	# a time it is drawn, twice a second
+	if not text or max(text) < "\u0300":
+		return len(text)
 	return sum(map(_char_width, text))
 
 def _fit(text, width, from_start=False):

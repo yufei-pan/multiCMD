@@ -262,6 +262,18 @@ def test_a_frame_never_ends_on_a_number_without_its_unit():
 		assert not re.search(r'[\d:]$', kept) or kept == whole.rstrip(), (columns, shown)
 
 
+@pytest.mark.parametrize('text, expected', [
+	('', 0), ('abc', 3), ('caf\u00e9', 4), ('\u00ff\u0100\u02ff', 3),
+	# U+0300 is where the count by length stops: a combining mark takes none, a format character ( zero width space ) none, a Hangul
+	# vowel jamo none, a wide character ( Chinese, full-width ) two, an emoji two
+	('\u0300', 0), ('e\u0301', 1), ('a\u200bb', 2), ('\u1160', 0), ('\u4e2d\u6587', 4), ('ab\u4e2d', 4), ('\uff21', 2), ('\U0001f600x', 3),
+	('x' * 300 + '\u4e2d', 302),
+])
+def test_cells_is_the_columns_the_terminal_draws(text, expected):
+	# ASCII and Latin-1, the usual text, is counted by length: a fast path that must give what the count by character gives
+	assert multiCMD._cells(text) == expected
+
+
 def test_a_frame_counts_a_wide_character_as_two_columns_and_a_combining_mark_as_none():
 	frame = _genrate_progress_bar(7, 0, WIDE_PATH[-50:] + ' |', '| ' + REMOVAL, 109)
 	# ( padded with a blank where a wide character did not fit in the last column )
