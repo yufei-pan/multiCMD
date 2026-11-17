@@ -240,6 +240,8 @@ def test_a_pipe_gets_the_same_bar_of_a_known_total():
 	(40, ' iteration:7 | Removed: 1.23 K'),
 	# '1.23' fits in the 29 columns, its unit does not
 	(30, ' iteration:7 |'),
+	# a field that fits to the last column stays ( the blank after it is the first thing that does not fit )
+	(31, ' iteration:7 | Removed: 1.23 K'),
 	(8, ' iterat'),
 	(1, ''),
 ])
