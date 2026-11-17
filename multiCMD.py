@@ -29,9 +29,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.67'
+version = '1.68'
 __version__ = version
-COMMIT_DATE = '2026-11-14'
+COMMIT_DATE = '2026-11-16'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -3347,9 +3347,17 @@ def input_with_timeout_and_countdown(timeout, prompt='Please enter your selectio
 		if ended:
 			time.sleep(max(deadline - (seconds - 1) - time.monotonic(), 0))
 
+def _char_width(ch):
+	'''The terminal columns a character takes ( internal ): an East Asian wide character two, a combining mark none'''
+	if ch < "\u0300":  # ASCII and Latin-1
+		return 1
+	import unicodedata
+	if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf") or "\u1160" <= ch <= "\u11ff":
+		return 0
+	return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
 def pretty_format_table(data, delimiter=None, header=None, full=False, remove_empty_columns=False):
 	import re
-	import unicodedata
 	version = 1.21
 	_ = version
 	if not data:
@@ -3383,12 +3391,7 @@ def pretty_format_table(data, delimiter=None, header=None, full=False, remove_em
 	# Widths count terminal columns: an East Asian wide character takes two,
 	# a combining mark and an ANSI color code none.
 	ansi = re.compile(r"(\x1b\[[0-?]*[ -/]*[@-~])")
-	def char_width(ch):
-		if ch < "\u0300":  # ASCII and Latin-1
-			return 1
-		if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf") or "\u1160" <= ch <= "\u11ff":
-			return 0
-		return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+	char_width = _char_width
 	def visible_len(s):
 		if "\x1b" in s:
 			s = ansi.sub("", s)
@@ -3533,7 +3536,11 @@ def slugify(value, allow_unicode=False):
 
 def get_terminal_size():
 	'''
-	Get the terminal size
+	Get the terminal size: stdout's terminal, else stdin's (cmd | less), else COLUMNS / LINES, else 240x50.
+
+	A terminal that reports 0 columns or rows does not know its size (a pty nobody set one on: script
+	without a terminal, some CI runners). As shutil.get_terminal_size does, what it does not know comes
+	from COLUMNS / LINES or the fallback.
 
 	@params:
 		None
@@ -3541,9 +3548,9 @@ def get_terminal_size():
 	@returns:
 		(int,int): the number of columns and rows of the terminal
 	'''
+	# ( shutil.get_terminal_size is not enough: before Python 3.11 it returns a terminal's zeros, and it does not read stdin's size )
 	try:
-		import os
-		_tsize = os.get_terminal_size()
+		columns, rows = os.get_terminal_size()
 	except Exception:
 		try:
 			import fcntl
@@ -3551,19 +3558,47 @@ def get_terminal_size():
 			import termios
 			packed = fcntl.ioctl(0, termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0))
 			rows, columns = struct.unpack('HHHH', packed)[:2]
-			_tsize = (columns, rows)
 		except Exception:
-			import shutil
-			_tsize = shutil.get_terminal_size(fallback=(240, 50))
-	return _tsize
+			columns = rows = 0
+	def from_environment(name, fallback):
+		try:
+			value = int(os.environ.get(name, ''))
+		except ValueError:
+			return fallback
+		return value if value > 0 else fallback
+	if columns <= 0:
+		columns = from_environment('COLUMNS', 240)
+	if rows <= 0:
+		rows = from_environment('LINES', 50)
+	return os.terminal_size((columns, rows))
 
 # the bar's blocks, and what a stdout whose encoding has no such characters gets for them ( see _writable )
 _BAR_BLOCKS = '▁▂▃▄▅▆▇█'
 _ASCII_BAR = str.maketrans(_BAR_BLOCKS, '.:-=+*%#')
 
+def _cells(text):
+	'''The terminal columns text takes ( internal ): a wide character two, a combining mark none'''
+	return sum(map(_char_width, text))
+
+def _fit(text, width, from_start=False):
+	'''
+	text cut to width terminal columns ( internal ): its end, back to the last blank that fits, so a number is never cut
+	short ( 'Removed: 1.2' of 1.23M ); from_start, its start, at the column
+	'''
+	used = 0
+	for i in (range(len(text) - 1, -1, -1) if from_start else range(len(text))):
+		used += _char_width(text[i])
+		if used > width:
+			if from_start:
+				return text[i + 1:]
+			blank = text.rfind(' ', 0, i + 1)
+			return text[:blank] if blank > 0 else text[:i]
+	return text
+
 def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	'''
-	Generate a progress bar string
+	Generate a progress bar string: one line, within one column less than columns ( a line that reaches the last column
+	wraps on some terminals, and a frame that wraps scrolls a row each time it is drawn ), counted in terminal columns
 
 	@params:
 		iteration   - Required  : current iteration (Int)
@@ -3579,22 +3614,29 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	noSuffix = False
 	noPercent = False
 	noBar = False
-	# if total is 0, we don't want to divide by 0
+	width = columns - 1
+	# if total is 0, we don't want to divide by 0: the iteration, padded to clear the last frame. What does not fit gives way
+	# from the prefix's start ( hpcp's is the end of a path ), then from the end
 	if total == 0:
-		return f'{prefix} iteration:{iteration} {suffix}'.ljust(columns)
+		rest = f' iteration:{iteration} {suffix}'
+		line = _fit(_fit(prefix, width - _cells(rest), from_start=True) + rest, width)
+		return line + ' ' * (width - _cells(line))
 	percent = f'|{("{0:.1f}").format(100 * (iteration / float(total)))}% '
-	length = columns - len(prefix) - len(suffix) - len(percent) - 3
+	prefix_cells, suffix_cells = _cells(prefix), _cells(suffix)
+	# a frame is at most columns - 2 wide: what it holds, and a bar one wider than length until it is full
+	length = columns - prefix_cells - suffix_cells - len(percent) - 3
 	if length <= 0:
-		length = columns - len(prefix) - len(suffix) - 3
+		length = columns - prefix_cells - suffix_cells - 3
 		noPercent = True
 	if length <= 0:
-		length = columns - len(suffix) - 3
+		length = columns - suffix_cells - 3
 		noPrefix = True
 	if length <= 0:
 		length = columns - 3
 		noSuffix = True
 	if length <= 0:
-		return f'{prefix}\niteration:\n {iteration}\ntotal:\n {total}\n| {suffix}\n'
+		# 3 columns or fewer: no room for a bar
+		return ''
 	if iteration == 0:
 		noBar = True
 	filled_length = int(length * iteration // total)
@@ -3602,7 +3644,8 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	fractional_progress = (length * iteration / total) - filled_length
 	char_index = int(fractional_progress * (len(progress_chars) - 1))
 	bar_char = progress_chars[char_index]
-	if filled_length == length:
+	# past the total too ( a total that was an estimate ): a full bar, not a longer one
+	if filled_length >= length:
 		bar = progress_chars[-1] * length
 	else:
 		bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)

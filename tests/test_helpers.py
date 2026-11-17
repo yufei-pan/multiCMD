@@ -203,7 +203,7 @@ def test_progress_bar_with_a_name_its_stdout_cannot_write(monkeypatch):
 	out = ascii_stdout(monkeypatch, 'utf-8', 'strict')
 	print_progress_bar(3, 0, prefix='dir/caf\udce9', suffix='s')
 	out.flush()
-	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(80)
+	assert out.buffer.getvalue().decode('utf-8') == '\r' + 'dir/caf? | iteration:3 | s'.ljust(79)
 
 
 def test_progress_bar_in_a_c_locale_python():
