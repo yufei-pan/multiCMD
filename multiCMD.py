@@ -3654,9 +3654,10 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	fractional_progress = (length * iteration / total) - filled_length
 	char_index = int(fractional_progress * (len(progress_chars) - 1))
 	bar_char = progress_chars[char_index]
-	# past the total too ( a total that was an estimate ): a full bar, not a longer one
+	# past the total too ( a total that was an estimate ): a full bar, not a longer one, and as wide as the bars before it: the
+	# frame is drawn over the one before it, and what it does not cover stays on the screen ( '| 00:00:001' for '| 00:00:00' )
 	if filled_length >= length:
-		bar = progress_chars[-1] * length
+		bar = progress_chars[-1] * (length + 1)
 	else:
 		bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)
 	lineOut = ''

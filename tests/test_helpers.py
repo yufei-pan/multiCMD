@@ -194,7 +194,7 @@ def test_progress_bar_on_a_stdout_that_cannot_write_its_blocks(monkeypatch):
 	out.flush()
 	assert out.buffer.getvalue().decode('ascii') == (
 		"\rProgress: |" + "#" * 24 + "=" + "_" * 25 + "|50.0% | Complete"
-		"\rProgress: |" + "#" * 48 + "|100.0% | Complete\n"
+		"\rProgress: |" + "#" * 49 + "|100.0% | Complete\n"
 	)
 
 

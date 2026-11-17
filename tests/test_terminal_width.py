@@ -221,7 +221,7 @@ def test_a_pipe_gets_the_same_bar_of_a_known_total():
 	full = '\N{FULL BLOCK}'
 	assert result.stdout.decode('utf-8') == (
 		'\rp |' + full * 112 + '\N{LOWER ONE EIGHTH BLOCK}' + '_' * 112 + '|50.0% | s'
-		'\rp |' + full * 223 + '|100.0% | s\n'
+		'\rp |' + full * 224 + '|100.0% | s\n'
 		# padded to clear the last frame, to 239 columns ( 1.67: 240 )
 		'\r' + 'p | iteration:3 | s'.ljust(239))
 
@@ -298,7 +298,19 @@ def test_a_bar_of_a_known_total_drops_a_long_prefix_and_its_percent():
 def test_a_bar_past_its_total_is_full_not_longer():
 	# a total that was an estimate: 1.67 drew a bar one and a half times its length, over the terminal's width
 	frame = _genrate_progress_bar(15, 10, 'p |', '| s', 40)
-	assert frame == 'p |' + '\N{FULL BLOCK}' * 23 + '|150.0% | s' and cells(frame) <= 39
+	assert frame == 'p |' + '\N{FULL BLOCK}' * 24 + '|150.0% | s' and cells(frame) == 38
+
+
+@pytest.mark.parametrize('columns', [40, 80, 240])
+def test_the_last_frame_of_a_bar_covers_the_one_before_it(columns):
+	# a frame is drawn over the one before it from the line's start, and what it does not cover stays: 1.67's full bar was one
+	# column shorter than the others, and a bar of 10 ended '| 00:00:001' for '| 00:00:00' ( hpcp's copy bar too )
+	drawn = [_genrate_progress_bar(i, 10, '10 files |', '| 3.2 F/s | 00:00:0%d' % (10 - i), columns) for i in range(1, 11)]
+	assert [len(frame) for frame in drawn] == [columns - 2] * 10
+	line = []
+	for frame in drawn:
+		line[:len(frame)] = list(frame)
+	assert ''.join(line) == drawn[-1] and drawn[-1].endswith('| 3.2 F/s | 00:00:00')
 
 
 def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypatch, capsys):
