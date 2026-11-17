@@ -1106,27 +1106,32 @@ def slugify(value,allow_unicode=False):
 	else:value=unicodedata.normalize('NFKD',value).encode('ascii','ignore').decode('ascii')
 	value=re.sub('[^\\w\\s-]','',value.lower());return re.sub('[-\\s]+','-',value).strip('-_')
 def get_terminal_size():
+	answered=True
 	try:columns,rows=os.get_terminal_size()
 	except Exception:
 		try:import fcntl,struct,termios;packed=fcntl.ioctl(0,termios.TIOCGWINSZ,struct.pack('HHHH',0,0,0,0));rows,columns=struct.unpack('HHHH',packed)[:2]
-		except Exception:columns=rows=0
+		except Exception:columns=rows=0;answered=False
 	def from_environment(name,fallback):
 		try:value=int(os.environ.get(name,''))
 		except ValueError:return fallback
 		return value if value>0 else fallback
-	if columns<=0:columns=from_environment('COLUMNS',240)
-	if rows<=0:rows=from_environment('LINES',50)
+	if columns<=0:columns=from_environment('COLUMNS',80 if answered else 240)
+	if rows<=0:rows=from_environment('LINES',24 if answered else 50)
 	return os.terminal_size((columns,rows))
 _BAR_BLOCKS='▁▂▃▄▅▆▇█'
 _ASCII_BAR=str.maketrans(_BAR_BLOCKS,'.:-=+*%#')
-def _cells(text):return sum(map(_char_width,text))
+def _cells(text):
+	if not text or max(text)<'̀':return len(text)
+	return sum(map(_char_width,text))
 def _fit(text,width,from_start=False):
 	used=0
 	for i in range(len(text)-1,-1,-1)if from_start else range(len(text)):
 		used+=_char_width(text[i])
 		if used>width:
 			if from_start:return text[i+1:]
-			blank=text.rfind(' ',0,i+1);return text[:blank]if blank>0 else text[:i]
+			blank=i
+			while blank>0 and(text[blank]!=' 'or text[blank-1].isdigit()or text[blank-1]==':'):blank-=1
+			return text[:blank]if blank>0 else text[:i]
 	return text
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	noPrefix=False;noSuffix=False;noPercent=False;noBar=False;width=columns-1
@@ -1138,7 +1143,7 @@ def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	if length<=0:return''
 	if iteration==0:noBar=True
 	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
-	if filled_length>=length:bar=progress_chars[-1]*length
+	if filled_length>=length:bar=progress_chars[-1]*(length+1)
 	else:bar=progress_chars[-1]*filled_length+bar_char+'_'*(length-filled_length)
 	lineOut=''
 	if not noPrefix:lineOut+=prefix
@@ -1160,7 +1165,7 @@ def _writable(text,stream):
 def print_progress_bar(iteration,total,prefix='',suffix=''):
 	prefix+=' |'if not prefix.endswith(' |')else'';suffix=f"| {suffix}"if not suffix.startswith('| ')else suffix
 	try:
-		columns,_=get_terminal_size();_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
+		columns,_=get_terminal_size();prefix,suffix=_writable(prefix,sys.stdout),_writable(suffix,sys.stdout);_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
 		if iteration==total and total>0:_display._write('\n')
 	except Exception:
 		if iteration%5==0:_display._write(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout)+'\n')
