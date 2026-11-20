@@ -1,5 +1,6 @@
 '''A progress line fits its terminal (1.68): a terminal of no size counts as unknown, and a frame is cut to one column less
-than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time (1.69).'''
+than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time; a bar past
+its total ends its line (1.69).'''
 import os
 import re
 import select
@@ -393,7 +394,7 @@ def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypat
 	assert capsys.readouterr().out == '\r' + ('tensors | iteration:7 | ' + REMOVAL).ljust(79)
 
 
-# ---- 1.69: a bar with a total keeps 10 cells, and its text gives way a field at a time
+# ---- 1.69: a bar with a total keeps 10 cells; a bar past its total ends its line
 
 BAR = re.compile('[' + multiCMD._BAR_BLOCKS + '_]+')
 
@@ -463,3 +464,41 @@ def test_a_frame_of_a_known_total_keeps_whole_fields_beside_10_cells_at_any_widt
 			assert head.startswith(first[:-2]), (columns, frame)
 		if cells(head) + cells(last) + 10 <= columns - 2:
 			assert tail.endswith(last), (columns, frame)
+
+
+def test_a_bar_past_its_total_ends_its_line(monkeypatch, capsys):
+	# 1.68 ended the line only at a frame equal to the total: a count that stepped over it left the line open, and the program's
+	# next output joined the bar ( '...|110.0% | snext' ). The first frame at or past the total ends it now; the frame at the
+	# total still ends it each time; a later frame past it is drawn on the next line and left open, so it does not scroll
+	monkeypatch.setattr(multiCMD, 'get_terminal_size', lambda: os.terminal_size((40, 24)))
+	monkeypatch.setattr(multiCMD, '_bar_done', [None])
+	print_progress_bar(9, 10, 'p', 's')
+	print_progress_bar(11, 10, 'p', 's')
+	print('next')
+	shown = capsys.readouterr().out.split('\n')
+	assert len(shown) == 3 and shown[0].endswith('|110.0% | s') and shown[1:] == ['next', ''], shown
+	for frames, lines in [
+		# a count that steps over the total, then goes on: one line end, after the first frame past it
+		([9, 12, 13, 15], 1),
+		# a frame at the total, each time ( as 1.68 )
+		([5, 10, 10], 2),
+		# at the total, then past it: as 1.68
+		([9, 10, 11], 1),
+		# a new bar of the same total: a frame below it starts it again
+		([12, 3, 12], 2),
+	]:
+		for iteration in frames:
+			print_progress_bar(iteration, 10, 'p', 's')
+		assert capsys.readouterr().out.count('\n') == lines, frames
+		print_progress_bar(0, 10, 'p', 's')
+		capsys.readouterr()
+
+
+@posix_only
+def test_the_output_after_a_bar_past_its_total_starts_a_line_of_its_own():
+	# at a terminal of no size ( 80x24 ): the bar's line ends with the first frame past the total, and 'next' starts the line after it
+	code = ('import multiCMD\n'
+		'for i in (5, 11): multiCMD.print_progress_bar(i, 10, "p", "s")\n'
+		'print("next")')
+	shown = at_a_pty(code, 0, 0)
+	assert shown.endswith('|110.0% | s\nnext\n') and shown.count('\n') == 2, shown

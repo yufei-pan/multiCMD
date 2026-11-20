@@ -3732,6 +3732,9 @@ def _writable(text, stream):
 		text = text.translate(_ASCII_BAR)
 	return text.encode(encoding, 'replace').decode(encoding)
 
+# the total of the bar whose last frame was at or past it, else None ( see print_progress_bar )
+_bar_done = [None]
+
 def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
 	Call in a loop to create terminal progress bar
@@ -3756,8 +3759,13 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 		# that wraps or leaves the one before it showing
 		prefix, suffix = _writable(prefix, sys.stdout), _writable(suffix, sys.stdout)
 		_display._write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
-		if iteration == total and total > 0:
+		# the frame at the total ends its line, each time, and so does the first one past it ( a total that was an estimate, a
+		# count that steps over it ), so the program's next output starts a line of its own. A later frame past the total is
+		# drawn on the line after it, and left open: ending each would scroll a line per frame
+		done = total > 0 and iteration >= total
+		if done and (iteration == total or _bar_done[0] != total):
 			_display._write('\n')
+		_bar_done[0] = total if done else None
 	except Exception:
 		if iteration % 5 == 0:
 			_display._write(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout) + '\n')
