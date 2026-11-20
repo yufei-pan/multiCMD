@@ -1,5 +1,5 @@
 '''A progress line fits its terminal (1.68): a terminal of no size counts as unknown, and a frame is cut to one column less
-than the width, in terminal columns.'''
+than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time (1.69).'''
 import os
 import re
 import select
@@ -29,6 +29,13 @@ def fb(count):
 REMOVAL = f'Removed: {fb(1230)} Folders: {fb(45)} | Overall: {fb(1230000)} Files'
 LISTING = f'Files: {fb(1230)} Links: {fb(12)} Folders: {fb(45)} Size: {multiCMD.format_bytes(1.15 * 2 ** 30)}B | Overall: {fb(1230000)} Files'
 WIDE_PATH = '/数据/项目/二〇二六/运行记录/输出结果/检查点/第一千二百步/模型权重文件.safetensors'
+# hpcp 9.96's copy bar ( Adaptive_Progress_Bar.print_progress, read, not imported ), with this module's format_bytes: its count,
+# size and jobs, then its rates, the last jobs' rates and the time left; with a rate limit set, the limits in the jobs' place
+COPY_PREFIX = f'{fb(123456)}F ({multiCMD.format_bytes(45.6 * 2 ** 30)}B) Copied | 16 Scheduled {4.0:0>3.1f} F/Job '
+COPY = (f'{multiCMD.format_bytes(1.23 * 2 ** 30)}B/s {fb(2345.6)}F/s | {2.5:.1f}s: {multiCMD.format_bytes(1.1 * 2 ** 30)}B/s '
+	f'{fb(2100)}F/s | 1h2m3s')
+COPY_LIMITED = (f'{multiCMD.format_bytes(1.23 * 2 ** 30)}B/s {fb(2345.6)}F/s | {multiCMD.format_bytes(2 ** 30)}B/s Limit | '
+	f'{fb(5000)}F/s Limit | 1h2m3s')
 
 
 def cells(text):
@@ -89,6 +96,10 @@ def test_the_test_strings_are_what_format_bytes_writes():
 	# '1.23K' and cut 'Size: 123.45 GiB' after its number )
 	assert REMOVAL == 'Removed: 1.23 K Folders: 45.00  | Overall: 1.23 M Files'
 	assert LISTING == 'Files: 1.23 K Links: 12.00  Folders: 45.00  Size: 1.15 GiB | Overall: 1.23 M Files'
+	# and hpcp 9.96's copy bar ( the 1.69 tests )
+	assert COPY_PREFIX == '123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job '
+	assert COPY == '1.23 GiB/s 2.35 KF/s | 2.5s: 1.10 GiB/s 2.10 KF/s | 1h2m3s'
+	assert COPY_LIMITED == '1.23 GiB/s 2.35 KF/s | 1.00 GiB/s Limit | 5.00 KF/s Limit | 1h2m3s'
 
 
 @pytest.mark.parametrize('reported, environ, expected', [
@@ -343,9 +354,13 @@ def test_a_bar_of_a_known_total_at_a_terminal_too_narrow_for_it():
 	assert _genrate_progress_bar(5, 10, 'p |', '| s', 5) == '\N{FULL BLOCK}\N{LOWER ONE EIGHTH BLOCK}_'
 
 
-def test_a_bar_of_a_known_total_drops_its_percent_before_it_shrinks():
-	# 15 columns: no room for the percent, so the bar takes its place and the prefix and suffix stay
-	assert _genrate_progress_bar(5, 10, 'p |', '| s', 15) == 'p |' + '\N{FULL BLOCK}' * 3 + '\N{LOWER ONE EIGHTH BLOCK}' + '_' * 3 + '| s'
+def test_a_bar_of_a_known_total_keeps_10_cells_before_its_text():
+	# 15 columns: the bar keeps its 10 cells, the percent goes, then the suffix, and the prefix's first field stays ( 1.68: a bar
+	# of 7 cells and both ). 12 columns: the bar alone, of 10; fewer: what there is
+	half = '\N{FULL BLOCK}' * 4 + '\N{LOWER HALF BLOCK}' + '_' * 5
+	assert _genrate_progress_bar(5, 10, 'p |', '| s', 15) == 'p |' + half
+	assert _genrate_progress_bar(5, 10, 'p |', '| s', 12) == half
+	assert _genrate_progress_bar(5, 10, 'p |', '| s', 8) == '\N{FULL BLOCK}' * 2 + '\N{LOWER HALF BLOCK}' + '_' * 3
 
 
 def test_a_bar_of_a_known_total_drops_a_long_prefix_and_its_percent():
@@ -368,10 +383,83 @@ def test_the_last_frame_of_a_bar_covers_the_one_before_it(columns):
 	line = []
 	for frame in drawn:
 		line[:len(frame)] = list(frame)
-	assert ''.join(line) == drawn[-1] and drawn[-1].endswith('| 3.2 F/s | 00:00:00')
+	# ( at 40 columns '3.2 F/s' gives way, to keep a bar of 10 cells: 1.69 )
+	assert ''.join(line) == drawn[-1] and drawn[-1].endswith('| 3.2 F/s | 00:00:00' if columns > 40 else '| 00:00:00')
 
 
 def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypatch, capsys):
 	monkeypatch.setattr(multiCMD, 'get_terminal_size', lambda: os.terminal_size((80, 24)))
 	print_progress_bar(7, 0, PATH[-50:], REMOVAL)
 	assert capsys.readouterr().out == '\r' + ('tensors | iteration:7 | ' + REMOVAL).ljust(79)
+
+
+# ---- 1.69: a bar with a total keeps 10 cells, and its text gives way a field at a time
+
+BAR = re.compile('[' + multiCMD._BAR_BLOCKS + '_]+')
+
+
+def parts(frame):
+	'''A frame of a known total as ( what is before its bar, the bar's cells, what is after it ).'''
+	found = BAR.search(frame)
+	return frame[:found.start()], found.end() - found.start(), frame[found.end():]
+
+
+def a_broken_start(kept, whole):
+	'''Why a frame's text that keeps the end of whole, from kept on, starts badly, else None: inside a word, on a unit without
+	its number, on a number without its label, or on a word whose number went ( '| Files' of '1.23 M Files' ): it starts with
+	a number, a label or a '|' ( the mirror of a_broken_end ).'''
+	if not whole.endswith(kept):
+		return 'is not the end of the line'
+	before = whole[:len(whole) - len(kept)]
+	if before and before[-1] != ' ':
+		return 'starts inside a word'
+	before = before.split()
+	if before and re.fullmatch(r'\d+(\.\d+)?', before[-1]):
+		return 'starts on a unit without its number'
+	if before and before[-1].endswith(':'):
+		return 'starts on a number without its label'
+	first = kept.split()[0]
+	if before and not (first[0].isdigit() or first[0] == '|' or first.endswith(':')):
+		return 'starts on a word whose number went'
+	return None
+
+
+@pytest.mark.parametrize('columns, suffix, shown', [
+	# 1.68 dropped the percent and the whole prefix: ( '', 18, '| ' + COPY ), with no count, size or percent
+	(80, COPY, ('123.46 KF |', 18, '| 2.35 KF/s | 2.5s: 1.10 GiB/s 2.10 KF/s | 1h2m3s')),
+	(80, COPY_LIMITED, ('123.46 KF |', 10, '| 2.35 KF/s | 1.00 GiB/s Limit | 5.00 KF/s Limit | 1h2m3s')),
+	(100, COPY, ('123.46 KF (45.60 GiB) |', 15, '| ' + COPY)),
+	(100, COPY_LIMITED, ('123.46 KF |', 19, '| ' + COPY_LIMITED)),
+	# 1.68: the whole prefix and a bar of 2 cells
+	(120, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '| ' + COPY)),
+	(160, COPY, (COPY_PREFIX + ' |', 35, '|50.0% | ' + COPY)),
+], ids=['80', '80-limited', '100', '100-limited', '120', '160'])
+def test_hpcp_copy_bar_keeps_its_count_and_its_time_left(columns, suffix, shown):
+	# the bar keeps 10 cells; beside it the percent gives way, then the prefix from its end down to its count, then the suffix
+	# from its start: the line keeps what it starts and ends with ( the count, the time left )
+	frame = _genrate_progress_bar(5, 10, COPY_PREFIX + ' |', '| ' + suffix, columns)
+	assert parts(frame) == shown and cells(frame) == columns - 2, frame
+
+
+@pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED, REMOVAL], ids=['copy', 'copy-limited', 'removal'])
+@pytest.mark.parametrize('prefix', [COPY_PREFIX, PATH[-50:], WIDE_PATH[-50:]], ids=['copy', 'path', 'wide-path'])
+def test_a_frame_of_a_known_total_keeps_whole_fields_beside_10_cells_at_any_width(prefix, suffix):
+	# at 12 to 200 columns: a bar of 10 cells or more, the start of the prefix and the end of the suffix, each cut only between
+	# fields ( a number keeps its unit, a label its number ), and the prefix's first field and the suffix's last as long as
+	# there is room for them
+	# ( a path has no blank: it is its one field )
+	first = '123.46 KF |' if prefix == COPY_PREFIX else prefix + ' |'
+	last = '| Overall: 1.23 M Files' if suffix == REMOVAL else '| 1h2m3s'
+	prefix, suffix = prefix + ' |', '| ' + suffix
+	for columns in range(12, 201):
+		frame = _genrate_progress_bar(5, 10, prefix, suffix, columns)
+		head, bar, tail = parts(frame)
+		if tail.startswith('|50.0% '):
+			tail = tail[len('|50.0% '):]
+		assert cells(frame) == columns - 2 and bar >= 10, (columns, frame)
+		assert head == '' or head == prefix or head.endswith(' |') and a_broken_end(head[:-2], prefix) is None, (columns, frame)
+		assert tail == '' or tail == suffix or tail.startswith('| ') and a_broken_start(tail[2:], suffix) is None, (columns, frame)
+		if cells(first) + 10 <= columns - 2:
+			assert head.startswith(first[:-2]), (columns, frame)
+		if cells(head) + cells(last) + 10 <= columns - 2:
+			assert tail.endswith(last), (columns, frame)
