@@ -1,6 +1,6 @@
 '''A progress line fits its terminal (1.68): a terminal of no size counts as unknown, and a frame is cut to one column less
 than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time; a bar past
-its total ends its line (1.69).'''
+its total ends its line; a control character in a frame's text is a '?' (1.69).'''
 import os
 import re
 import select
@@ -326,9 +326,9 @@ def test_a_frame_never_ends_inside_a_field_at_any_width(prefix, suffix):
 	('x' * 300 + '\u4e2d', 302),
 ])
 def test_cells_counts_a_character_by_its_unicode_width(text, expected):
-	# the module's own count, by Unicode's width of each character: no terminal measures it ( a tab or a newline counts one:
-	# docs/limitations.md, deferred to 1.69 ). ASCII and Latin-1, the usual text, is counted by length: a fast path that must give
-	# what the count by character gives
+	# the module's own count, by Unicode's width of each character: no terminal measures it ( a tab or a newline counts one, and a
+	# frame draws each as a '?' before it counts: 1.69 ). ASCII and Latin-1, the usual text, is counted by length: a fast path that
+	# must give what the count by character gives
 	assert multiCMD._cells(text) == expected
 
 
@@ -394,7 +394,7 @@ def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypat
 	assert capsys.readouterr().out == '\r' + ('tensors | iteration:7 | ' + REMOVAL).ljust(79)
 
 
-# ---- 1.69: a bar with a total keeps 10 cells; a bar past its total ends its line
+# ---- 1.69: a bar with a total keeps 10 cells; a bar past its total ends its line; a control character is a '?'
 
 BAR = re.compile('[' + multiCMD._BAR_BLOCKS + '_]+')
 
@@ -502,3 +502,30 @@ def test_the_output_after_a_bar_past_its_total_starts_a_line_of_its_own():
 		'print("next")')
 	shown = at_a_pty(code, 0, 0)
 	assert shown.endswith('|110.0% | s\nnext\n') and shown.count('\n') == 2, shown
+
+
+CONTROL = re.compile('[\x00-\x1f\x7f-\x9f]')
+
+
+@pytest.mark.parametrize('name', ['run\tlog', 'run\nlog', 'run\rlog', 'run\x1b[2Jlog', 'run\x7flog', 'run\x9b2Jlog', 'run\x00log'],
+	ids=['tab', 'newline', 'carriage-return', 'escape', 'delete', 'c1-csi', 'nul'])
+def test_a_control_character_in_a_frame_is_a_question_mark(name):
+	# a file name may hold any of them ( hpcp's removal and listing lines show the end of a path ): 1.68 wrote a newline as a
+	# new row, so each redraw scrolled, and a tab to the next tab stop, so the frame could reach the last column and wrap
+	shown = CONTROL.sub('?', name)
+	assert shown.startswith('run?') and shown.endswith('log')
+	frame = _genrate_progress_bar(7, 0, '/data/' + name + ' |', '| Removed: 1.23 K', 80)
+	assert frame == ('/data/' + shown + ' | iteration:7 | Removed: 1.23 K').ljust(79), frame
+	frame = _genrate_progress_bar(5, 10, name + ' |', '| ' + name, 80)
+	assert not CONTROL.search(frame) and cells(frame) == 78 and frame.startswith(shown + ' |') and frame.endswith('| ' + shown)
+
+
+@posix_only
+def test_a_name_with_a_tab_and_a_newline_stays_on_one_row():
+	# at an 80-column terminal: three frames, no row of their own and no tab ( 1.68: a row more per frame, each scrolling )
+	code = ('import multiCMD\n'
+		'for i in range(3): multiCMD.print_progress_bar(i, 0, "/data/run\\tlog\\nold", "Removed: 1.23 K")\n')
+	shown = at_a_pty(code, 24, 80)
+	assert '\n' not in shown and '\t' not in shown and len(frames(shown)) == 3, shown
+	assert [frame.rstrip() for frame in frames(shown)] == ['/data/run?log?old | iteration:%d | Removed: 1.23 K' % i for i in range(3)]
+	assert all(cells(frame) == 79 for frame in frames(shown)), shown

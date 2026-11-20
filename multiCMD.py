@@ -3618,6 +3618,10 @@ def _fit(text, width, from_start=False, whole=False):
 # bar at 80 columns showed no count, and at 120 a bar of two cells )
 _LEAST_BAR = 10
 
+# the control characters ( C0, DEL, C1 ), each a '?' in a frame's text: a newline starts a row, a tab jumps to a tab stop, an
+# escape starts a sequence the terminal acts on, so the frame cannot be measured ( a file name may hold any of them )
+_CONTROLS = dict.fromkeys(list(range(0x20)) + list(range(0x7f, 0xa0)), '?')
+
 def _cut_prefix(prefix, width):
 	'''
 	A frame's prefix in width terminal columns ( internal ): whole, or its start, cut after a whole field ( _fit ) and joined
@@ -3670,6 +3674,8 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	@returns:
 		str: the progress bar string
 	'''
+	# a control character would break the frame over rows or columns it cannot count: it is drawn as a '?'
+	prefix, suffix = prefix.translate(_CONTROLS), suffix.translate(_CONTROLS)
 	width = columns - 1
 	# if total is 0, we don't want to divide by 0: the iteration, padded to clear the last frame. What does not fit gives way
 	# from the prefix's start ( hpcp's is the end of a path ), then from the end
