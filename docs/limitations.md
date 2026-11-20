@@ -352,3 +352,14 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   Ctrl-Z as characters), testable only on GitHub's Windows runner. cas runs on Linux HPC hosts.
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
+
+### A bar's percent gives way before the prefix's inner fields
+- Kind: deferred (1.70)
+- What the operator sees: where a `print_progress_bar()` frame with a total does not fit beside a bar of 10 cells, the percent
+  is the first part to go, before the prefix is cut. hpcp's copy bar at 127 to 134 columns therefore shows no percent
+  (`50.0%`) beside a bar of 10 to 16 cells, with its jobs (`16 Scheduled 4.0 F/Job`); 1.68 showed the percent beside a bar of
+  2 to 9 cells there. From 135 columns the frames are the same as in 1.68.
+- Why: 1.69's order gives way from the bar outward, a field at a time, with the percent first. Cutting the prefix to its first
+  `|` field before dropping the percent keeps the percent longer; it changes the order in `_genrate_progress_bar` and its tests,
+  and was found in the final review, after the 1.69 code was settled.
+- Revisit when: 1.70, right after 1.69 ships.
