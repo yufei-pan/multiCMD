@@ -384,8 +384,10 @@ def test_the_last_frame_of_a_bar_covers_the_one_before_it(columns):
 	line = []
 	for frame in drawn:
 		line[:len(frame)] = list(frame)
-	# ( at 40 columns '3.2 F/s' gives way, to keep a bar of 10 cells: 1.69 )
-	assert ''.join(line) == drawn[-1] and drawn[-1].endswith('| 3.2 F/s | 00:00:00' if columns > 40 else '| 00:00:00')
+	# ( at 40 columns '3.2 F/s' gives way, to keep a bar of 10 cells or more, and the bar takes the room: 1.68 drew '3.2 F/s' beside
+	# a bar of 8 cells there )
+	tail = '|100.0% | 3.2 F/s | 00:00:00' if columns > 40 else '| 00:00:00'
+	assert ''.join(line) == drawn[-1] == '10 files |' + '\N{FULL BLOCK}' * (columns - 2 - 10 - len(tail)) + tail
 
 
 def test_print_progress_bar_draws_at_one_column_less_than_the_terminal(monkeypatch, capsys):
