@@ -1168,7 +1168,7 @@ def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
 	if filled_length>=length:bar=progress_chars[-1]*(length+1)
 	else:bar=progress_chars[-1]*filled_length+bar_char+'_'*(length-filled_length)
-	if iteration==0:return prefix+(' Calculating... 'if length>=16 else'')+suffix
+	if iteration==0:return prefix+(' Calculating... 'if length+1>=16 else' '*(length+1))+suffix
 	return prefix+bar+percent+suffix
 def _writable(text,stream):
 	encoding=getattr(stream,'encoding',None)

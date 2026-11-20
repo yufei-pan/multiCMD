@@ -3613,9 +3613,9 @@ def _fit(text, width, from_start=False, whole=False):
 			return text[:blank] if blank > 0 else '' if whole else text[:i]
 	return text
 
-# The least bar of a frame with a total, in cells: one a tenth of the total, so it reads at a glance. Its text gives way before
-# the bar shrinks below it ( 1.68 shrank the bar to two cells first, then dropped the percent and the prefix whole: hpcp's copy
-# bar at 80 columns showed no count, and at 120 a bar of two cells )
+# The least bar of a frame with a total, in cells, whatever the total, so it reads at a glance. Its text gives way before the bar
+# shrinks below it ( 1.68 shrank the bar first, down to two cells, then dropped the percent and the prefix whole: hpcp's copy
+# bar at 80 columns showed no count )
 _LEAST_BAR = 10
 
 # the control characters ( C0, DEL, C1 ), each a '?' in a frame's text: a newline starts a row, a tab jumps to a tab stop, an
@@ -3713,7 +3713,9 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	else:
 		bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)
 	if iteration == 0:
-		return prefix + (' Calculating... ' if length >= 16 else '') + suffix
+		# the place of the bar ( length + 1 cells, as in the frames after it ): ' Calculating... ' when it fits, else blanks, so the
+		# first frame is cut as the ones after it, and the prefix's joint and the suffix's never stand side by side ( '||' )
+		return prefix + (' Calculating... ' if length + 1 >= 16 else ' ' * (length + 1)) + suffix
 	return prefix + bar + percent + suffix
 
 def _writable(text, stream):

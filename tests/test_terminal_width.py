@@ -468,6 +468,23 @@ def test_a_frame_of_a_known_total_keeps_whole_fields_beside_10_cells_at_any_widt
 			assert tail.endswith(last), (columns, frame)
 
 
+@pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED, REMOVAL], ids=['copy', 'copy-limited', 'removal'])
+@pytest.mark.parametrize('prefix', [COPY_PREFIX, PATH[-50:], WIDE_PATH[-50:]], ids=['copy', 'path', 'wide-path'])
+def test_the_first_frame_of_a_known_total_has_the_place_of_its_bar_and_no_double_joint(prefix, suffix):
+	# iteration 0 ( hpcp's first copy bar frame ) is cut as the frames after it, and its text stands where theirs does: the bar's
+	# place holds ' Calculating... ' when it fits, else blanks ( 1.69 first cut it for a bar it never drew and joined prefix and
+	# suffix with nothing between: '0.00 F || 0.00 F/s | ∞' at 40 columns ). 1 of 1000 has a percent as long as 0's
+	prefix, suffix = prefix + ' |', '| ' + suffix
+	for columns in range(12, 201):
+		first = _genrate_progress_bar(0, 1000, prefix, suffix, columns)
+		head, bar, tail = parts(_genrate_progress_bar(1, 1000, prefix, suffix, columns))
+		if tail.startswith('|0.1% '):
+			tail = tail[len('|0.1% '):]
+		place = ' Calculating... ' if bar >= 16 else ' ' * bar
+		assert first == head + place + tail, (columns, first)
+		assert '||' not in first and cells(first) <= columns - 2, (columns, first)
+
+
 def test_a_bar_past_its_total_ends_its_line(monkeypatch, capsys):
 	# 1.68 ended the line only at a frame equal to the total: a count that stepped over it left the line open, and the program's
 	# next output joined the bar ( '...|110.0% | snext' ). The first frame at or past the total ends it now; the frame at the
