@@ -605,10 +605,10 @@ def handler(signum, frame):
 signal.signal(signal.SIGALRM, handler)
 def reap_strays():
 	# a stop that lands as Popen's fork returns leaves a child that no Popen knows ( docs/limitations.md, "A Ctrl-C inside
-	# Popen during a serial start ..." ), a zombie until the probe exits: 128 to 1,954 in 5,000 stops on 3.11 and 3.14 ran a
-	# process limit of 1,024 ( Docker's default ) out, and the next start failed with EAGAIN. Between calls a command
-	# multiCMD started has been waited for ( a stop waits for its command, or gives up on it ); one reaped here that a
-	# Popen still holds would read as exited with 0 there
+	# Popen during a serial start ..." ), a zombie until the probe exits: in 5,000 stops one run reaped 770 ( 3.6 ), 782 ( 3.9 ),
+	# 1,821 ( 3.11 ), 1,822 ( 3.12 ) and 2,032 ( 3.14 ), so on 3.11 and later a process limit of 1,024 ( Docker's default ) runs
+	# out, and the next start fails with EAGAIN. The test asserts that some were reaped: a probe that reaps none passes only where
+	# there is no process limit
 	count = 0
 	while True:
 		try:
@@ -668,8 +668,9 @@ def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
 	run = subprocess.run([sys.executable, '-I', str(probe), str(PACKAGE_ROOT), '5000'], stdout=subprocess.PIPE,
 		stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
 	# ( the probe flushes stderr before its result line: see there )
-	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors, \d+ strays reaped$', run.stdout, re.M), (
-		run.stdout[-4000:])
+	result = re.search(r'^5000 calls, \d+ stopped, 0 other errors, (\d+) strays reaped$', run.stdout, re.M)
+	# ( 770 to 2,032 were reaped in 5,000 stops on the five Pythons: a probe that reaps none has lost its reaper )
+	assert run.returncode == 0 and result and int(result.group(1)) > 0, run.stdout[-4000:]
 
 
 def _dummy_threads():
