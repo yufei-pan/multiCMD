@@ -603,13 +603,28 @@ def handler(signum, frame):
 		armed[0] = False
 		raise KeyboardInterrupt
 signal.signal(signal.SIGALRM, handler)
+def reap_strays():
+	# a stop that lands as Popen's fork returns leaves a child that no Popen knows ( docs/limitations.md, "A Ctrl-C inside
+	# Popen during a serial start ..." ), a zombie until the probe exits: 128 to 1,954 in 5,000 stops on 3.11 and 3.14 ran a
+	# process limit of 1,024 ( Docker's default ) out, and the next start failed with EAGAIN. Between calls a command
+	# multiCMD started has been waited for ( a stop waits for its command, or gives up on it ); one reaped here that a
+	# Popen still holds would read as exited with 0 there
+	count = 0
+	while True:
+		try:
+			pid, _ = os.waitpid(-1, os.WNOHANG)
+		except ChildProcessError:
+			return count
+		if not pid:
+			return count
+		count += 1
 times = []
 for _ in range(50):
 	start = time.perf_counter()
 	multiCMD.run_command(['true'], quiet=True)
 	times.append(time.perf_counter() - start)
 window = sorted(times)[len(times) // 2] * 1.5
-stops = others = 0
+stops = others = strays = 0
 for i in range(n):
 	try:
 		try:
@@ -630,12 +645,13 @@ for i in range(n):
 		print('LEAK: threading._active_limbo_lock held after %d calls' % (i + 1), flush=True)
 		os._exit(2)
 	threading._active_limbo_lock.release()
+	strays += reap_strays()
 	done[0] = i + 1
 assert multiCMD.run_command(['true'], quiet=True, return_code_only=True) == 0
 # ( Python 3.6 - 3.8 block-buffer a redirected stderr, where the stops that landed in a finalizer are told: a result line
 # printed while a flush at 8 KB had left half a line there would land on the end of it, so the line is told after a flush )
 sys.stderr.flush()
-print('%d calls, %d stopped, %d other errors' % (n, stops, others), flush=True)
+print('%d calls, %d stopped, %d other errors, %d strays reaped' % (n, stops, others, strays), flush=True)
 '''
 
 
@@ -646,13 +662,14 @@ def test_stops_in_serial_commands_never_jam_thread_starts(tmp_path):
 	# left threading's _active_limbo_lock held, and every later thread start hung: up to 1.59 on 3.14 this probe hung in 6 of
 	# 6 runs of 20,000 calls, after 30 to 9,000 calls ( three runs by the plan, three by the build ). 3.6 never hung so in
 	# 60,000 calls. 5,000 calls take about 75 s on 3.6 ( a call and the sleep after it ): 600 s leaves eight times that
-	# under -n auto
+	# under -n auto. The probe reaps the zombies such stops leave ( 1.69: 1.68's probe failed under a process limit of 1,024 )
 	probe = tmp_path / 'probe.py'
 	probe.write_text(STOP_PROBE)
 	run = subprocess.run([sys.executable, '-I', str(probe), str(PACKAGE_ROOT), '5000'], stdout=subprocess.PIPE,
 		stderr=subprocess.STDOUT, universal_newlines=True, timeout=600)
 	# ( the probe flushes stderr before its result line: see there )
-	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors$', run.stdout, re.M), run.stdout[-4000:]
+	assert run.returncode == 0 and re.search(r'^5000 calls, \d+ stopped, 0 other errors, \d+ strays reaped$', run.stdout, re.M), (
+		run.stdout[-4000:])
 
 
 def _dummy_threads():
