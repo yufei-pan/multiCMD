@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.68'
+version='1.69'
 __version__=version
-COMMIT_DATE='2026-11-16'
+COMMIT_DATE='2026-11-20'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -1123,36 +1123,53 @@ _ASCII_BAR=str.maketrans(_BAR_BLOCKS,'.:-=+*%#')
 def _cells(text):
 	if not text or max(text)<'̀':return len(text)
 	return sum(map(_char_width,text))
-def _fit(text,width,from_start=False):
+def _cuts_at(text,i):return text[i]==' 'and not(i and(text[i-1].isdigit()or text[i-1]==':'))
+def _fit(text,width,from_start=False,whole=False):
 	used=0
 	for i in range(len(text)-1,-1,-1)if from_start else range(len(text)):
 		used+=_char_width(text[i])
 		if used>width:
 			if from_start:return text[i+1:]
 			blank=i
-			while blank>0 and(text[blank]!=' 'or text[blank-1].isdigit()or text[blank-1]==':'):blank-=1
-			return text[:blank]if blank>0 else text[:i]
+			while blank>0 and not _cuts_at(text,blank):blank-=1
+			return text[:blank]if blank>0 else''if whole else text[:i]
 	return text
+_LEAST_BAR=10
+_CONTROLS=dict.fromkeys(list(range(32))+list(range(127,160)),'?')
+def _cut_prefix(prefix,width):
+	if _cells(prefix)<=width:return prefix
+	kept=_fit(prefix,width-2,whole=True).rstrip(' |');return kept+' |'if kept else''
+def _first_field(prefix):
+	for i in range(1,len(prefix)+1):
+		if i==len(prefix)or _cuts_at(prefix,i):
+			kept=prefix[:i].rstrip(' |')
+			if kept:return kept+' |'
+	return''
+def _cut_suffix(suffix,width):
+	if _cells(suffix)<=width:return suffix
+	start=len(suffix)-len(_fit(suffix,width-2,from_start=True))
+	for i in range(max(start-1,0),len(suffix)):
+		if _cuts_at(suffix,i):
+			word=suffix[i+1:].lstrip(' ').split(' ',1)[0]
+			if word[:1].isdigit()or word[:1]=='|'or word.endswith(':'):kept=suffix[i+1:].lstrip('| ');return'| '+kept if kept else''
+	return''
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
-	noPrefix=False;noSuffix=False;noPercent=False;noBar=False;width=columns-1
+	prefix,suffix=prefix.translate(_CONTROLS),suffix.translate(_CONTROLS);width=columns-1
 	if total==0:rest=f" iteration:{iteration} {suffix}";line=_fit(_fit(prefix,width-_cells(rest),from_start=True)+rest,width);return line+' '*(width-_cells(line))
-	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";prefix_cells,suffix_cells=_cells(prefix),_cells(suffix);length=columns-prefix_cells-suffix_cells-len(percent)-3
-	if length<=0:length=columns-prefix_cells-suffix_cells-3;noPercent=True
-	if length<=0:length=columns-suffix_cells-3;noPrefix=True
-	if length<=0:length=columns-3;noSuffix=True
+	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";room=columns-2-_LEAST_BAR;prefix_cells,suffix_cells=_cells(prefix),_cells(suffix)
+	if prefix_cells+suffix_cells+len(percent)>room:
+		percent=''
+		if prefix_cells+suffix_cells>room:
+			prefix=_cut_prefix(prefix,room-suffix_cells)or _first_field(prefix)
+			if _cells(prefix)>room:prefix=''
+			suffix=_cut_suffix(suffix,room-_cells(prefix))
+	length=columns-_cells(prefix)-_cells(suffix)-len(percent)-3
 	if length<=0:return''
-	if iteration==0:noBar=True
 	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
 	if filled_length>=length:bar=progress_chars[-1]*(length+1)
 	else:bar=progress_chars[-1]*filled_length+bar_char+'_'*(length-filled_length)
-	lineOut=''
-	if not noPrefix:lineOut+=prefix
-	if not noBar:
-		lineOut+=f"{bar}"
-		if not noPercent:lineOut+=percent
-	elif length>=16:lineOut+=' Calculating... '
-	if not noSuffix:lineOut+=suffix
-	return lineOut
+	if iteration==0:return prefix+(' Calculating... 'if length+1>=16 else' '*(length+1))+suffix
+	return prefix+bar+percent+suffix
 def _writable(text,stream):
 	encoding=getattr(stream,'encoding',None)
 	if not encoding:return text
@@ -1162,11 +1179,13 @@ def _writable(text,stream):
 	try:_BAR_BLOCKS.encode(encoding)
 	except UnicodeEncodeError:text=text.translate(_ASCII_BAR)
 	return text.encode(encoding,'replace').decode(encoding)
+_bar_done=[None]
 def print_progress_bar(iteration,total,prefix='',suffix=''):
 	prefix+=' |'if not prefix.endswith(' |')else'';suffix=f"| {suffix}"if not suffix.startswith('| ')else suffix
 	try:
-		columns,_=get_terminal_size();prefix,suffix=_writable(prefix,sys.stdout),_writable(suffix,sys.stdout);_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout))
-		if iteration==total and total>0:_display._write('\n')
+		columns,_=get_terminal_size();prefix,suffix=_writable(prefix,sys.stdout),_writable(suffix,sys.stdout);_display._write(_writable(f"\r{_genrate_progress_bar(iteration,total,prefix,suffix,columns)}",sys.stdout));done=total>0 and iteration>=total
+		if done and(iteration==total or _bar_done[0]!=total):_display._write('\n')
+		_bar_done[0]=total if done else None
 	except Exception:
 		if iteration%5==0:_display._write(_writable(_genrate_progress_bar(iteration,total,prefix,suffix),sys.stdout)+'\n')
 def format_bytes(size,use_1024_bytes=None,to_int=False,to_str=False,str_format='.2f'):

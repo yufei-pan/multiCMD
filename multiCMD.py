@@ -29,9 +29,9 @@ import traceback
 from pprint import pformat
 
 #%% global vars
-version = '1.68'
+version = '1.69'
 __version__ = version
-COMMIT_DATE = '2026-11-16'
+COMMIT_DATE = '2026-11-20'
 # fire-and-forget threads (run_commands with wait_for_return=False) that join_threads() waits on. multiCMD takes no
 # lock for it: each update is one set operation and each snapshot one set.copy(), as for _live_procs below
 __running_threads = set()
@@ -3589,11 +3589,17 @@ def _cells(text):
 		return len(text)
 	return sum(map(_char_width, text))
 
-def _fit(text, width, from_start=False):
+def _cuts_at(text, i):
 	'''
-	text cut to width terminal columns ( internal ): its end, back to the last blank that fits and follows neither a digit
-	nor a colon, so a number keeps its label and its unit ( format_bytes writes '1.23 K' ); from_start, its start, at the
-	column
+	Whether text can be cut at its index i ( internal ): at a blank that follows neither a digit nor a colon. A blank after a digit
+	may sit between a number and its unit ( format_bytes writes '1.23 K' ), one after a colon between a label and its number
+	'''
+	return text[i] == ' ' and not (i and (text[i - 1].isdigit() or text[i - 1] == ':'))
+
+def _fit(text, width, from_start=False, whole=False):
+	'''
+	text cut to width terminal columns ( internal ): its end, back to the last blank it can be cut at ( _cuts_at ), so a number
+	keeps its label and its unit, else at the column ( with whole, not at all: '' ); from_start, its start, at the column
 	'''
 	used = 0
 	for i in (range(len(text) - 1, -1, -1) if from_start else range(len(text))):
@@ -3601,13 +3607,57 @@ def _fit(text, width, from_start=False):
 		if used > width:
 			if from_start:
 				return text[i + 1:]
-			# a blank after a digit may sit between a number and its unit ( '1.23 K' ), one after a colon between a label and
-			# its number: neither is a place to cut
 			blank = i
-			while blank > 0 and (text[blank] != ' ' or text[blank - 1].isdigit() or text[blank - 1] == ':'):
+			while blank > 0 and not _cuts_at(text, blank):
 				blank -= 1
-			return text[:blank] if blank > 0 else text[:i]
+			return text[:blank] if blank > 0 else '' if whole else text[:i]
 	return text
+
+# The least bar of a frame with a total, in cells, whatever the total, so it reads at a glance. Its text gives way before the bar
+# shrinks below it ( 1.68 shrank the bar first, down to two cells, then dropped the percent and the prefix whole: hpcp's copy
+# bar at 80 columns showed no count )
+_LEAST_BAR = 10
+
+# the control characters ( C0, DEL, C1 ), each a '?' in a frame's text: a newline starts a row, a tab jumps to a tab stop, an
+# escape starts a sequence the terminal acts on, so the frame cannot be measured ( a file name may hold any of them )
+_CONTROLS = dict.fromkeys(list(range(0x20)) + list(range(0x7f, 0xa0)), '?')
+
+def _cut_prefix(prefix, width):
+	'''
+	A frame's prefix in width terminal columns ( internal ): whole, or its start, cut after a whole field ( _fit ) and joined
+	to the bar by ' |' again; '' where not even its first field fits
+	'''
+	if _cells(prefix) <= width:
+		return prefix
+	kept = _fit(prefix, width - 2, whole=True).rstrip(' |')
+	return kept + ' |' if kept else ''
+
+def _first_field(prefix):
+	'''A frame's prefix cut after its first field ( internal; see _cut_prefix ), or '' if it holds only the joint to the bar'''
+	for i in range(1, len(prefix) + 1):
+		if i == len(prefix) or _cuts_at(prefix, i):
+			kept = prefix[:i].rstrip(' |')
+			if kept:
+				return kept + ' |'
+	return ''
+
+def _cut_suffix(suffix, width):
+	'''
+	A frame's suffix in width terminal columns ( internal ): whole, or its end, joined to the bar by '| ' again, from a blank it
+	can be cut at ( _cuts_at ) before a number, a label ( a word that ends in a colon ) or a '|': a word after a number's unit
+	( '1.23 M Files', '5.00 KF/s Limit' ) never starts it without its number. '' where not even its last such part fits
+	'''
+	if _cells(suffix) <= width:
+		return suffix
+	# the first character of the end that fits beside the '| '
+	start = len(suffix) - len(_fit(suffix, width - 2, from_start=True))
+	for i in range(max(start - 1, 0), len(suffix)):
+		if _cuts_at(suffix, i):
+			word = suffix[i + 1:].lstrip(' ').split(' ', 1)[0]
+			if word[:1].isdigit() or word[:1] == '|' or word.endswith(':'):
+				kept = suffix[i + 1:].lstrip('| ')
+				return '| ' + kept if kept else ''
+	return ''
 
 def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	'''
@@ -3624,10 +3674,8 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	@returns:
 		str: the progress bar string
 	'''
-	noPrefix = False
-	noSuffix = False
-	noPercent = False
-	noBar = False
+	# a control character would break the frame over rows or columns it cannot count: it is drawn as a '?'
+	prefix, suffix = prefix.translate(_CONTROLS), suffix.translate(_CONTROLS)
 	width = columns - 1
 	# if total is 0, we don't want to divide by 0: the iteration, padded to clear the last frame. What does not fit gives way
 	# from the prefix's start ( hpcp's is the end of a path ), then from the end
@@ -3636,23 +3684,23 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		line = _fit(_fit(prefix, width - _cells(rest), from_start=True) + rest, width)
 		return line + ' ' * (width - _cells(line))
 	percent = f'|{("{0:.1f}").format(100 * (iteration / float(total)))}% '
+	# a bar is length + 1 wide, full or not ( see below ), so a frame is at most columns - 2 wide. Beside a bar of _LEAST_BAR
+	# cells, what does not fit gives way from the bar outward: the percent, the prefix from its end down to its first field, the
+	# suffix from its start, then that first field, each a whole field at a time. The line keeps what it starts and ends with
+	# longest: hpcp's count, and its time left
+	room = columns - 2 - _LEAST_BAR
 	prefix_cells, suffix_cells = _cells(prefix), _cells(suffix)
-	# a bar is length + 1 wide, full or not ( see below ), so a frame is at most columns - 2 wide
-	length = columns - prefix_cells - suffix_cells - len(percent) - 3
-	if length <= 0:
-		length = columns - prefix_cells - suffix_cells - 3
-		noPercent = True
-	if length <= 0:
-		length = columns - suffix_cells - 3
-		noPrefix = True
-	if length <= 0:
-		length = columns - 3
-		noSuffix = True
+	if prefix_cells + suffix_cells + len(percent) > room:
+		percent = ''
+		if prefix_cells + suffix_cells > room:
+			prefix = _cut_prefix(prefix, room - suffix_cells) or _first_field(prefix)
+			if _cells(prefix) > room:
+				prefix = ''
+			suffix = _cut_suffix(suffix, room - _cells(prefix))
+	length = columns - _cells(prefix) - _cells(suffix) - len(percent) - 3
 	if length <= 0:
 		# 3 columns or fewer: no room for a bar
 		return ''
-	if iteration == 0:
-		noBar = True
 	filled_length = int(length * iteration // total)
 	progress_chars = _BAR_BLOCKS
 	fractional_progress = (length * iteration / total) - filled_length
@@ -3664,19 +3712,11 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		bar = progress_chars[-1] * (length + 1)
 	else:
 		bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)
-	lineOut = ''
-	if not noPrefix:
-		lineOut += prefix
-	if not noBar:
-		lineOut += f'{bar}'
-		if not noPercent:
-			lineOut += percent
-	else:
-		if length >= 16:
-			lineOut += ' Calculating... '
-	if not noSuffix:
-		lineOut += suffix
-	return lineOut
+	if iteration == 0:
+		# the place of the bar ( length + 1 cells ): ' Calculating... ' when it fits, else blanks, so the first frame is cut as a frame
+		# under 10% is ( a percent as wide as its own ), and the prefix's joint and the suffix's never stand side by side ( '||' )
+		return prefix + (' Calculating... ' if length + 1 >= 16 else ' ' * (length + 1)) + suffix
+	return prefix + bar + percent + suffix
 
 def _writable(text, stream):
 	'''
@@ -3699,6 +3739,9 @@ def _writable(text, stream):
 	except UnicodeEncodeError:
 		text = text.translate(_ASCII_BAR)
 	return text.encode(encoding, 'replace').decode(encoding)
+
+# the total of the bar whose last frame was at or past it, else None ( see print_progress_bar )
+_bar_done = [None]
 
 def print_progress_bar(iteration, total, prefix='', suffix=''):
 	'''
@@ -3724,8 +3767,13 @@ def print_progress_bar(iteration, total, prefix='', suffix=''):
 		# that wraps or leaves the one before it showing
 		prefix, suffix = _writable(prefix, sys.stdout), _writable(suffix, sys.stdout)
 		_display._write(_writable(f'\r{_genrate_progress_bar(iteration, total, prefix, suffix, columns)}', sys.stdout))
-		if iteration == total and total > 0:
+		# the frame at the total ends its line, each time, and so does the first one past it ( a total that was an estimate, a
+		# count that steps over it ), so the program's next output starts a line of its own. A later frame past the total is
+		# drawn on the line after it, and left open: ending each would scroll a line per frame
+		done = total > 0 and iteration >= total
+		if done and (iteration == total or _bar_done[0] != total):
 			_display._write('\n')
+		_bar_done[0] = total if done else None
 	except Exception:
 		if iteration % 5 == 0:
 			_display._write(_writable(_genrate_progress_bar(iteration, total, prefix, suffix), sys.stdout) + '\n')

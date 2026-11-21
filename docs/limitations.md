@@ -353,34 +353,16 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a Windows user hits it.
 - Approved: 2026-11-13, the user chose "Known limitation (Recommended)".
 
-### A bar past its total never ends its line
-- Kind: deferred (1.69)
-- What the operator sees: when the iteration passes the total (a total that was an estimate), `print_progress_bar` draws a
-  full bar (`110.0%`) but writes no newline, because it ends the line only for an iteration equal to the total. The
-  program's next output lands on the bar's line (`...|110.0% | snext`). A bar that stops at its total is not affected.
-- Why: the line ends in `print_progress_bar` at `iteration == total`, and nothing else ends it. The same in 1.67; found by
-  1.68's second opinion (2026-11-16).
-- Revisit when: multiCMD 1.69. The plan: end the line on the first frame at or past the total, and a test that the
-  program's next output starts on its own line.
-- Noted: 2026-11-16, the main session's call (a deferral, not asked).
-
-### A tab or newline in a progress frame's prefix or suffix breaks the frame over several lines
-- Kind: deferred (1.69)
-- What the operator sees: a tab or newline in the prefix or suffix of `print_progress_bar` (a file name in hpcp's removal
-  and listing lines can have one): a newline starts a new row, so each redraw scrolls; a tab takes the columns up to the
-  next tab stop, so the frame can reach the last column and wrap. The same in 1.67 (which cut no frame at all).
-- Why: a frame is measured at one column a character and its text goes out as given.
-- Revisit when: multiCMD 1.69. The plan: replace the control characters in the frame's text before it is measured, and a
-  test with a name that has a tab and one that has a newline.
-- Noted: 2026-11-16, the main session's call (a deferral, not asked).
-
-### A bar with a total drops its percent and prefix before it has a least width
-- Kind: deferred (1.69)
-- What the operator sees: the bar is fitted last, into what the prefix, percent and suffix leave. When that is nothing, it
-  drops the percent, then the prefix, and takes what remains. At 80 columns hpcp's copy bar shows its bar and its rates and
-  time, with no count, size or percent (the count and size are its prefix); with a rate limit set the suffix is longer, and
-  at 120 columns the bar can be a few cells. The same in 1.67.
-- Why: `_genrate_progress_bar` fits the suffix first and the bar last, and sets no least width for the bar.
-- Revisit when: multiCMD 1.69. The plan: the bar shrinks to a least width before the prefix and the percent are cut, and a
-  test with hpcp's copy-bar strings at 80 and 100 columns.
-- Noted: 2026-11-17, the main session's triage of the 1.68 re-review, from its second opinion (a deferral, not asked).
+### A bar's percent gives way before the prefix's inner fields
+- Kind: deferred (1.70)
+- What the operator sees: where a `print_progress_bar()` frame with a total does not fit beside a bar of 10 cells, the percent
+  is the first part to go, before the prefix is cut. hpcp's bars therefore lose the percent (`50.0%`) at some widths where 1.68
+  showed it beside a bar of 2 to 9 cells, and show a bar of 10 to 16 cells instead: the copy bar at 127 to 134 columns (with its
+  jobs, `16 Scheduled 4.0 F/Job`), its rate-limited line at 135 to 142, and the removal bar (`Deleted`) one column later in
+  each (each window measured in one state, at half the total; it moves with the strings). Above its window each frame is the
+  same as in 1.68.
+- Why: 1.69's order gives way from the bar outward, a field at a time, with the percent first. Cutting the prefix to its first
+  `|` field before dropping the percent keeps the percent longer; it changes the order in `_genrate_progress_bar` and its tests,
+  and was found in the final review, after the 1.69 code was settled.
+- Revisit when: 1.70, right after 1.69 ships.
+- Noted: 2026-11-20, the main session's triage of the 1.69 final review (a deferral, not asked).

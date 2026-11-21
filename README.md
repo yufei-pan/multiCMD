@@ -533,6 +533,21 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.69 from 1.68
+
+- Nothing needs doing. `mcmd` is unchanged.
+- Changed, library: a `print_progress_bar()` frame with a total keeps a bar of at least 10 cells (from 12 columns up; the first
+  frame holds ` Calculating... ` or blanks in its place). Beside it the percent
+  gives way first, then the prefix from its end down to its first field, then the suffix from its start, then that first
+  field, a whole field at a time, so a number keeps its unit and its label (1.68 shrank the bar to two cells, then dropped
+  the percent and the prefix whole). At 80 columns hpcp's copy bar shows its count and its time left (1.68: no count).
+- Fix, library: the first frame at or past the total ends its line, so the program's next output does not join a count
+  that stepped over its total (1.68 ended the line only at a frame equal to the total). A count that goes on past its
+  total draws its later frames on the next line, and the last stays open: the next output joins it.
+- Fix, library: a control character in a frame's prefix or suffix (a tab, a newline, an escape: a file name can hold one)
+  is drawn as `?` (1.68: a newline started a row, so each frame scrolled, and a tab could wrap the frame). A prefix or
+  suffix coloured with escape codes shows them as text (`?[32m`).
+
 ## Upgrading to 1.68 from 1.67
 
 - Nothing needs doing.
