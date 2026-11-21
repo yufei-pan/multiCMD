@@ -545,8 +545,8 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
   that stepped over its total (1.68 ended the line only at a frame equal to the total). A count that goes on past its
   total draws its later frames on the next line, and the last stays open: the next output joins it.
 - Fix, library: a control character in a frame's prefix or suffix (a tab, a newline, an escape: a file name can hold one)
-  is drawn as `?` (1.68: a newline started a row, so each frame scrolled, and a tab could wrap the frame). A prefix or suffix coloured with escape codes shows them as text
-  (`?[32m`).
+  is drawn as `?` (1.68: a newline started a row, so each frame scrolled, and a tab could wrap the frame). A prefix or
+  suffix coloured with escape codes shows them as text (`?[32m`).
 
 ## Upgrading to 1.68 from 1.67
 
