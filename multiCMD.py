@@ -3713,8 +3713,8 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	else:
 		bar = progress_chars[-1] * filled_length + bar_char + '_' * (length - filled_length)
 	if iteration == 0:
-		# the place of the bar ( length + 1 cells, as in the frames after it ): ' Calculating... ' when it fits, else blanks, so the
-		# first frame is cut as the ones after it, and the prefix's joint and the suffix's never stand side by side ( '||' )
+		# the place of the bar ( length + 1 cells ): ' Calculating... ' when it fits, else blanks, so the first frame is cut as a frame
+		# under 10% is ( a percent as wide as its own ), and the prefix's joint and the suffix's never stand side by side ( '||' )
 		return prefix + (' Calculating... ' if length + 1 >= 16 else ' ' * (length + 1)) + suffix
 	return prefix + bar + percent + suffix
 
