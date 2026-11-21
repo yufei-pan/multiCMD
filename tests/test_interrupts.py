@@ -607,8 +607,8 @@ def reap_strays():
 	# a stop that lands as Popen's fork returns leaves a child that no Popen knows ( docs/limitations.md, "A Ctrl-C inside
 	# Popen during a serial start ..." ), a zombie until the probe exits: in 5,000 stops one run reaped 770 ( 3.6 ), 782 ( 3.9 ),
 	# 1,821 ( 3.11 ), 1,822 ( 3.12 ) and 2,032 ( 3.14 ), so on 3.11 and later a process limit of 1,024 ( Docker's default ) runs
-	# out, and the next start fails with EAGAIN. The test asserts that some were reaped: a probe that reaps none passes only where
-	# there is no process limit
+	# out, and the next start fails with EAGAIN. The test asserts that some were reaped: a probe that reaps none passes wherever
+	# the process limit is above its strays
 	count = 0
 	while True:
 		try:
