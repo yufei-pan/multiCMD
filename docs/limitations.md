@@ -358,8 +358,9 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - What the operator sees: where a `print_progress_bar()` frame with a total does not fit beside a bar of 10 cells, the percent
   is the first part to go, before the prefix is cut. hpcp's bars therefore lose the percent (`50.0%`) at some widths where 1.68
   showed it beside a bar of 2 to 9 cells, and show a bar of 10 to 16 cells instead: the copy bar at 127 to 134 columns (with its
-  jobs, `16 Scheduled 4.0 F/Job`), its rate-limited copy line at 135 to 142, its removal line at 120 to 127 (each window
-  measured in one state, at half the total; it moves with the strings). Above its window each frame is the same as in 1.68.
+  jobs, `16 Scheduled 4.0 F/Job`), its rate-limited line at 135 to 142, and the removal bar (`Deleted`) one column later in
+  each (each window measured in one state, at half the total; it moves with the strings). Above its window each frame is the
+  same as in 1.68.
 - Why: 1.69's order gives way from the bar outward, a field at a time, with the percent first. Cutting the prefix to its first
   `|` field before dropping the percent keeps the percent longer; it changes the order in `_genrate_progress_bar` and its tests,
   and was found in the final review, after the 1.69 code was settled.
