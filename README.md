@@ -554,8 +554,9 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 - Changed, library: a `print_progress_bar()` frame with a total keeps a bar of at least 10 cells (from 12 columns up; the first
   frame holds ` Calculating... ` or blanks in its place). Beside it the percent
   gives way first, then the prefix from its end down to its first field, then the suffix from its start, then that first
-  field (at once, when it alone is wider than the room), a whole field at a time, so a number keeps its unit and its label (1.68 shrank the bar to two cells, then dropped
-  the percent and the prefix whole). At 80 columns hpcp's copy bar shows its count and its time left (1.68: no count).
+  field (at once, when it alone is wider than the room), a whole field at a time, so a number keeps its unit and its label
+  (1.68 shrank the bar to two cells, then dropped the percent and the prefix whole). At 80 columns hpcp's copy bar shows its
+  count and its time left (1.68: no count).
 - Fix, library: the first frame at or past the total ends its line, so the program's next output does not join a count
   that stepped over its total (1.68 ended the line only at a frame equal to the total). A count that goes on past its
   total draws its later frames on the next line, and the last stays open: the next output joins it.

@@ -438,7 +438,7 @@ def a_broken_start(kept, whole):
 	(120, COPY, ('123.46 KF (45.60 GiB) Copied |', 21, '|50.0% | ' + COPY)),
 	# 1.68: all of it beside a bar of 2 to 9 cells; 1.69: all of its jobs and no percent. 1.70 decides with the percent at the
 	# total ( '|100.0% ', one cell wider than '|50.0% ' ), so a bar's parts hold from its first frame to its last: all of its
-	# jobs from 135 columns, as 1.68 and 1.69 did ( 1.68 from 127 with a bar of 2 cells, 1.69 with no percent until 135 )
+	# jobs and the percent from 135 columns ( 1.68: from 127, beside a bar of 2 to 9 cells; 1.69: the percent from 135 )
 	(127, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY)),
 	(134, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 20, '|50.0% | ' + COPY)),
 	(135, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 11, '|50.0% | ' + COPY)),
