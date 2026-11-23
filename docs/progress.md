@@ -11,7 +11,7 @@ State at 2026-11-21: v1.69 is the latest release (the merge of feat/169); 1.70 i
 ## Open work
 
 ### multiCMD 1.70 (no written plan yet: the entry of kind "deferred (1.70)" in docs/limitations.md; next, after 1.69's release on 2026-11-21)
-- **A bar's percent outlasts the prefix's inner fields,** so hpcp's copy bar at 127 to 134 columns (its rate-limited line at 135 to 142, its `Deleted` bar a column later in each) keeps its percent as 1.68 did, beside a bar of 10 cells: cut the prefix to its first `|` field before the percent goes (`_genrate_progress_bar`'s order and its tests). State: building on feat/170 (2026-11-23). From: 1.69's final review (Fable F1) and the main session's triage, 2026-11-20, a deferral, not asked.
+- **A bar's percent outlasts the prefix's inner fields,** so hpcp's copy bar at 127 to 134 columns (its rate-limited line at 135 to 142, its `Deleted` bar a column later in each) keeps its percent as 1.68 did, beside a bar of 10 cells: cut the prefix to its first `|` field before the percent goes (`_genrate_progress_bar`'s order and its tests). State: built on feat/170 (601eb62, 42d47be: percent kept from 109 columns on hpcp's copy bar; every CI Python passed at first runs), in final review (2026-11-23). From: 1.69's final review (Fable F1) and the main session's triage, 2026-11-20, a deferral, not asked.
 
 ### Standing rows
 - **Deferred work** is in `docs/limitations.md` (entries of kind "deferred"); each names when it is revisited.
