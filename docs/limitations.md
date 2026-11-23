@@ -376,3 +376,11 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
 - Revisit when: a tool draws past its total in practice.
 - Approved: 2026-11-23, chief's decision (C207), not the user's words: option (1), a known limitation; the README's 1.69
   notes already say that only the first frame past the total ends its line.
+
+### `use_sudo` stops at sudo's password prompt and the run waits until a Ctrl-C
+- Kind: deferred (1.71)
+- What the operator sees: a run with `use_sudo` (or `set_sudo(True)`) whose sudo wants a password at that moment (nothing remembered: `timestamp_timeout=0`, or a timeout run out) and that has a terminal: the sudo multiCMD starts, in a process group of its own with stdin from /dev/null, tries to read the password from the terminal and is stopped (state T), with or without a prompt shown, and the run waits until a Ctrl-C. Measured on 1.69 with sudo 1.9.16 by statbtrfs 0.46's build, which fixed its own calls; 1.70 the same.
+- Why: found while building statbtrfs 0.46 (2026-11-23); not a hold for 1.70, which does not touch the sudo path.
+- Plan (1.71): add `-n` to the sudo multiCMD prefixes where the process has a controlling terminal (`/dev/tty` opens), so a sudo that would ask fails at once with its own message, and keep the foreground `sudo -v` as the place that asks. Without a terminal keep plain `sudo`: `-n` there refuses a sudo that signs in with no question (an ssh agent, Kerberos), and statbtrfs 0.46's reviews found that plain `sudo` with no terminal counts each refused command as a failed login in pam_faillock: weigh both, as statbtrfs 0.46 and 0.47 do, and measure.
+- Revisit when: 1.71.
+- Noted: 2026-11-23, the main session (from statbtrfs 0.46's build and reviews); a deferral, not asked.
