@@ -1,7 +1,7 @@
 '''A progress line fits its terminal (1.68): a terminal of no size counts as unknown, and a frame is cut to one column less
 than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time; a bar past
 its total ends its line; a control character in a frame's text is a '?' (1.69). What follows a frame's prefix's first '|'
-gives way before the percent (1.70).'''
+gives way before the percent, and a bar's parts hold as its percent grows (1.70).'''
 import os
 import re
 import select
