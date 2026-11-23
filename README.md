@@ -514,6 +514,8 @@ The module also bundles a few terminal/formatting helpers used internally and
 reusable on their own: `pretty_format_table`, `parseTable`, `print_progress_bar`,
 `format_bytes`, `get_terminal_size`, `input_with_timeout_and_countdown` (its prompt and countdown go to
 stderr), and `slugify`.
+A progress bar counts its blocks as one column each, so a terminal set to draw East Asian ambiguous-width
+characters wide wraps it ([docs/limitations.md](docs/limitations.md)).
 
 ## Platform support
 

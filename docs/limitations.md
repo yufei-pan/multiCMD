@@ -366,3 +366,27 @@ Approved known limitations and deferrals. Reviewers: read this first, and don't 
   and was found in the final review, after the 1.69 code was settled.
 - Revisit when: 1.70, right after 1.69 ships.
 - Noted: 2026-11-20, the main session's triage of the 1.69 final review (a deferral, not asked).
+
+### Bars on a terminal that draws East Asian ambiguous characters two columns wide
+- Kind: known limitation
+- What the operator sees: on a terminal set to draw East Asian "ambiguous" characters two columns wide (an option some CJK
+  setups turn on; most terminals draw them narrow by default), a `print_progress_bar()` frame with a total is about twice as
+  wide as counted and wraps, a row per update. The bar's blocks (U+2588 and the eighths) are ambiguous-width, and multiCMD
+  counts them as one column each, as 1.67 did. Found by 1.68's second opinions, from reading; not seen on such a terminal.
+- Why: a program cannot ask the terminal how it draws them. Guessing from a CJK locale would be wrong for most CJK terminals,
+  which draw them narrow, and an ASCII bar would change every bar for everyone.
+- Revisit when: someone sees it on a real terminal.
+- Approved: 2026-11-23, chief's decision (C206), not the user's words: option (1), a known limitation with one README line.
+
+### A bar drawn on past its total leaves its last frame's line open
+- Kind: known limitation
+- What the operator sees: a program that draws several frames past a bar's total (99, then 101, 102 and 103 of 100) gets the
+  first frame past the total's line ended (1.69); the later frames draw on the next line and the last stays open, so the
+  program's next output joins it (`...|103.0% | next`). 1.68 drew them all on one row and joined it the same way, so 1.69
+  adds one line, holding the 101% frame. A second bar of the same total whose first frame is already past it gets no line
+  end, as in 1.68. No hpcp bar passes its total (hpcp 9.96's counters, read in 1.69's final review and fix round).
+- Why: only the caller knows which frame is its last; ending every frame at or past the total would scroll a line per frame
+  for a program whose total is an estimate.
+- Revisit when: a tool draws past its total in practice.
+- Approved: 2026-11-23, chief's decision (C207), not the user's words: option (1), a known limitation; the README's 1.69
+  notes already say that only the first frame past the total ends its line.
