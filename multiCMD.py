@@ -3702,8 +3702,9 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 	# that field ( a first field wider than the room goes before the suffix is cut ). The line keeps what it starts and ends with
 	# longest: hpcp's count, and its time left ( 1.69 dropped the percent first: hpcp's copy bar at 127 to 134 columns showed its
 	# jobs and no percent, where 1.68 showed both ). The choice is made with the widest percent, '|100.0% ' ( 6 cells at 0.1%, 7 at
-	# 10.0%, 8 at the total ), so a bar shows at its end, the frame left on the screen, what it showed at its start; a percent
-	# wider than that ( a total that was off tenfold ) decides for itself
+	# 10.0%, 8 at 100.0% to 999.9% ), so the prefix and the suffix a frame keeps, and whether it has a percent, do not change as
+	# the percent grows: the frame left on the screen, at the total, keeps what the frames before it showed. A percent wider than
+	# that ( a total that was off tenfold ) decides for itself
 	room = columns - 2 - _LEAST_BAR
 	prefix_cells, suffix_cells = _cells(prefix), _cells(suffix)
 	reserve = max(len(percent), len('|100.0% '))
