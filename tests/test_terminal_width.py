@@ -1,7 +1,7 @@
 '''A progress line fits its terminal (1.68): a terminal of no size counts as unknown, and a frame is cut to one column less
 than the width, in terminal columns. A bar with a total keeps 10 cells, and its text gives way a field at a time; a bar past
 its total ends its line; a control character in a frame's text is a '?' (1.69). What follows a frame's prefix's first '|'
-gives way before the percent, and a bar's parts hold as its percent grows (1.70).'''
+gives way before the percent, and the prefix and suffix a bar keeps hold as its percent grows (1.70).'''
 import os
 import re
 import select
@@ -437,8 +437,9 @@ def a_broken_start(kept, whole):
 	# 1.68: the whole prefix and a bar of 2 cells; 1.69: its jobs' count ( '16 Scheduled' ) and no percent
 	(120, COPY, ('123.46 KF (45.60 GiB) Copied |', 21, '|50.0% | ' + COPY)),
 	# 1.68: all of it beside a bar of 2 to 9 cells; 1.69: all of its jobs and no percent. 1.70 decides with the percent at the
-	# total ( '|100.0% ', one cell wider than '|50.0% ' ), so a bar's parts hold from its first frame to its last: all of its
-	# jobs and the percent from 135 columns ( 1.68: from 127, beside a bar of 2 to 9 cells; 1.69: the percent from 135 )
+	# total ( '|100.0% ', one cell wider than '|50.0% ' ), so a bar's prefix and suffix hold from its first frame to its
+	# last: all of its jobs and the percent from 135 columns ( 1.68: from 127, beside a bar of 2 to 9 cells; 1.69: the
+	# percent from 135 )
 	(127, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY)),
 	(134, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 20, '|50.0% | ' + COPY)),
 	(135, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 11, '|50.0% | ' + COPY)),
@@ -497,18 +498,30 @@ def test_a_bar_inside_a_word_is_not_the_prefixs_first_bar():
 	(STAGE_PREFIX, COPY), ('1234 Symbolic Links Created', '5678.12 F/s'), (PATH[-50:], REMOVAL),
 ], ids=['copy', 'copy-limited', 'deleted', 'deleted-limited', 'stage', 'symlinks', 'path'])
 def test_a_bars_parts_do_not_change_as_its_percent_grows(prefix, suffix):
-	# the percent is 6 cells at 0.1% to 9.9%, 7 at 10.0% to 99.9% and 8 at the total ( '|100.0% ' ). A layout decided with the
-	# frame's own percent drew hpcp's copy bar with its percent at 99.9% and none at the total, the frame left on the screen
-	# ( at 107 columns; with its last jobs at 123 and 133 ): what a bar shows at its start it shows at its end
+	# the percent is 6 cells at 0.1% to 9.9%, 7 at 10.0% to 99.9% and 8 at 100.0% to 999.9% ( '|100.0% ' ). A layout decided with
+	# the frame's own percent drew hpcp's copy bar with its percent at 99.9% and none at the total, the frame left on the screen
+	# ( with this file's strings: 1.69 at 135 columns; 1.70's first build at 109, and its jobs at 124 and 134 ). The prefix, the
+	# suffix and whether the percent shows hold from the first frame ( which has no percent ) to the last; the bar's length
+	# follows each frame's percent
 	prefix, suffix = prefix + ' |', '| ' + suffix
 	for columns in range(12, 201):
 		seen = set()
-		for iteration in (1, 50, 99, 100, 500, 999, 1000, 1100):
+		for iteration in (1, 50, 99, 100, 500, 999, 1000, 1100, 9999):
 			head, bar, tail = parts(_genrate_progress_bar(iteration, 1000, prefix, suffix, columns))
 			percent = re.match(r'\|\d+\.\d% ', tail)
 			seen.add((head, bool(percent), tail[percent.end():] if percent else tail))
 			assert bar >= 10, (columns, iteration, bar)
 		assert len(seen) == 1, (columns, seen)
+		(head, _, rest), = seen
+		first = _genrate_progress_bar(0, 1000, prefix, suffix, columns)
+		assert first.startswith(head) and first.endswith(rest), (columns, first)
+
+
+def test_a_percent_wider_than_the_one_at_the_total_keeps_a_bar_of_10_cells():
+	# a count tenfold over its total ( '|1000.0% ', 9 cells ) decides with its own percent: the bar keeps its 10 cells
+	for columns in range(12, 201):
+		frame = _genrate_progress_bar(10000, 1000, COPY_PREFIX + ' |', '| ' + COPY, columns)
+		assert parts(frame)[1] >= 10 and cells(frame) == columns - 2, (columns, frame)
 
 
 @pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED, REMOVAL], ids=['copy', 'copy-limited', 'removal'])
