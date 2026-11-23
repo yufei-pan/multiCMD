@@ -433,15 +433,50 @@ def a_broken_start(kept, whole):
 	(80, COPY_LIMITED, ('123.46 KF |', 10, '| 2.35 KF/s | 1.00 GiB/s Limit | 5.00 KF/s Limit | 1h2m3s')),
 	(100, COPY, ('123.46 KF (45.60 GiB) |', 15, '| ' + COPY)),
 	(100, COPY_LIMITED, ('123.46 KF |', 19, '| ' + COPY_LIMITED)),
-	# 1.68: the whole prefix and a bar of 2 cells
-	(120, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '| ' + COPY)),
+	# 1.68: the whole prefix and a bar of 2 cells; 1.69: its jobs' count ( '16 Scheduled' ) and no percent
+	(120, COPY, ('123.46 KF (45.60 GiB) Copied |', 21, '|50.0% | ' + COPY)),
+	# 1.68: all of it beside a bar of 2 to 9 cells; 1.69: all of its jobs and no percent
+	(127, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY)),
+	(134, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 10, '|50.0% | ' + COPY)),
+	(135, COPY_LIMITED, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY_LIMITED)),
 	(160, COPY, (COPY_PREFIX + ' |', 35, '|50.0% | ' + COPY)),
-], ids=['80', '80-limited', '100', '100-limited', '120', '160'])
+], ids=['80', '80-limited', '100', '100-limited', '120', '127', '134', '135-limited', '160'])
 def test_hpcp_copy_bar_keeps_its_count_and_its_time_left(columns, suffix, shown):
-	# the bar keeps 10 cells; beside it the percent gives way, then the prefix from its end down to its count, then the suffix
-	# from its start: the line keeps what it starts and ends with ( the count, the time left )
+	# the bar keeps 10 cells; beside it the prefix's jobs give way ( what follows its first '|' ), then the percent, then the
+	# prefix on down to its count, then the suffix from its start: the line keeps what it starts and ends with ( the count, the
+	# time left )
 	frame = _genrate_progress_bar(5, 10, COPY_PREFIX + ' |', '| ' + suffix, columns)
 	assert parts(frame) == shown and cells(frame) == columns - 2, frame
+
+
+# a stage of three after the count: a part after the first '|' that is narrower than the percent
+STAGE_PREFIX = f'{fb(1234)}F Copied | 2/3'
+
+
+@pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED], ids=['copy', 'copy-limited'])
+@pytest.mark.parametrize('prefix', [COPY_PREFIX, COPY_PREFIX.replace(' Copied ', ' Deleted '), STAGE_PREFIX],
+	ids=['copy', 'deleted', 'stage'])
+def test_the_percent_outlasts_what_follows_the_prefixs_first_bar(prefix, suffix):
+	# 1.69 dropped the percent first: hpcp's copy bar at 127 to 134 columns showed its jobs and no percent ( 1.68 showed both,
+	# beside a bar of 2 to 9 cells ). What follows the prefix's first '|' gives way first, from its end, then the percent, and
+	# it does not come back once the percent has gone ( a part narrower than the percent would fit in its place )
+	first = prefix[:prefix.index(' | ')] + ' |'
+	prefix, suffix = prefix + ' |', '| ' + suffix
+	for columns in range(12, 201):
+		frame = _genrate_progress_bar(5, 10, prefix, suffix, columns)
+		head, bar, tail = parts(frame)
+		percent = tail.startswith('|50.0% ')
+		assert bar >= 10 and cells(frame) == columns - 2, (columns, frame)
+		if cells(head) > cells(first):
+			assert percent, (columns, frame)
+		if cells(first) + cells('|50.0% ') + cells(suffix) + 10 <= columns - 2:
+			assert percent and head.startswith(first), (columns, frame)
+
+
+def test_a_prefix_with_no_bar_inside_gives_way_after_the_percent():
+	# as in 1.69: hpcp's symbolic link bar is one part, so at 55 columns its percent goes and its prefix stays whole
+	frame = _genrate_progress_bar(5, 10, '1234 Symbolic Links Created |', '| 5678.12 F/s', 55)
+	assert parts(frame) == ('1234 Symbolic Links Created |', 11, '| 5678.12 F/s'), frame
 
 
 @pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED, REMOVAL], ids=['copy', 'copy-limited', 'removal'])
