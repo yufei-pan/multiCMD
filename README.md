@@ -535,14 +535,29 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.70 from 1.69
+
+- Nothing needs doing. `mcmd` is unchanged.
+- Changed, library: beside a `print_progress_bar()` bar of 10 cells, the prefix gives way from its end down to its first `|`
+  followed by a blank before the percent goes, and what followed that `|` stays gone once the percent has gone (1.69
+  dropped the percent first). At 132 columns hpcp's copy bar shows `16 Scheduled` and its percent where 1.69 showed
+  `16 Scheduled 4.0 F/Job` and no percent (with typical strings). A prefix with no such `|` before its end gives way in
+  1.69's order, with the room of the widest percent (the next point).
+- Changed, library: what a bar keeps of its prefix and suffix, and whether it has a percent, hold as its percent grows, up
+  to 999.9% (a wider one decides for itself; the bar's own length follows each frame's percent). The layout is decided with
+  the widest percent (`|100.0% `, 8 cells; the frame's own is 6 at 0.1% to 9.9% and 7 to 99.9%), so the frame left on the
+  screen at the total keeps what the frames before it showed: 1.69 showed hpcp's copy bar's percent at 99.9% and none at
+  the total at 135 columns. The percent starts at 110 columns (the rate-limited line: 118).
+
 ## Upgrading to 1.69 from 1.68
 
 - Nothing needs doing. `mcmd` is unchanged.
 - Changed, library: a `print_progress_bar()` frame with a total keeps a bar of at least 10 cells (from 12 columns up; the first
   frame holds ` Calculating... ` or blanks in its place). Beside it the percent
-  gives way first, then the prefix from its end down to its first field, then the suffix from its start, then that first
-  field, a whole field at a time, so a number keeps its unit and its label (1.68 shrank the bar to two cells, then dropped
-  the percent and the prefix whole). At 80 columns hpcp's copy bar shows its count and its time left (1.68: no count).
+  gives way first, then the prefix from its end down to its first field, then the suffix from its start (a first field
+  wider than the room goes before it), a whole field at a time, so a number keeps its unit and its label
+  (1.68 shrank the bar to two cells, then dropped the percent and the prefix whole). At 80 columns hpcp's copy bar shows its
+  count and its time left (1.68: no count).
 - Fix, library: the first frame at or past the total ends its line, so the program's next output does not join a count
   that stepped over its total (1.68 ended the line only at a frame equal to the total). A count that goes on past its
   total draws its later frames on the next line, and the last stays open: the next output joins it.
