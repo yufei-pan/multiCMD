@@ -3,7 +3,7 @@ import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,ma
 from pprint import pformat
 version='1.70'
 __version__=version
-COMMIT_DATE='2026-11-20'
+COMMIT_DATE='2026-11-23'
 __running_threads=set()
 __finished_threads=collections.deque()
 _JOIN_MAY_HANG=sys.version_info<(3,9,8)or sys.version_info[:3]==(3,10,0)
@@ -1162,10 +1162,10 @@ def _cut_suffix(suffix,width):
 def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	prefix,suffix=prefix.translate(_CONTROLS),suffix.translate(_CONTROLS);width=columns-1
 	if total==0:rest=f" iteration:{iteration} {suffix}";line=_fit(_fit(prefix,width-_cells(rest),from_start=True)+rest,width);return line+' '*(width-_cells(line))
-	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";room=columns-2-_LEAST_BAR;prefix_cells,suffix_cells=_cells(prefix),_cells(suffix)
-	if prefix_cells+suffix_cells+len(percent)>room:
-		cut,first=_cut_prefix(prefix,room-suffix_cells-len(percent)),_first_part(prefix);prefix=cut if _cells(cut)>_cells(first)else first
-		if _cells(prefix)+suffix_cells+len(percent)>room:
+	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";room=columns-2-_LEAST_BAR;prefix_cells,suffix_cells=_cells(prefix),_cells(suffix);reserve=max(len(percent),len('|100.0% '))
+	if prefix_cells+suffix_cells+reserve>room:
+		cut,first=_cut_prefix(prefix,room-suffix_cells-reserve),_first_part(prefix);prefix=cut if _cells(cut)>_cells(first)else first
+		if _cells(prefix)+suffix_cells+reserve>room:
 			percent=''
 			if _cells(prefix)+suffix_cells>room:
 				prefix=_cut_prefix(prefix,room-suffix_cells)or _first_field(prefix)
