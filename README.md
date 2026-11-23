@@ -535,6 +535,14 @@ pytest -m "not slow"   # skip intentional sleep-heavy cases
 
 `test_expand_ranges_perf.py` is a manual performance microbenchmark and is not collected by pytest.
 
+## Upgrading to 1.70 from 1.69
+
+- Nothing needs doing. `mcmd` is unchanged.
+- Changed, library: beside a `print_progress_bar()` bar of 10 cells, the prefix gives way from its end down to its first `|`
+  before the percent goes, and what followed that `|` stays gone once the percent has gone (1.69 dropped the percent
+  first). At 132 columns hpcp's copy bar shows `16 Scheduled` and its percent where 1.69 showed `16 Scheduled 4.0 F/Job`
+  and no percent (with typical strings). A prefix with no `|` before its end gives way as in 1.69.
+
 ## Upgrading to 1.69 from 1.68
 
 - Nothing needs doing. `mcmd` is unchanged.

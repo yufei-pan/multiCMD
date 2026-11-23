@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import _thread,argparse,atexit,collections,collections.abc,errno,io,itertools,math,os,re,select,shlex,shutil,signal,stat,string,subprocess,sys,threading,time,traceback
 from pprint import pformat
-version='1.69'
+version='1.70'
 __version__=version
 COMMIT_DATE='2026-11-20'
 __running_threads=set()
@@ -1145,6 +1145,12 @@ def _first_field(prefix):
 			kept=prefix[:i].rstrip(' |')
 			if kept:return kept+' |'
 	return''
+def _first_part(prefix):
+	for i in range(1,len(prefix)):
+		if prefix[i]==' 'and prefix[i-1]=='|':
+			kept=prefix[:i].rstrip(' |')
+			if kept:return kept+' |'
+	return prefix
 def _cut_suffix(suffix,width):
 	if _cells(suffix)<=width:return suffix
 	start=len(suffix)-len(_fit(suffix,width-2,from_start=True))
@@ -1158,11 +1164,13 @@ def _genrate_progress_bar(iteration,total,prefix='',suffix='',columns=240):
 	if total==0:rest=f" iteration:{iteration} {suffix}";line=_fit(_fit(prefix,width-_cells(rest),from_start=True)+rest,width);return line+' '*(width-_cells(line))
 	percent=f"|{'{0:.1f}'.format(100*(iteration/float(total)))}% ";room=columns-2-_LEAST_BAR;prefix_cells,suffix_cells=_cells(prefix),_cells(suffix)
 	if prefix_cells+suffix_cells+len(percent)>room:
-		percent=''
-		if prefix_cells+suffix_cells>room:
-			prefix=_cut_prefix(prefix,room-suffix_cells)or _first_field(prefix)
-			if _cells(prefix)>room:prefix=''
-			suffix=_cut_suffix(suffix,room-_cells(prefix))
+		cut,first=_cut_prefix(prefix,room-suffix_cells-len(percent)),_first_part(prefix);prefix=cut if _cells(cut)>_cells(first)else first
+		if _cells(prefix)+suffix_cells+len(percent)>room:
+			percent=''
+			if _cells(prefix)+suffix_cells>room:
+				prefix=_cut_prefix(prefix,room-suffix_cells)or _first_field(prefix)
+				if _cells(prefix)>room:prefix=''
+				suffix=_cut_suffix(suffix,room-_cells(prefix))
 	length=columns-_cells(prefix)-_cells(suffix)-len(percent)-3
 	if length<=0:return''
 	filled_length=int(length*iteration//total);progress_chars=_BAR_BLOCKS;fractional_progress=length*iteration/total-filled_length;char_index=int(fractional_progress*(len(progress_chars)-1));bar_char=progress_chars[char_index]
