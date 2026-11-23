@@ -3697,17 +3697,21 @@ def _genrate_progress_bar(iteration, total, prefix='', suffix='',columns=240):
 		return line + ' ' * (width - _cells(line))
 	percent = f'|{("{0:.1f}").format(100 * (iteration / float(total)))}% '
 	# a bar is length + 1 wide, full or not ( see below ), so a frame is at most columns - 2 wide. Beside a bar of _LEAST_BAR
-	# cells, what does not fit gives way from the bar outward: the prefix from its end down to its first '|' ( hpcp's jobs ), the
-	# percent, the prefix on down to its first field, the suffix from its start, then that first field, each a whole field at a
-	# time. The line keeps what it starts and ends with longest: hpcp's count, and its time left ( 1.69 dropped the percent
-	# first: hpcp's copy bar at 127 to 134 columns showed its jobs and no percent, where 1.68 showed both )
+	# cells, what does not fit gives way from the bar outward, a whole field at a time: the prefix from its end down to its first
+	# '|' that ends a field ( hpcp's jobs ), the percent, the prefix on down to its first field, the suffix from its start, then
+	# that field ( a first field wider than the room goes before the suffix is cut ). The line keeps what it starts and ends with
+	# longest: hpcp's count, and its time left ( 1.69 dropped the percent first: hpcp's copy bar at 127 to 134 columns showed its
+	# jobs and no percent, where 1.68 showed both ). The choice is made with the widest percent, '|100.0% ' ( 6 cells at 0.1%, 7 at
+	# 10.0%, 8 at the total ), so a bar shows at its end, the frame left on the screen, what it showed at its start; a percent
+	# wider than that ( a total that was off tenfold ) decides for itself
 	room = columns - 2 - _LEAST_BAR
 	prefix_cells, suffix_cells = _cells(prefix), _cells(suffix)
-	if prefix_cells + suffix_cells + len(percent) > room:
+	reserve = max(len(percent), len('|100.0% '))
+	if prefix_cells + suffix_cells + reserve > room:
 		# the prefix down to its first part, kept whole until the percent has gone; what followed it does not come back then
-		cut, first = _cut_prefix(prefix, room - suffix_cells - len(percent)), _first_part(prefix)
+		cut, first = _cut_prefix(prefix, room - suffix_cells - reserve), _first_part(prefix)
 		prefix = cut if _cells(cut) > _cells(first) else first
-		if _cells(prefix) + suffix_cells + len(percent) > room:
+		if _cells(prefix) + suffix_cells + reserve > room:
 			percent = ''
 			if _cells(prefix) + suffix_cells > room:
 				prefix = _cut_prefix(prefix, room - suffix_cells) or _first_field(prefix)

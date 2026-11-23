@@ -436,12 +436,16 @@ def a_broken_start(kept, whole):
 	(100, COPY_LIMITED, ('123.46 KF |', 19, '| ' + COPY_LIMITED)),
 	# 1.68: the whole prefix and a bar of 2 cells; 1.69: its jobs' count ( '16 Scheduled' ) and no percent
 	(120, COPY, ('123.46 KF (45.60 GiB) Copied |', 21, '|50.0% | ' + COPY)),
-	# 1.68: all of it beside a bar of 2 to 9 cells; 1.69: all of its jobs and no percent
+	# 1.68: all of it beside a bar of 2 to 9 cells; 1.69: all of its jobs and no percent. 1.70 decides with the percent at the
+	# total ( '|100.0% ', one cell wider than '|50.0% ' ), so a bar's parts hold from its first frame to its last: all of its
+	# jobs from 135 columns, as 1.68 and 1.69 did ( 1.68 from 127 with a bar of 2 cells, 1.69 with no percent until 135 )
 	(127, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY)),
-	(134, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 10, '|50.0% | ' + COPY)),
+	(134, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 20, '|50.0% | ' + COPY)),
+	(135, COPY, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 11, '|50.0% | ' + COPY)),
 	(135, COPY_LIMITED, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled |', 13, '|50.0% | ' + COPY_LIMITED)),
+	(143, COPY_LIMITED, ('123.46 KF (45.60 GiB) Copied | 16 Scheduled 4.0 F/Job |', 11, '|50.0% | ' + COPY_LIMITED)),
 	(160, COPY, (COPY_PREFIX + ' |', 35, '|50.0% | ' + COPY)),
-], ids=['80', '80-limited', '100', '100-limited', '120', '127', '134', '135-limited', '160'])
+], ids=['80', '80-limited', '100', '100-limited', '120', '127', '134', '135', '135-limited', '143-limited', '160'])
 def test_hpcp_copy_bar_keeps_its_count_and_its_time_left(columns, suffix, shown):
 	# the bar keeps 10 cells; beside it the prefix's jobs give way ( what follows its first '|' ), then the percent, then the
 	# prefix on down to its count, then the suffix from its start: the line keeps what it starts and ends with ( the count, the
@@ -470,7 +474,8 @@ def test_the_percent_outlasts_what_follows_the_prefixs_first_bar(prefix, suffix)
 		assert bar >= 10 and cells(frame) == columns - 2, (columns, frame)
 		if cells(head) > cells(first):
 			assert percent, (columns, frame)
-		if cells(first) + cells('|50.0% ') + cells(suffix) + 10 <= columns - 2:
+		# the percent that must fit is the widest, the one at the total ( see the test below )
+		if cells(first) + cells('|100.0% ') + cells(suffix) + 10 <= columns - 2:
 			assert percent and head.startswith(first), (columns, frame)
 
 
@@ -478,6 +483,32 @@ def test_a_prefix_with_no_bar_inside_gives_way_after_the_percent():
 	# as in 1.69: hpcp's symbolic link bar is one part, so at 55 columns its percent goes and its prefix stays whole
 	frame = _genrate_progress_bar(5, 10, '1234 Symbolic Links Created |', '| 5678.12 F/s', 55)
 	assert parts(frame) == ('1234 Symbolic Links Created |', 11, '| 5678.12 F/s'), frame
+
+
+def test_a_bar_inside_a_word_is_not_the_prefixs_first_bar():
+	# a '|' with no blank after it ( a name's 'a|b' ) ends no part: the prefix gives way as one part, after the percent
+	frame = _genrate_progress_bar(5, 10, 'a|b 1234 Links Created |', '| 5678.12 F/s', 50)
+	assert parts(frame) == ('a|b 1234 Links Created |', 11, '| 5678.12 F/s'), frame
+
+
+@pytest.mark.parametrize('prefix, suffix', [
+	(COPY_PREFIX, COPY), (COPY_PREFIX, COPY_LIMITED),
+	(COPY_PREFIX.replace(' Copied ', ' Deleted '), COPY), (COPY_PREFIX.replace(' Copied ', ' Deleted '), COPY_LIMITED),
+	(STAGE_PREFIX, COPY), ('1234 Symbolic Links Created', '5678.12 F/s'), (PATH[-50:], REMOVAL),
+], ids=['copy', 'copy-limited', 'deleted', 'deleted-limited', 'stage', 'symlinks', 'path'])
+def test_a_bars_parts_do_not_change_as_its_percent_grows(prefix, suffix):
+	# the percent is 6 cells at 0.1% to 9.9%, 7 at 10.0% to 99.9% and 8 at the total ( '|100.0% ' ). A layout decided with the
+	# frame's own percent drew hpcp's copy bar with its percent at 99.9% and none at the total, the frame left on the screen
+	# ( at 107 columns; with its last jobs at 123 and 133 ): what a bar shows at its start it shows at its end
+	prefix, suffix = prefix + ' |', '| ' + suffix
+	for columns in range(12, 201):
+		seen = set()
+		for iteration in (1, 50, 99, 100, 500, 999, 1000, 1100):
+			head, bar, tail = parts(_genrate_progress_bar(iteration, 1000, prefix, suffix, columns))
+			percent = re.match(r'\|\d+\.\d% ', tail)
+			seen.add((head, bool(percent), tail[percent.end():] if percent else tail))
+			assert bar >= 10, (columns, iteration, bar)
+		assert len(seen) == 1, (columns, seen)
 
 
 @pytest.mark.parametrize('suffix', [COPY, COPY_LIMITED, REMOVAL], ids=['copy', 'copy-limited', 'removal'])
